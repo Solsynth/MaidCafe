@@ -6,6 +6,8 @@ on:
     tags: ['*']
   pull_request:
     branches: [master]
+  workflow_dispatch:
+
 
 env:
   REGISTRY: ghcr.io
@@ -103,8 +105,7 @@ jobs:
   # Configure repository variable DISTRIBUTION_API_BASE_URL and
   # DISTRIBUTION_PRODUCT_ID, plus secret DISTRIBUTION_UPLOAD_KEY.
   upload-daemon-to-distribution:
-    needs: daemon-systemd-artifact
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.daemon-systemd-artifact.result == 'success'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/') && needs.daemon-systemd-artifact.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -141,8 +142,7 @@ jobs:
 
   # Publish the latest master commit independently from stable releases.
   upload-daemon-rolling-to-distribution:
-    needs: daemon-systemd-artifact
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.daemon-systemd-artifact.result == 'success'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && needs.daemon-systemd-artifact.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read

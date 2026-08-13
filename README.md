@@ -244,6 +244,8 @@ GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/b
 - Pull requests run tests and builds and build the cloud image without pushing.
 - `master` pushes publish the cloud image to GHCR.
 - Version tags publish a versioned cloud image.
+- Manual workflow runs are also supported. Run them from a version tag for a
+  stable release or from `master` for a rolling release.
 - Every verified workflow run uploads a daemon systemd bundle containing the
   daemon binary, unit file, and example configuration.
 - Version tags without a leading `v` (for example `1.2.3`) upload that daemon
