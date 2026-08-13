@@ -1,22 +1,3 @@
-[app]
-name = "MaidCafe"
-
-[http]
-port = "8080"
-
-[database]
-# Required by cloud mode.
-dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"
-
-[auth]
-target = "stargate:9090"
-useTLS = true
-tlsSkipVerify = false
-
-[eventbus]
-# Optional NATS URL; empty keeps PostgreSQL as the source of truth.
-url = ""
-
 [daemon]
 id = "maidkit-host-01"
 listen = "127.0.0.1:8747"

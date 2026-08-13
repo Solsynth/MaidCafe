@@ -154,8 +154,10 @@ Example response:
 
 ## Configuration
 
-Start from [`config.example.toml`](config.example.toml). Configuration is typed
-TOML loaded through Viper and can also be selected with `CONFIG_PATH`.
+Use [`config.cloud.example.toml`](config.cloud.example.toml) for cloud mode and
+[`config.daemon.example.toml`](config.daemon.example.toml) for daemon mode.
+Configuration is typed TOML loaded through Viper and can also be selected with
+`CONFIG_PATH`.
 
 Cloud requires:
 
@@ -176,8 +178,8 @@ Daemon cloud publishing is optional. An empty cloud URL and secret are valid.
 ## Running locally
 
 ```sh
-go run ./cmd/cloud --config config.toml
-go run ./cmd/daemon --config config.toml
+go run ./cmd/cloud --config config.cloud.example.toml
+go run ./cmd/daemon --config config.daemon.example.toml
 ```
 
 Useful Make targets:
@@ -199,7 +201,7 @@ runtime image:
 docker build -t maidcafe-cloud .
 docker run --rm \
   -p 8080:8080 \
-  -v "$PWD/config.toml:/etc/maidcafe/config.toml:ro" \
+  -v "$PWD/config.cloud.toml:/etc/maidcafe/config.toml:ro" \
   -e CONFIG_PATH=/etc/maidcafe/config.toml \
   maidcafe-cloud
 ```
@@ -225,7 +227,7 @@ Build and install:
 make build-daemon
 sudo install -o root -g root -m 0755 bin/maidcafe-daemon /usr/local/bin/maidcafe-daemon
 sudo install -d -o root -g maidcafe -m 0750 /etc/maidcafe
-sudo install -o root -g maidcafe -m 0640 config.toml /etc/maidcafe/config.toml
+sudo install -o root -g maidcafe -m 0640 config.daemon.toml /etc/maidcafe/config.toml
 sudo install -o root -g root -m 0644 deploy/maidcafe-daemon.service \
   /etc/systemd/system/maidcafe-daemon.service
 sudo systemctl daemon-reload

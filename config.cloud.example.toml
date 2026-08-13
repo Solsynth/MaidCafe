@@ -1,0 +1,18 @@
+[app]
+name = "MaidCafe"
+
+[http]
+port = "8080"
+
+[database]
+# Replace the example password and connection settings before deployment.
+dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"
+
+[auth]
+target = "stargate:9090"
+useTLS = true
+tlsSkipVerify = false
+
+[eventbus]
+# Optional NATS URL. Leave empty to disable push fan-out.
+url = ""

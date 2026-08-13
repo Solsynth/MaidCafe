@@ -5,7 +5,7 @@ services:
     environment:
       CONFIG_PATH: /etc/maidcafe/config.toml
     volumes:
-      - ./config.toml:/etc/maidcafe/config.toml:ro
+      - ./config.cloud.toml:/etc/maidcafe/config.toml:ro
     ports:
       - "8080:8080"
     depends_on:

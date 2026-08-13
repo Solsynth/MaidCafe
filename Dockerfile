@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/maidcafe-cloud ./c
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/maidcafe-cloud /maidcafe-cloud
-COPY config.example.toml /config.example.toml
+COPY config.cloud.example.toml /config.cloud.example.toml
 
 USER nonroot:nonroot
 EXPOSE 8080

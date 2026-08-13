@@ -87,7 +87,7 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
             -o dist/maidcafe-daemon/maidcafe-daemon ./cmd/daemon
           cp deploy/maidcafe-daemon.service dist/maidcafe-daemon/
-          cp config.example.toml dist/maidcafe-daemon/config.example.toml
+          cp config.daemon.example.toml dist/maidcafe-daemon/config.daemon.example.toml
           tar -C dist -czf maidcafe-daemon-systemd.tar.gz maidcafe-daemon
 
       - name: Upload daemon systemd bundle
