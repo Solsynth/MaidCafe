@@ -13,6 +13,12 @@ target = "stargate:9090"
 useTLS = true
 tlsSkipVerify = false
 
+[ring]
+# Optional Metoer/Ring gRPC target for device push delivery.
+target = "metoer:9090"
+useTLS = false
+tlsSkipVerify = false
+
 [eventbus]
 # Optional NATS URL. Leave empty to disable push fan-out.
 url = ""

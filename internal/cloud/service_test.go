@@ -144,7 +144,9 @@ func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
 	if err != nil || requested.Title != "Restart" {
 		t.Fatalf("push request: %v %#v", err, requested)
 	}
-	if len(publisher.events) != 0 {
-		t.Fatalf("push request should not invoke push publisher: %#v", publisher.events)
+	if len(publisher.events) != 2 ||
+		publisher.events[0].Kind != "daemon.alarm.cpu_percent" ||
+		publisher.events[1].Kind != "maintenance" {
+		t.Fatalf("notification publication mismatch: %#v", publisher.events)
 	}
 }

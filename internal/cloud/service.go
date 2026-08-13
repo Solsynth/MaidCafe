@@ -27,6 +27,21 @@ type PushPublisher interface {
 	Publish(context.Context, NotificationEvent) error
 }
 
+type FanoutPublisher []PushPublisher
+
+func (p FanoutPublisher) Publish(ctx context.Context, event NotificationEvent) error {
+	var firstErr error
+	for _, publisher := range p {
+		if publisher == nil {
+			continue
+		}
+		if err := publisher.Publish(ctx, event); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 type NotificationEvent struct {
 	EventID        string          `json:"event_id"`
 	Timestamp      time.Time       `json:"timestamp"`
@@ -381,8 +396,26 @@ func (s *Service) evaluateAlarms(ctx context.Context, daemon database.Daemon, in
 		if err := s.db.WithContext(ctx).Save(alarm).Error; err != nil {
 			return err
 		}
+		s.publishNotification(ctx, notification)
 	}
 	return nil
+}
+func (s *Service) publishNotification(ctx context.Context, notification database.Notification) {
+	if s.publisher == nil {
+		return
+	}
+	event := NotificationEvent{
+		EventID:        uuid.NewString(),
+		Timestamp:      notification.CreatedAt,
+		AccountID:      notification.AccountID,
+		DaemonID:       notification.DaemonID,
+		NotificationID: notification.ID,
+		Kind:           notification.Kind,
+		Title:          notification.Title,
+		Body:           notification.Body,
+		Metadata:       json.RawMessage(notification.Metadata),
+	}
+	_ = s.publisher.Publish(ctx, event)
 }
 func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonID string, input NotificationInput) (NotificationView, error) {
 	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
@@ -416,6 +449,7 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
 	}
+	s.publishNotification(ctx, row)
 	return notificationView(row), nil
 }
 func bound(value string, max int) (string, error) {
@@ -461,10 +495,7 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err
 	}
-	event := NotificationEvent{EventID: uuid.NewString(), Timestamp: n.CreatedAt, AccountID: n.AccountID, DaemonID: n.DaemonID, NotificationID: n.ID, Kind: n.Kind, Title: n.Title, Body: n.Body, Metadata: json.RawMessage(metadata)}
-	if s.publisher != nil {
-		_ = s.publisher.Publish(ctx, event)
-	}
+	s.publishNotification(ctx, n)
 	return notificationView(n), nil
 }
 func notificationView(n database.Notification) NotificationView {

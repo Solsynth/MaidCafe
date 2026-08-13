@@ -19,6 +19,7 @@ type Config struct {
 	Database DatabaseConfig `mapstructure:"database"`
 	Auth     AuthConfig     `mapstructure:"auth"`
 	Eventbus EventbusConfig `mapstructure:"eventbus"`
+	Ring     RingConfig     `mapstructure:"ring"`
 	Daemon   DaemonConfig   `mapstructure:"daemon"`
 }
 
@@ -32,6 +33,11 @@ type DatabaseConfig struct {
 	DSN string `mapstructure:"dsn"`
 }
 type AuthConfig struct {
+	Target        string `mapstructure:"target"`
+	UseTLS        bool   `mapstructure:"useTLS"`
+	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
+}
+type RingConfig struct {
 	Target        string `mapstructure:"target"`
 	UseTLS        bool   `mapstructure:"useTLS"`
 	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
@@ -79,6 +85,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("auth.useTLS", true)
 	viper.SetDefault("auth.tlsSkipVerify", false)
 	viper.SetDefault("eventbus.url", "")
+	viper.SetDefault("ring.target", "")
+	viper.SetDefault("ring.useTLS", false)
+	viper.SetDefault("ring.tlsSkipVerify", false)
 	viper.SetDefault("daemon.listen", "127.0.0.1:8747")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
@@ -103,8 +112,8 @@ func Load(configPath string) (*Config, error) {
 
 func applyEnvAliases() {
 	aliases := map[string]string{
-		"CONFIG_APP_NAME": "app.name", "HTTP_PORT": "http.port", "DATABASE_DSN": "database.dsn",
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
+		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_CLOUD_URL": "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",

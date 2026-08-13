@@ -93,11 +93,12 @@ func TestDaemonCloudURLValidation(t *testing.T) {
 func TestEnvironmentOverrides(t *testing.T) {
 	t.Setenv("DAEMON_ID", "env-host")
 	t.Setenv("DAEMON_REQUEST_TIMEOUT", "2s")
+	t.Setenv("RING_TARGET", "metoer:9090")
 	cfg, err := Load(writeConfig(t, "[daemon]\nid = \"file-host\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Daemon.ID != "env-host" || cfg.Daemon.RequestTimeout != 2*time.Second {
-		t.Fatalf("environment override failed: %#v", cfg.Daemon)
+	if cfg.Daemon.ID != "env-host" || cfg.Daemon.RequestTimeout != 2*time.Second || cfg.Ring.Target != "metoer:9090" {
+		t.Fatalf("environment override failed: %#v", cfg)
 	}
 }
