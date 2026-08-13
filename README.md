@@ -243,12 +243,27 @@ GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/b
 
 - Pull requests run tests and builds and build the cloud image without pushing.
 - `master` pushes publish the cloud image to GHCR.
-- `v*` tags publish a versioned cloud image.
+- Version tags publish a versioned cloud image.
 - Every verified workflow run uploads a daemon systemd bundle containing the
   daemon binary, unit file, and example configuration.
+- Version tags without a leading `v` (for example `1.2.3`) upload that daemon
+  bundle to DistributionCenter as the stable `linux`/`amd64` artifact.
+- Every commit pushed to `master` also uploads the daemon bundle to the rolling
+  channel. Its version is the first six characters of the commit SHA.
 
 Set the repository variable `PACKAGE_OWNER` to the GHCR owner used by the image
-name.
+name. For daemon artifact publishing, create a DistributionCenter product and
+product-scoped upload key, then set:
+
+- `DISTRIBUTION_API_BASE_URL` repository variable
+- `DISTRIBUTION_PRODUCT_ID` repository variable
+- `DISTRIBUTION_UPLOAD_KEY` repository secret
+
+DistributionCenter can return a daemon artifact's download URL to a server
+using the product release API filtered by channel, `platform=linux`, and
+`architecture=amd64`. Use `channel=stable` for version-tagged releases or
+`channel=rolling` with the six-character commit version for the latest commit
+build.
 
 ## Security boundary
 

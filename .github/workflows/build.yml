@@ -3,13 +3,16 @@ name: Build MaidCafe
 on:
   push:
     branches: [master]
-    tags: ['v*']
+    tags: ['*']
   pull_request:
     branches: [master]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ vars.PACKAGE_OWNER }}/maidcafe-cloud
+
+permissions:
+  contents: read
 
 jobs:
   verify:
@@ -96,3 +99,74 @@ jobs:
           name: maidcafe-daemon-systemd-${{ github.sha }}
           path: maidcafe-daemon-systemd.tar.gz
           if-no-files-found: error
+
+  # Configure repository variable DISTRIBUTION_API_BASE_URL and
+  # DISTRIBUTION_PRODUCT_ID, plus secret DISTRIBUTION_UPLOAD_KEY.
+  upload-daemon-to-distribution:
+    needs: daemon-systemd-artifact
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.daemon-systemd-artifact.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download daemon systemd bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: maidcafe-daemon-systemd-${{ github.sha }}
+          path: ./dist
+
+      - name: Resolve distribution version
+        id: distribution_version
+        shell: bash
+        run: |
+          version="$GITHUB_REF_NAME"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag must be a SemVer version without a leading v: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload daemon systemd bundle to DistributionCenter
+        uses: Solsynth/SolsynthExpressUpload@v2
+        with:
+          api-base-url: ${{ vars.DISTRIBUTION_API_BASE_URL }}
+          product-id: ${{ vars.DISTRIBUTION_PRODUCT_ID }}
+          api-key: ${{ secrets.DISTRIBUTION_UPLOAD_KEY }}
+          version: ${{ steps.distribution_version.outputs.version }}
+          file: ./dist/maidcafe-daemon-systemd.tar.gz
+          platform: linux
+          architecture: amd64
+          mime-type: application/gzip
+          channel: stable
+
+  # Publish the latest master commit independently from stable releases.
+  upload-daemon-rolling-to-distribution:
+    needs: daemon-systemd-artifact
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.daemon-systemd-artifact.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download daemon systemd bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: maidcafe-daemon-systemd-${{ github.sha }}
+          path: ./dist
+
+      - name: Resolve rolling version
+        id: rolling_version
+        shell: bash
+        run: echo "version=${GITHUB_SHA:0:6}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload rolling daemon bundle to DistributionCenter
+        uses: Solsynth/SolsynthExpressUpload@v2
+        with:
+          api-base-url: ${{ vars.DISTRIBUTION_API_BASE_URL }}
+          product-id: ${{ vars.DISTRIBUTION_PRODUCT_ID }}
+          api-key: ${{ secrets.DISTRIBUTION_UPLOAD_KEY }}
+          version: ${{ steps.rolling_version.outputs.version }}
+          file: ./dist/maidcafe-daemon-systemd.tar.gz
+          platform: linux
+          architecture: amd64
+          mime-type: application/gzip
+          channel: rolling
