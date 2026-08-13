@@ -1,7 +1,7 @@
 [daemon]
 id = "maidkit-host-01"
 listen = "127.0.0.1:8747"
-cloudUrl = "https://maidcafe.example.com"
+cloudUrl = "https://mk.solsynth.dev"
 cloudSecret = "replace-with-cloud-issued-secret"
 metricsInterval = "1m"
 requestTimeout = "10s"

@@ -22,35 +22,43 @@ type Config struct {
 	Daemon   DaemonConfig   `mapstructure:"daemon"`
 }
 
-type AppConfig struct { Name string `mapstructure:"name"` }
-type HTTPConfig struct { Port string `mapstructure:"port"` }
-type DatabaseConfig struct { DSN string `mapstructure:"dsn"` }
-type AuthConfig struct {
-	Target string `mapstructure:"target"`
-	UseTLS bool `mapstructure:"useTLS"`
-	TLSSkipVerify bool `mapstructure:"tlsSkipVerify"`
+type AppConfig struct {
+	Name string `mapstructure:"name"`
 }
-type EventbusConfig struct { URL string `mapstructure:"url"` }
+type HTTPConfig struct {
+	Port string `mapstructure:"port"`
+}
+type DatabaseConfig struct {
+	DSN string `mapstructure:"dsn"`
+}
+type AuthConfig struct {
+	Target        string `mapstructure:"target"`
+	UseTLS        bool   `mapstructure:"useTLS"`
+	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
+}
+type EventbusConfig struct {
+	URL string `mapstructure:"url"`
+}
 type DaemonConfig struct {
-	ID string `mapstructure:"id"`
-	Listen string `mapstructure:"listen"`
-	CloudURL string `mapstructure:"cloudUrl"`
-	CloudSecret string `mapstructure:"cloudSecret"`
-	MetricsInterval time.Duration `mapstructure:"metricsInterval"`
-	RequestTimeout time.Duration `mapstructure:"requestTimeout"`
-	ScriptTimeout time.Duration `mapstructure:"scriptTimeout"`
-	MaxBodyBytes int64 `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns int `mapstructure:"maxConcurrentRuns"`
-	Webhooks []WebhookConfig `mapstructure:"webhooks"`
+	ID                string          `mapstructure:"id"`
+	Listen            string          `mapstructure:"listen"`
+	CloudURL          string          `mapstructure:"cloudUrl"`
+	CloudSecret       string          `mapstructure:"cloudSecret"`
+	MetricsInterval   time.Duration   `mapstructure:"metricsInterval"`
+	RequestTimeout    time.Duration   `mapstructure:"requestTimeout"`
+	ScriptTimeout     time.Duration   `mapstructure:"scriptTimeout"`
+	MaxBodyBytes      int64           `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns int             `mapstructure:"maxConcurrentRuns"`
+	Webhooks          []WebhookConfig `mapstructure:"webhooks"`
 }
 type WebhookConfig struct {
-	Name string `mapstructure:"name"`
-	Secret string `mapstructure:"secret"`
-	Command string `mapstructure:"command"`
-	Args []string `mapstructure:"args"`
-	Enabled bool `mapstructure:"enabled"`
-	NotifyOnSuccess bool `mapstructure:"notifyOnSuccess"`
-	NotifyOnFailure bool `mapstructure:"notifyOnFailure"`
+	Name            string   `mapstructure:"name"`
+	Secret          string   `mapstructure:"secret"`
+	Command         string   `mapstructure:"command"`
+	Args            []string `mapstructure:"args"`
+	Enabled         bool     `mapstructure:"enabled"`
+	NotifyOnSuccess bool     `mapstructure:"notifyOnSuccess"`
+	NotifyOnFailure bool     `mapstructure:"notifyOnFailure"`
 }
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -72,7 +80,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("auth.tlsSkipVerify", false)
 	viper.SetDefault("eventbus.url", "")
 	viper.SetDefault("daemon.listen", "127.0.0.1:8747")
-	viper.SetDefault("daemon.cloudUrl", "")
+	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
 	viper.SetDefault("daemon.requestTimeout", 10*time.Second)
@@ -111,42 +119,80 @@ func applyEnvAliases() {
 }
 
 func (c *Config) ValidateCloud() error {
-	if strings.TrimSpace(c.Database.DSN) == "" { return fmt.Errorf("database.dsn is required in cloud mode") }
-	if strings.TrimSpace(c.Auth.Target) == "" { return fmt.Errorf("auth.target is required in cloud mode") }
-	if err := validatePort(c.HTTP.Port); err != nil { return fmt.Errorf("http.port: %w", err) }
+	if strings.TrimSpace(c.Database.DSN) == "" {
+		return fmt.Errorf("database.dsn is required in cloud mode")
+	}
+	if strings.TrimSpace(c.Auth.Target) == "" {
+		return fmt.Errorf("auth.target is required in cloud mode")
+	}
+	if err := validatePort(c.HTTP.Port); err != nil {
+		return fmt.Errorf("http.port: %w", err)
+	}
 	return nil
 }
 
 func (c *Config) ValidateDaemon() error {
-	if strings.TrimSpace(c.Daemon.ID) == "" { return fmt.Errorf("daemon.id is required in daemon mode") }
-	if err := validateListen(c.Daemon.Listen); err != nil { return fmt.Errorf("daemon.listen: %w", err) }
-	if c.Daemon.MetricsInterval <= 0 { return fmt.Errorf("daemon.metricsInterval must be positive") }
-	if c.Daemon.RequestTimeout <= 0 { return fmt.Errorf("daemon.requestTimeout must be positive") }
-	if c.Daemon.ScriptTimeout <= 0 { return fmt.Errorf("daemon.scriptTimeout must be positive") }
-	if c.Daemon.MaxBodyBytes <= 0 { return fmt.Errorf("daemon.maxBodyBytes must be positive") }
-	if c.Daemon.MaxConcurrentRuns <= 0 { return fmt.Errorf("daemon.maxConcurrentRuns must be positive") }
+	if strings.TrimSpace(c.Daemon.ID) == "" {
+		return fmt.Errorf("daemon.id is required in daemon mode")
+	}
+	if err := validateListen(c.Daemon.Listen); err != nil {
+		return fmt.Errorf("daemon.listen: %w", err)
+	}
+	if c.Daemon.MetricsInterval <= 0 {
+		return fmt.Errorf("daemon.metricsInterval must be positive")
+	}
+	if c.Daemon.RequestTimeout <= 0 {
+		return fmt.Errorf("daemon.requestTimeout must be positive")
+	}
+	if c.Daemon.ScriptTimeout <= 0 {
+		return fmt.Errorf("daemon.scriptTimeout must be positive")
+	}
+	if c.Daemon.MaxBodyBytes <= 0 {
+		return fmt.Errorf("daemon.maxBodyBytes must be positive")
+	}
+	if c.Daemon.MaxConcurrentRuns <= 0 {
+		return fmt.Errorf("daemon.maxConcurrentRuns must be positive")
+	}
 	seen := make(map[string]struct{}, len(c.Daemon.Webhooks))
 	for i, hook := range c.Daemon.Webhooks {
-		if strings.TrimSpace(hook.Name) == "" || !webhookNamePattern.MatchString(hook.Name) { return fmt.Errorf("daemon.webhooks[%d].name must match [A-Za-z0-9._-]+", i) }
-		if _, ok := seen[hook.Name]; ok { return fmt.Errorf("daemon.webhooks[%d].name %q is duplicated", i, hook.Name) }
+		if strings.TrimSpace(hook.Name) == "" || !webhookNamePattern.MatchString(hook.Name) {
+			return fmt.Errorf("daemon.webhooks[%d].name must match [A-Za-z0-9._-]+", i)
+		}
+		if _, ok := seen[hook.Name]; ok {
+			return fmt.Errorf("daemon.webhooks[%d].name %q is duplicated", i, hook.Name)
+		}
 		seen[hook.Name] = struct{}{}
-		if strings.TrimSpace(hook.Secret) == "" { return fmt.Errorf("daemon.webhooks[%d].secret is required", i) }
-		if !filepath.IsAbs(hook.Command) { return fmt.Errorf("daemon.webhooks[%d].command must be an absolute path", i) }
+		if strings.TrimSpace(hook.Secret) == "" {
+			return fmt.Errorf("daemon.webhooks[%d].secret is required", i)
+		}
+		if !filepath.IsAbs(hook.Command) {
+			return fmt.Errorf("daemon.webhooks[%d].command must be an absolute path", i)
+		}
 	}
 	if strings.TrimSpace(c.Daemon.CloudURL) != "" {
 		u, err := url.Parse(c.Daemon.CloudURL)
-		if err != nil || u.Host == "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost"))) { return fmt.Errorf("daemon.cloudUrl must be HTTPS, or HTTP to localhost") }
+		if err != nil || u.Host == "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost"))) {
+			return fmt.Errorf("daemon.cloudUrl must be HTTPS, or HTTP to localhost")
+		}
 	}
 	return nil
 }
 
 func validateListen(value string) error {
-	if strings.TrimSpace(value) == "" { return fmt.Errorf("must not be empty") }
-	if _, err := net.ResolveTCPAddr("tcp", value); err != nil { return fmt.Errorf("invalid address: %w", err) }
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if _, err := net.ResolveTCPAddr("tcp", value); err != nil {
+		return fmt.Errorf("invalid address: %w", err)
+	}
 	return nil
 }
 func validatePort(value string) error {
-	if strings.TrimSpace(value) == "" { return fmt.Errorf("must not be empty") }
-	if _, err := net.ResolveTCPAddr("tcp", ":"+strings.TrimPrefix(value, ":")); err != nil { return fmt.Errorf("invalid port: %w", err) }
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if _, err := net.ResolveTCPAddr("tcp", ":"+strings.TrimPrefix(value, ":")); err != nil {
+		return fmt.Errorf("invalid port: %w", err)
+	}
 	return nil
 }
