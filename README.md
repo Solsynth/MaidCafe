@@ -1,16 +1,199 @@
 # MaidCafe
 
-MaidCafe provides a cloud control plane and a dependency-light MaidKit daemon.
-Build them separately:
+MaidCafe is the backend for MaidKit-managed hosts. It contains two separate
+runtime modes:
+
+- **Cloud**: a PostgreSQL-backed control plane for daemon registration,
+  credentials, metrics, and notifications.
+- **Daemon**: a local named-webhook runner for managed hosts. It can run fully
+offline or publish metrics and selected webhook notifications to the cloud over
+ordinary HTTP(S) POST requests.
+
+The daemon has no database, queue, NATS connection, Solar authentication client,
+or inbound cloud-control channel. Cloud-to-daemon control is intentionally not
+implemented.
+
+## Current feature set
+
+### Cloud control plane
+
+- Gin HTTP server with recovery middleware and request validation.
+- PostgreSQL persistence through GORM and startup `AutoMigrate`.
+- Solar Network bearer-token authentication for user routes.
+- Account ownership checks for daemon and notification resources.
+- Daemon registration with one-time randomly generated credentials.
+- bcrypt storage for daemon credentials; plaintext secrets are never persisted.
+- Secret rotation that invalidates the previous secret.
+- Soft daemon deletion: disables the daemon, removes metrics, and keeps the row
+  as an audit record.
+- Daemon metrics ingestion with server-side receive timestamps.
+- Notification persistence with bounded kind, title, body, and metadata fields.
+- Optional NATS/event-bus fan-out using the event type
+  `maidcafe.notification.v1`.
+- Durable notification listing with unread filtering, daemon filtering, limits,
+  cursor pagination, and idempotent read acknowledgement.
+- Unauthenticated health endpoint:
+
+```text
+GET /health
+{"ok":true,"mode":"cloud"}
+```
+
+### Daemon runtime
+
+- Gin HTTP routing with recovery middleware.
+- Loopback default listen address: `127.0.0.1:8747`.
+- Named, immutable webhook configuration.
+- Bearer-secret authentication with constant-time comparison.
+- Disabled and unknown webhooks return `404`.
+- Request bodies are opaque stdin bytes. They are never parsed, templated, or
+  appended to command arguments.
+- Commands run directly with `exec.CommandContext`; the daemon never invokes
+  `sh -c`.
+- Static configured arguments only.
+- Absolute command paths and controlled working directory.
+- Request body size limits.
+- Maximum concurrent execution limit with `429` on exhaustion.
+- Script timeout handling with `504` responses.
+- Non-zero exit handling with `502` responses.
+- Bounded stdout/stderr capture in JSON responses.
+- Atomic success/failure execution counters.
+- Public health endpoint that exposes only daemon mode and ID:
+
+```text
+GET /health
+{"ok":true,"mode":"daemon","id":"..."}
+```
+
+### Optional cloud publishing from the daemon
+
+When both `daemon.cloudUrl` and `daemon.cloudSecret` are configured, the daemon:
+
+- Publishes metrics on every `metricsInterval` tick.
+- Publishes webhook success notifications when `notifyOnSuccess = true`.
+- Publishes webhook failure notifications when `notifyOnFailure = true`.
+- Uses `Authorization: Bearer <daemon-secret>`.
+- Uses request deadlines and disables cross-host redirect following.
+- Drops failed publishing attempts without failing local webhook execution.
+- Does not retain an unbounded retry queue.
+
+Cloud publishing is disabled when either setting is empty. HTTPS is required,
+except for HTTP development URLs using `localhost` or `127.0.0.1`.
+
+## Cloud API
+
+User routes require a Solar bearer token. Daemon ingestion routes require the
+registered daemon secret instead; a daemon secret cannot access user routes.
+
+### Daemons
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/daemons` | Create a daemon; returns the one-time secret |
+| `GET` | `/api/daemons` | List owned daemons |
+| `GET` | `/api/daemons/:id` | Read an owned daemon |
+| `PATCH` | `/api/daemons/:id` | Change name or enabled state |
+| `POST` | `/api/daemons/:id/rotate-secret` | Rotate the one-time secret |
+| `DELETE` | `/api/daemons/:id` | Disable daemon and delete its metrics |
+| `POST` | `/api/daemons/:id/metrics` | Ingest daemon metrics |
+| `POST` | `/api/daemons/:id/notifications` | Create a daemon notification |
+
+Create a daemon:
+
+```sh
+curl -X POST http://localhost:8080/api/daemons \
+  -H 'Authorization: Bearer <solar-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"managed-host-01"}'
+```
+
+The response contains `id`, `name`, and `secret`. Store the secret in the
+managed host configuration. It is not returned by list or read endpoints.
+
+### Notifications
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/notifications` | List owned notifications |
+| `POST` | `/api/notifications/:id/read` | Mark an owned notification read |
+
+`GET /api/notifications` supports `unread`, `daemon_id`, `limit` up to `100`,
+and an RFC3339 `before` cursor.
+
+## Daemon API
+
+Webhook requests use:
+
+```text
+POST /api/v1/webhooks/:name
+Authorization: Bearer <webhook-secret>
+```
+
+Example:
+
+```sh
+curl -X POST http://127.0.0.1:8747/api/v1/webhooks/backup \
+  -H 'Authorization: Bearer replace-with-local-webhook-secret' \
+  --data-binary '{"job":"incremental"}'
+```
+
+Successful execution returns `200`; non-zero exit returns `502`; timeout returns
+`504`; oversized bodies return `413`; exhausted concurrency returns `429`.
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "name": "backup",
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+## Configuration
+
+Start from [`config.example.toml`](config.example.toml). Configuration is typed
+TOML loaded through Viper and can also be selected with `CONFIG_PATH`.
+
+Cloud requires:
+
+- `database.dsn`
+- `auth.target`
+- `http.port` (default `8080`)
+
+Daemon requires:
+
+- `daemon.id`
+- Valid positive durations and resource limits.
+- Webhook names matching `[A-Za-z0-9._-]+`.
+- Absolute webhook command paths.
+- Unique webhook names.
+
+Daemon cloud publishing is optional. An empty cloud URL and secret are valid.
+
+## Running locally
 
 ```sh
 go run ./cmd/cloud --config config.toml
 go run ./cmd/daemon --config config.toml
 ```
 
+Useful Make targets:
+
+```sh
+make build
+make build-cloud
+make build-daemon
+make test
+make tidy
+```
+
 ## Cloud deployment with Docker
 
-The Docker image is cloud-only and expects a read-only TOML configuration mount:
+The Docker image builds **cloud mode only** and uses a non-root distroless
+runtime image:
 
 ```sh
 docker build -t maidcafe-cloud .
@@ -21,18 +204,22 @@ docker run --rm \
   maidcafe-cloud
 ```
 
-For PostgreSQL plus the cloud service, copy `docker-compose.example.yml` and
-replace the example credentials and auth target before starting it.
-
-GitHub Actions builds and publishes the cloud image to GHCR on `master` and
-version tags. Pull requests build it without pushing. The same workflow uploads
-`maidcafe-daemon-systemd-<commit>` as an artifact containing the daemon binary,
-systemd unit, and example configuration. Set the repository `PACKAGE_OWNER`
-variable to the GHCR owner used by the workflow.
+For PostgreSQL plus the cloud service, copy
+[`docker-compose.example.yml`](docker-compose.example.yml), then replace the
+example database credentials and Solar auth target.
 
 ## Daemon deployment with systemd
 
-Build only the daemon binary and install it with the unit template:
+The daemon is intended to run directly on managed hosts under systemd, not in
+the cloud Docker image.
+
+Create a service account:
+
+```sh
+sudo useradd --system --home /var/lib/maidcafe --create-home maidcafe
+```
+
+Build and install:
 
 ```sh
 make build-daemon
@@ -45,33 +232,25 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now maidcafe-daemon
 ```
 
-Create the service account before installation:
+The unit runs as `maidcafe`, restarts after failure, and applies systemd
+hardening. Webhook commands must be readable and executable by that account.
 
-```sh
-sudo useradd --system --home /var/lib/maidcafe --create-home maidcafe
-```
+## CI artifacts
 
-The unit binds the configured daemon address, runs as `maidcafe`, restarts after
-failure, and allows outbound cloud HTTPS publishing. Webhook commands must be
-absolute paths readable and executable by that account.
+GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/build.yml):
 
-Cloud mode requires PostgreSQL and a Solar Network auth target. `POST /api/daemons`
-returns a daemon ID and a credential once. Store that credential in the daemon
-configuration; `POST /api/daemons/:id/rotate-secret` invalidates the old credential
-and returns a replacement once.
+- Pull requests run tests and builds and build the cloud image without pushing.
+- `master` pushes publish the cloud image to GHCR.
+- `v*` tags publish a versioned cloud image.
+- Every verified workflow run uploads a daemon systemd bundle containing the
+  daemon binary, unit file, and example configuration.
 
-Daemon mode can run with no cloud URL or secret. Configure named absolute-path
-webhooks and call one with:
+Set the repository variable `PACKAGE_OWNER` to the GHCR owner used by the image
+name.
 
-```sh
-curl -X POST http://127.0.0.1:8747/api/v1/webhooks/backup \
-  -H 'Authorization: Bearer replace-with-local-webhook-secret' \
-  --data-binary '{"job":"incremental"}'
-```
+## Security boundary
 
-The request body is opaque stdin data. It is never parsed as shell syntax and is
-never appended to the configured command's static argument list. The daemon invokes
-the absolute command directly, without `sh -c`. When both `cloudUrl` and
-`cloudSecret` are configured, it periodically publishes metrics and optionally
-publishes webhook success/failure notifications over HTTPS POST. Publishing
-failures are dropped and do not affect local execution.
+Webhook request bodies are data delivered to process stdin. They are not shell
+syntax. Commands and arguments come only from validated static configuration.
+Daemon secrets are sent only in the `Authorization` header, never in query
+parameters or cookies.
