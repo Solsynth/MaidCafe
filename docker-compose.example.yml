@@ -1,0 +1,30 @@
+services:
+  cloud:
+    build:
+      context: .
+    environment:
+      CONFIG_PATH: /etc/maidcafe/config.toml
+    volumes:
+      - ./config.toml:/etc/maidcafe/config.toml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: maidcafe
+      POSTGRES_USER: maidcafe
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - maidcafe-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maidcafe -d maidcafe"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  maidcafe-postgres:

@@ -1,0 +1,26 @@
+[Unit]
+Description=MaidCafe MaidKit daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=maidcafe
+Group=maidcafe
+ExecStart=/usr/local/bin/maidcafe-daemon --config /etc/maidcafe/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# Keep the daemon's configuration and executable immutable at runtime while
+# allowing configured scripts to use the dedicated state directory.
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+[app]
+name = "MaidCafe"
+
+[http]
+port = "8080"
+
+[database]
+# Required by cloud mode.
+dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"
+
+[auth]
+target = "stargate:9090"
+useTLS = true
+tlsSkipVerify = false
+
+[eventbus]
+# Optional NATS URL; empty keeps PostgreSQL as the source of truth.
+url = ""
+
+[daemon]
+id = "maidkit-host-01"
+listen = "127.0.0.1:8747"
+cloudUrl = "https://maidcafe.example.com"
+cloudSecret = "replace-with-cloud-issued-secret"
+metricsInterval = "1m"
+requestTimeout = "10s"
+scriptTimeout = "30s"
+maxBodyBytes = 65536
+maxConcurrentRuns = 4
+
+[[daemon.webhooks]]
+name = "backup"
+secret = "replace-with-local-webhook-secret"
+command = "/usr/local/bin/maidkit-backup"
+args = ["--mode", "incremental"]
+enabled = true
+notifyOnSuccess = false
+notifyOnFailure = true
