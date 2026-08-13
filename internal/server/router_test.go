@@ -36,6 +36,14 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	if err := json.Unmarshal(health.Body.Bytes(), &healthJSON); err != nil || healthJSON["mode"] != "cloud" {
 		t.Fatalf("health body %s", health.Body)
 	}
+	landing := httptest.NewRecorder()
+	router.ServeHTTP(landing, httptest.NewRequest(http.MethodGet, "/", nil))
+	if landing.Code != http.StatusOK ||
+		!strings.Contains(landing.Header().Get("Content-Type"), "text/html") ||
+		!strings.Contains(landing.Body.String(), "Your MaidCafe cloud is ready.") ||
+		!strings.Contains(landing.Body.String(), "Use MaidKit to connect") {
+		t.Fatalf("landing page response %d %q", landing.Code, landing.Body.String())
+	}
 
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		unauth := httptest.NewRecorder()
