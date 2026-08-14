@@ -47,6 +47,7 @@ type EventbusConfig struct {
 }
 type DaemonConfig struct {
 	ID                string          `mapstructure:"id"`
+	Transport         string          `mapstructure:"transport"`
 	Listen            string          `mapstructure:"listen"`
 	CloudURL          string          `mapstructure:"cloudUrl"`
 	CloudSecret       string          `mapstructure:"cloudSecret"`
@@ -56,6 +57,7 @@ type DaemonConfig struct {
 	MaxBodyBytes      int64           `mapstructure:"maxBodyBytes"`
 	MaxConcurrentRuns int             `mapstructure:"maxConcurrentRuns"`
 	Webhooks          []WebhookConfig `mapstructure:"webhooks"`
+	Actions           []WebhookConfig `mapstructure:"actions"`
 }
 type WebhookConfig struct {
 	Name            string   `mapstructure:"name"`
@@ -88,6 +90,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("ring.target", "")
 	viper.SetDefault("ring.useTLS", false)
 	viper.SetDefault("ring.tlsSkipVerify", false)
+	viper.SetDefault("daemon.transport", "http")
 	viper.SetDefault("daemon.listen", "127.0.0.1:8747")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
@@ -114,7 +117,7 @@ func applyEnvAliases() {
 	aliases := map[string]string{
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
-		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_LISTEN": "daemon.listen",
+		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_CLOUD_URL": "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
 		"DAEMON_SCRIPT_TIMEOUT": "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
@@ -144,8 +147,17 @@ func (c *Config) ValidateDaemon() error {
 	if strings.TrimSpace(c.Daemon.ID) == "" {
 		return fmt.Errorf("daemon.id is required in daemon mode")
 	}
-	if err := validateListen(c.Daemon.Listen); err != nil {
-		return fmt.Errorf("daemon.listen: %w", err)
+	transport := strings.ToLower(strings.TrimSpace(c.Daemon.Transport))
+	if transport == "" {
+		transport = "http"
+	}
+	if transport != "http" && transport != "stdio" {
+		return fmt.Errorf("daemon.transport must be http or stdio")
+	}
+	if transport == "http" {
+		if err := validateListen(c.Daemon.Listen); err != nil {
+			return fmt.Errorf("daemon.listen: %w", err)
+		}
 	}
 	if c.Daemon.MetricsInterval <= 0 {
 		return fmt.Errorf("daemon.metricsInterval must be positive")
@@ -162,7 +174,7 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.MaxConcurrentRuns <= 0 {
 		return fmt.Errorf("daemon.maxConcurrentRuns must be positive")
 	}
-	seen := make(map[string]struct{}, len(c.Daemon.Webhooks))
+	seen := make(map[string]struct{}, len(c.Daemon.Webhooks)+len(c.Daemon.Actions))
 	for i, hook := range c.Daemon.Webhooks {
 		if strings.TrimSpace(hook.Name) == "" || !webhookNamePattern.MatchString(hook.Name) {
 			return fmt.Errorf("daemon.webhooks[%d].name must match [A-Za-z0-9._-]+", i)
@@ -176,6 +188,18 @@ func (c *Config) ValidateDaemon() error {
 		}
 		if !filepath.IsAbs(hook.Command) {
 			return fmt.Errorf("daemon.webhooks[%d].command must be an absolute path", i)
+		}
+	}
+	for i, action := range c.Daemon.Actions {
+		if strings.TrimSpace(action.Name) == "" || !webhookNamePattern.MatchString(action.Name) {
+			return fmt.Errorf("daemon.actions[%d].name must match [A-Za-z0-9._-]+", i)
+		}
+		if _, ok := seen[action.Name]; ok {
+			return fmt.Errorf("daemon.actions[%d].name %q is duplicated", i, action.Name)
+		}
+		seen[action.Name] = struct{}{}
+		if !filepath.IsAbs(action.Command) {
+			return fmt.Errorf("daemon.actions[%d].command must be an absolute path", i)
 		}
 	}
 	if strings.TrimSpace(c.Daemon.CloudURL) != "" {

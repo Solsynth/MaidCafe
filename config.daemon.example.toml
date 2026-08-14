@@ -1,5 +1,6 @@
 [daemon]
 id = "maidkit-host-01"
+transport = "http"
 listen = "127.0.0.1:8747"
 cloudUrl = "https://mk.solsynth.dev"
 cloudSecret = "replace-with-cloud-issued-secret"
@@ -17,3 +18,9 @@ args = ["--mode", "incremental"]
 enabled = true
 notifyOnSuccess = false
 notifyOnFailure = true
+
+[[daemon.actions]]
+name = "cleanup"
+command = "/usr/local/bin/maidkit-cleanup"
+args = ["--retention-days", "7"]
+enabled = true

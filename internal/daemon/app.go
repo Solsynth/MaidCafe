@@ -52,11 +52,24 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		publisher.PublishNotification(context.Background(), notificationPayload{Kind: kind, Title: title, Body: body, Metadata: map[string]any{"name": hook.Name, "exit_code": exitCode, "duration_ms": duration.Milliseconds()}})
 	})
 
+	if strings.EqualFold(strings.TrimSpace(cfg.Transport), "stdio") {
+		app.server = nil
+		return app, nil
+	}
 	router := gin.New()
 	router.Use(gin.Recovery())
-	router.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "daemon", "id": cfg.ID}) })
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "daemon", "id": cfg.ID})
+	})
 	router.POST("/api/v1/webhooks/:name", executor.GinHandler())
-	app.server = &http.Server{Addr: cfg.Listen, Handler: router, ReadHeaderTimeout: cfg.RequestTimeout, ReadTimeout: cfg.RequestTimeout, WriteTimeout: cfg.RequestTimeout, IdleTimeout: cfg.RequestTimeout}
+	app.server = &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           router,
+		ReadHeaderTimeout: cfg.RequestTimeout,
+		ReadTimeout:       cfg.RequestTimeout,
+		WriteTimeout:      cfg.RequestTimeout,
+		IdleTimeout:       cfg.RequestTimeout,
+	}
 	return app, nil
 }
 func (a *App) Start() error {
@@ -82,6 +95,9 @@ func (a *App) ListenAddr() string {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	if strings.EqualFold(strings.TrimSpace(a.cfg.Transport), "stdio") {
+		return a.runStdio(ctx)
+	}
 	if err := a.Start(); err != nil {
 		return err
 	}

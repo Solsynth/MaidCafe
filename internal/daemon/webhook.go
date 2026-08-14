@@ -43,6 +43,7 @@ func (b *limitedBuffer) String() string { return b.buf.String() }
 
 type WebhookExecutor struct {
 	hooks         map[string]config.WebhookConfig
+	actions       map[string]config.WebhookConfig
 	scriptTimeout time.Duration
 	maxBodyBytes  int64
 	slots         chan struct{}
@@ -51,11 +52,22 @@ type WebhookExecutor struct {
 }
 
 func NewWebhookExecutor(cfg config.DaemonConfig) *WebhookExecutor {
-	hooks := make(map[string]config.WebhookConfig, len(cfg.Webhooks))
+	hooks := make(map[string]config.WebhookConfig, len(cfg.Webhooks)+len(cfg.Actions))
+	actions := make(map[string]config.WebhookConfig, len(cfg.Actions))
 	for _, h := range cfg.Webhooks {
 		hooks[h.Name] = h
 	}
-	return &WebhookExecutor{hooks: hooks, scriptTimeout: cfg.ScriptTimeout, maxBodyBytes: cfg.MaxBodyBytes, slots: make(chan struct{}, cfg.MaxConcurrentRuns)}
+	for _, action := range cfg.Actions {
+		hooks[action.Name] = action
+		actions[action.Name] = action
+	}
+	return &WebhookExecutor{
+		hooks:         hooks,
+		actions:       actions,
+		scriptTimeout: cfg.ScriptTimeout,
+		maxBodyBytes:  cfg.MaxBodyBytes,
+		slots:         make(chan struct{}, cfg.MaxConcurrentRuns),
+	}
 }
 func (e *WebhookExecutor) SetCompletionHandler(handler func(config.WebhookConfig, bool, int, string, time.Duration)) {
 	e.onComplete = handler
@@ -134,6 +146,67 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 		e.onComplete(hook, err == nil, exitCode, stderr.String(), duration)
 	}
 	return executionResponse{OK: err == nil, Name: name, ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}, status, nil
+}
+
+// RunAction executes a configured action through an authenticated SSH/stdin
+// transport. SSH already provides the transport boundary, so action secrets
+// are not required in this mode.
+func (e *WebhookExecutor) RunAction(
+	ctx context.Context,
+	name string,
+	body []byte,
+) (executionResponse, *requestError) {
+	if int64(len(body)) > e.maxBodyBytes {
+		return executionResponse{}, &requestError{
+			status:  http.StatusRequestEntityTooLarge,
+			message: "request body too large",
+		}
+	}
+	hook, exists := e.actions[name]
+	if !exists || !hook.Enabled {
+		return executionResponse{}, &requestError{
+			status:  http.StatusNotFound,
+			message: "not found",
+		}
+	}
+	select {
+	case e.slots <- struct{}{}:
+		defer func() { <-e.slots }()
+	default:
+		return executionResponse{}, &requestError{
+			status:  http.StatusTooManyRequests,
+			message: "too many concurrent runs",
+		}
+	}
+	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, hook.Command, hook.Args...)
+	cmd.Dir = "/"
+	cmd.Stdin = bytes.NewReader(body)
+	stdout, stderr := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	start := time.Now()
+	err := cmd.Run()
+	duration := time.Since(start)
+	exitCode := 0
+	if err != nil {
+		e.counts.failures.Add(1)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	} else {
+		e.counts.successes.Add(1)
+	}
+	if e.onComplete != nil {
+		e.onComplete(hook, err == nil, exitCode, stderr.String(), duration)
+	}
+	return executionResponse{
+		OK:       err == nil,
+		Name:     name,
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+	}, nil
 }
 
 func (e *WebhookExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request) {

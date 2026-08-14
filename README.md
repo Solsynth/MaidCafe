@@ -65,6 +65,24 @@ GET /health
 {"ok":true,"mode":"daemon","id":"..."}
 ```
 
+### SSH stdio daemon mode
+
+Set `daemon.transport = "stdio"` to run without a listening HTTP port. MaidKit
+starts `/usr/local/bin/maidcafe-daemon` over SSH and exchanges newline-delimited
+JSON on stdin/stdout:
+
+```json
+{"type":"request","id":"1","action":"health"}
+{"type":"request","id":"2","action":"metrics"}
+{"type":"request","id":"3","action":"action","name":"backup","body":{"job":"incremental"}}
+```
+
+The daemon emits a `ready` event, periodic `metrics` events, and one response
+per request. SSH authentication is the transport boundary for actions, so
+`daemon.actions` entries use fixed absolute commands and fixed argument lists
+without webhook secrets. MaidKit's server detail page installs this mode and
+lets the user define those action presets.
+
 ### Optional cloud publishing from the daemon
 
 When both `daemon.cloudUrl` and `daemon.cloudSecret` are configured, the daemon:
