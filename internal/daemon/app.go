@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -59,9 +60,38 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "daemon", "id": cfg.ID})
+		c.JSON(http.StatusOK, gin.H{
+			"ok":      true,
+			"mode":    "daemon",
+			"id":      cfg.ID,
+			"version": cfg.Version,
+		})
+	})
+	router.GET("/api/v1/metrics", func(c *gin.Context) {
+		c.JSON(http.StatusOK, app.metrics.Collect())
+	})
+	router.POST("/api/v1/actions/:name", func(c *gin.Context) {
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		response, requestErr := executor.RunAction(
+			c.Request.Context(),
+			c.Param("name"),
+			body,
+		)
+		if requestErr != nil {
+			c.JSON(
+				requestErr.status,
+				gin.H{"ok": false, "error": requestErr.message},
+			)
+			return
+		}
+		c.JSON(http.StatusOK, response)
 	})
 	router.POST("/api/v1/webhooks/:name", executor.GinHandler())
+
 	app.server = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           router,

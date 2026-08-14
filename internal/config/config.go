@@ -47,6 +47,7 @@ type EventbusConfig struct {
 }
 type DaemonConfig struct {
 	ID                string          `mapstructure:"id"`
+	Version           string          `mapstructure:"version"`
 	Transport         string          `mapstructure:"transport"`
 	Listen            string          `mapstructure:"listen"`
 	CloudURL          string          `mapstructure:"cloudUrl"`
