@@ -71,9 +71,44 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  daemon-systemd-artifact:
+  daemon-artifacts:
     needs: verify
+    if: github.event_name == 'pull_request' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            architecture: amd64
+            goos: linux
+            goarch: amd64
+            extension: ''
+          - platform: linux
+            architecture: arm64
+            goos: linux
+            goarch: arm64
+            extension: ''
+          - platform: darwin
+            architecture: amd64
+            goos: darwin
+            goarch: amd64
+            extension: ''
+          - platform: darwin
+            architecture: arm64
+            goos: darwin
+            goarch: arm64
+            extension: ''
+          - platform: windows
+            architecture: amd64
+            goos: windows
+            goarch: amd64
+            extension: .exe
+          - platform: windows
+            architecture: arm64
+            goos: windows
+            goarch: arm64
+            extension: .exe
     permissions:
       contents: read
     steps:
@@ -86,35 +121,103 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build daemon systemd bundle
+      - name: Build compressed daemon binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
         run: |
-          mkdir -p dist/maidcafe-daemon
-          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
-            -o dist/maidcafe-daemon/maidcafe-daemon ./cmd/daemon
-          cp deploy/maidcafe-daemon.service dist/maidcafe-daemon/
-          cp config.daemon.example.toml dist/maidcafe-daemon/config.daemon.example.toml
-          tar -C dist -czf maidcafe-daemon-systemd.tar.gz maidcafe-daemon
+          set -eu
+          mkdir -p dist
+          binary="maidcafe-daemon${{ matrix.extension }}"
+          archive="maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz"
+          go build -trimpath -ldflags='-s -w' -o "dist/$binary" ./cmd/daemon
+          tar -C dist -czf "$archive" "$binary"
 
-      - name: Upload daemon systemd bundle
+      - name: Upload compressed daemon binary
         uses: actions/upload-artifact@v4
         with:
-          name: maidcafe-daemon-systemd-${{ github.sha }}
-          path: maidcafe-daemon-systemd.tar.gz
+          name: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}-${{ github.sha }}
+          path: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+
+  daemon-rolling-artifacts:
+    needs: verify
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            architecture: amd64
+            goos: linux
+            goarch: amd64
+          - platform: linux
+            architecture: arm64
+            goos: linux
+            goarch: arm64
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build compressed rolling daemon binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -eu
+          mkdir -p dist
+          binary=maidcafe-daemon
+          archive="maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz"
+          go build -trimpath -ldflags='-s -w' -o "dist/$binary" ./cmd/daemon
+          tar -C dist -czf "$archive" "$binary"
+
+      - name: Upload compressed rolling daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}-${{ github.sha }}
+          path: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
 
   # Configure repository variable DISTRIBUTION_API_BASE_URL and
   # DISTRIBUTION_PRODUCT_ID, plus secret DISTRIBUTION_UPLOAD_KEY.
   upload-daemon-to-distribution:
-    needs: daemon-systemd-artifact
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/') && needs.daemon-systemd-artifact.result == 'success'
+    needs: daemon-artifacts
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/') && needs.daemon-artifacts.result == 'success'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            architecture: amd64
+          - platform: linux
+            architecture: arm64
+          - platform: darwin
+            architecture: amd64
+          - platform: darwin
+            architecture: arm64
+          - platform: windows
+            architecture: amd64
+          - platform: windows
+            architecture: arm64
     permissions:
       contents: read
     steps:
-      - name: Download daemon systemd bundle
+      - name: Download daemon binary
         uses: actions/download-artifact@v4
         with:
-          name: maidcafe-daemon-systemd-${{ github.sha }}
+          name: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}-${{ github.sha }}
           path: ./dist
 
       - name: Resolve distribution version
@@ -128,31 +231,39 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Upload daemon systemd bundle to DistributionCenter
+      - name: Upload daemon binary to DistributionCenter
         uses: Solsynth/SolsynthExpressUpload@v2
         with:
           api-base-url: ${{ vars.DISTRIBUTION_API_BASE_URL }}
           product-id: ${{ vars.DISTRIBUTION_PRODUCT_ID }}
           api-key: ${{ secrets.DISTRIBUTION_UPLOAD_KEY }}
           version: ${{ steps.distribution_version.outputs.version }}
-          file: ./dist/maidcafe-daemon-systemd.tar.gz
-          platform: linux
-          architecture: amd64
+          file: ./dist/maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+          platform: ${{ matrix.platform }}
+          architecture: ${{ matrix.architecture }}
           mime-type: application/gzip
           channel: stable
 
   # Publish the latest master commit independently from stable releases.
   upload-daemon-rolling-to-distribution:
-    needs: daemon-systemd-artifact
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && needs.daemon-systemd-artifact.result == 'success'
+    needs: daemon-rolling-artifacts
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && needs.daemon-rolling-artifacts.result == 'success'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            architecture: amd64
+          - platform: linux
+            architecture: arm64
     permissions:
       contents: read
     steps:
-      - name: Download daemon systemd bundle
+      - name: Download daemon binary
         uses: actions/download-artifact@v4
         with:
-          name: maidcafe-daemon-systemd-${{ github.sha }}
+          name: maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}-${{ github.sha }}
           path: ./dist
 
       - name: Resolve rolling version
@@ -160,15 +271,15 @@ jobs:
         shell: bash
         run: echo "version=${GITHUB_SHA:0:6}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload rolling daemon bundle to DistributionCenter
+      - name: Upload rolling daemon binary to DistributionCenter
         uses: Solsynth/SolsynthExpressUpload@v2
         with:
           api-base-url: ${{ vars.DISTRIBUTION_API_BASE_URL }}
           product-id: ${{ vars.DISTRIBUTION_PRODUCT_ID }}
           api-key: ${{ secrets.DISTRIBUTION_UPLOAD_KEY }}
           version: ${{ steps.rolling_version.outputs.version }}
-          file: ./dist/maidcafe-daemon-systemd.tar.gz
-          platform: linux
-          architecture: amd64
+          file: ./dist/maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+          platform: ${{ matrix.platform }}
+          architecture: ${{ matrix.architecture }}
           mime-type: application/gzip
           channel: rolling

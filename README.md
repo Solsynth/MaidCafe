@@ -264,12 +264,13 @@ GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/b
 - Version tags publish a versioned cloud image.
 - Manual workflow runs are also supported. Run them from a version tag for a
   stable release or from `master` for a rolling release.
-- Every verified workflow run uploads a daemon systemd bundle containing the
-  daemon binary, unit file, and example configuration.
-- Version tags without a leading `v` (for example `1.2.3`) upload that daemon
-  bundle to DistributionCenter as the stable `linux`/`amd64` artifact.
-- Every commit pushed to `master` also uploads the daemon bundle to the rolling
-  channel. Its version is the first six characters of the commit SHA.
+- Pull requests validate the daemon build matrix without publishing daemon artifacts.
+- Version tags without a leading `v` (for example `1.2.3`) publish compressed
+  daemon-binary-only archives for Linux, macOS, and Windows on `amd64` and
+  `arm64` to the stable channel.
+- Every commit pushed to `master` publishes only Linux `amd64` and `arm64`
+  daemon archives to the rolling channel. Its version is the first six
+  characters of the commit SHA.
 
 Set the repository variable `PACKAGE_OWNER` to the GHCR owner used by the image
 name. For daemon artifact publishing, create a DistributionCenter product and
@@ -279,11 +280,10 @@ product-scoped upload key, then set:
 - `DISTRIBUTION_PRODUCT_ID` repository variable
 - `DISTRIBUTION_UPLOAD_KEY` repository secret
 
-DistributionCenter can return a daemon artifact's download URL to a server
-using the product release API filtered by channel, `platform=linux`, and
-`architecture=amd64`. Use `channel=stable` for version-tagged releases or
-`channel=rolling` with the six-character commit version for the latest commit
-build.
+DistributionCenter returns a daemon artifact's download URL by matching the
+release channel, platform, and architecture. The archive contains only the
+compressed daemon binary; MaidKit supplies configuration and service-manager
+integration on the target host.
 
 ## Security boundary
 
