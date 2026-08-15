@@ -93,10 +93,12 @@ func (a *AuditLogger) Record(entry auditEntry) {
 // Recent returns up to [limit] (bounded to 500) of the newest entries,
 // newest first. The rotated file is read before the active one so entries
 // stay in order across the rotation boundary; unreadable or malformed lines
-// are skipped.
+// are skipped. A disabled logger yields an empty (non-nil) slice so the API
+// always responds with `entries: []`.
 func (a *AuditLogger) Recent(limit int) []auditEntry {
+	entries := []auditEntry{}
 	if a == nil {
-		return nil
+		return entries
 	}
 	if limit <= 0 {
 		limit = 50
@@ -106,7 +108,6 @@ func (a *AuditLogger) Recent(limit int) []auditEntry {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	var entries []auditEntry
 	appendFile := func(path string) {
 		file, err := os.Open(path)
 		if err != nil {

@@ -90,7 +90,7 @@ func TestAuditLoggerDisabledWhenUnwritable(t *testing.T) {
 	}
 	var nilLogger *AuditLogger
 	nilLogger.Record(auditEntry{Name: "x"})
-	if got := nilLogger.Recent(5); got != nil {
+	if got := nilLogger.Recent(5); len(got) != 0 {
 		t.Fatalf("nil logger Recent = %v", got)
 	}
 }
