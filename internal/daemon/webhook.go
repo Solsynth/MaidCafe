@@ -8,10 +8,13 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,6 +22,54 @@ import (
 	"github.com/gin-gonic/gin"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
+
+// templateVarPattern matches {{ name }} placeholders inside action scripts.
+// Names are deliberately free-form (no case convention): the requester picks
+// the vocabulary, e.g. {{ SERVICE_NAME }} or {{ serviceName }}.
+var templateVarPattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
+
+// substituteScriptTemplate replaces {{ name }} placeholders in the action
+// script at [scriptPath] with values from the JSON request [body]. The
+// runner is an SSH- or HMAC-authenticated trusted source, so values are
+// inserted verbatim (no shell escaping); template control is the feature,
+// not a boundary against untrusted input. A placeholder whose name is absent
+// from the body is an error so a missing value never silently becomes a
+// broken command line.
+func substituteScriptTemplate(scriptPath string, body []byte) ([]byte, error) {
+	source, err := os.ReadFile(scriptPath)
+	if err != nil {
+		return nil, fmt.Errorf("read action script: %w", err)
+	}
+	var values map[string]any
+	if len(bytes.TrimSpace(body)) > 0 {
+		// The body is also piped to the script on stdin, so it may be
+		// arbitrary bytes; only JSON bodies can carry template values.
+		_ = json.Unmarshal(body, &values)
+	}
+	var missing []string
+	substituted := templateVarPattern.ReplaceAllStringFunc(
+		string(source),
+		func(match string) string {
+			name := templateVarPattern.FindStringSubmatch(match)[1]
+			value, ok := values[name]
+			if !ok {
+				missing = append(missing, name)
+				return match
+			}
+			if value == nil {
+				return ""
+			}
+			return fmt.Sprint(value)
+		},
+	)
+	if len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"action requires %s",
+			strings.Join(missing, ", "),
+		)
+	}
+	return []byte(substituted), nil
+}
 
 type counters struct {
 	successes atomic.Uint64
@@ -83,6 +134,9 @@ type executionResponse struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
+	// Error carries a request-level failure (template missing a value, unread
+	// script) that is not a script exit; status is 4xx/5xx alongside.
+	Error string `json:"error,omitempty"`
 }
 
 func bearerSecret(r *http.Request) (string, bool) {
@@ -168,7 +222,57 @@ func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig
 	}
 	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, hook.Command, hook.Args...)
+	command, args := hook.Command, hook.Args
+	if hook.Script {
+		// Substitute {{ name }} template variables from the request body and
+		// run the rendered body from a per-run temp file so the deployed
+		// script on disk stays untouched.
+		script, err := substituteScriptTemplate(command, body)
+		if err != nil {
+			return executionResponse{
+				OK:    false,
+				Name:  hook.Name,
+				Error: err.Error(),
+			}, http.StatusBadRequest
+		}
+		tmp, err := os.CreateTemp("", "maidcafe-action-*.sh")
+		if err != nil {
+			return executionResponse{
+				OK:    false,
+				Name:  hook.Name,
+				Error: err.Error(),
+			}, http.StatusInternalServerError
+		}
+		if _, err := tmp.Write(script); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return executionResponse{
+				OK:    false,
+				Name:  hook.Name,
+				Error: err.Error(),
+			}, http.StatusInternalServerError
+		}
+		if err := tmp.Chmod(0o700); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return executionResponse{
+				OK:    false,
+				Name:  hook.Name,
+				Error: err.Error(),
+			}, http.StatusInternalServerError
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return executionResponse{
+				OK:    false,
+				Name:  hook.Name,
+				Error: err.Error(),
+			}, http.StatusInternalServerError
+		}
+		command = tmp.Name()
+		defer func() { os.Remove(command) }()
+	}
+	cmd := exec.CommandContext(runCtx, command, args...)
 	cmd.Dir = "/"
 	cmd.Stdin = bytes.NewReader(body)
 	stdout, stderr := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}

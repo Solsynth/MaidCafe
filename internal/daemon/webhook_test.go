@@ -135,3 +135,93 @@ func TestHealthDoesNotRevealConfiguration(t *testing.T) {
 		t.Fatalf("health leaked config: %s", encoded)
 	}
 }
+
+func TestSubstituteScriptTemplate(t *testing.T) {
+	script := executable(t, "#!/bin/sh\necho '{{ SERVICE_NAME }} → {{ serviceName }}'\n")
+	substituted, err := substituteScriptTemplate(script, []byte(`{"SERVICE_NAME":"nginx","serviceName":"web"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(substituted), "echo 'nginx → web'") {
+		t.Fatalf("unexpected substitution: %q", substituted)
+	}
+
+	// Values are inserted verbatim: the caller is trusted, no escaping.
+	script = executable(t, "#!/bin/sh\ncat {{ PATH }}\n")
+	substituted, err = substituteScriptTemplate(script, []byte(`{"PATH":"/etc/passwd; id"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(substituted) != "#!/bin/sh\ncat /etc/passwd; id\n" {
+		t.Fatalf("verbatim substitution expected, got %q", substituted)
+	}
+
+	// Numbers and JSON null render sensibly.
+	script = executable(t, "#!/bin/sh\necho {{ N }} {{ NIL }}\n")
+	substituted, err = substituteScriptTemplate(script, []byte(`{"N":42,"NIL":null}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(substituted) != "#!/bin/sh\necho 42 \n" {
+		t.Fatalf("scalar substitution expected, got %q", substituted)
+	}
+}
+
+func TestSubstituteScriptTemplateRequiresValues(t *testing.T) {
+	script := executable(t, "#!/bin/sh\necho {{ SERVICE_NAME }}\n")
+	_, err := substituteScriptTemplate(script, []byte(`{"OTHER":"x"}`))
+	if err == nil || !strings.Contains(err.Error(), "SERVICE_NAME") {
+		t.Fatalf("missing variable should fail with its name, got %v", err)
+	}
+
+	// A non-JSON body carries no values; the script must not reference any.
+	_, err = substituteScriptTemplate(script, []byte("not json"))
+	if err == nil || !strings.Contains(err.Error(), "SERVICE_NAME") {
+		t.Fatalf("non-JSON body should surface missing variables, got %v", err)
+	}
+	plain := executable(t, "#!/bin/sh\ncat\n")
+	substituted, err := substituteScriptTemplate(plain, []byte("not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(substituted) != "#!/bin/sh\ncat\n" {
+		t.Fatalf("template-free script must pass through, got %q", substituted)
+	}
+}
+
+func TestScriptActionSubstitutesTemplate(t *testing.T) {
+	script := executable(t, "#!/bin/sh\necho \"hello {{ NAME }}\"\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name:    "greet",
+			Command: script,
+			Script:  true,
+			Enabled: true,
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+
+	result, requestErr := executor.RunAction(
+		context.Background(),
+		"greet",
+		[]byte(`{"NAME":"world"}`),
+	)
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if !result.OK || !strings.Contains(result.Stdout, "hello world") {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	// Missing values fail with a clear message and no script exit code.
+	result, requestErr = executor.RunAction(context.Background(), "greet", []byte(`{}`))
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if result.OK || !strings.Contains(result.Error, "NAME") {
+		t.Fatalf("error should name the missing variable: %+v", result)
+	}
+}

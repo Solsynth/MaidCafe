@@ -83,6 +83,10 @@ type WebhookConfig struct {
 	Enabled         bool     `mapstructure:"enabled"`
 	NotifyOnSuccess bool     `mapstructure:"notifyOnSuccess"`
 	NotifyOnFailure bool     `mapstructure:"notifyOnFailure"`
+	// Script marks command as a MaidKit-deployed script body. The executor
+	// substitutes {{ name }} template variables from the request body into
+	// the script before running it. Plain commands keep Script false.
+	Script bool `mapstructure:"script"`
 }
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
