@@ -49,6 +49,12 @@ func main() {
 		log.Fatal().Err(err).Msg("initialize auth")
 	}
 
+	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(cfg.Workspace)
+	if err != nil {
+		log.Fatal().Err(err).Msg("initialize workspace client")
+	}
+	defer workspaceConn.Close()
+
 	var publishers cloud.FanoutPublisher
 	bus, err := eventbus.New(cfg.Eventbus.URL, cfg.App.Name)
 	if err != nil {
@@ -74,7 +80,7 @@ func main() {
 	if len(publishers) > 0 {
 		publisher = publishers
 	}
-	svc := cloud.NewService(db, publisher)
+	svc := cloud.NewService(db, publisher, workspaces)
 	router := server.NewRouter(cfg, svc, authenticator)
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,

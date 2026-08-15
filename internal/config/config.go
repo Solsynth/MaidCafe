@@ -14,13 +14,14 @@ import (
 )
 
 type Config struct {
-	App      AppConfig      `mapstructure:"app"`
-	HTTP     HTTPConfig     `mapstructure:"http"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Auth     AuthConfig     `mapstructure:"auth"`
-	Eventbus EventbusConfig `mapstructure:"eventbus"`
-	Ring     RingConfig     `mapstructure:"ring"`
-	Daemon   DaemonConfig   `mapstructure:"daemon"`
+	App      AppConfig       `mapstructure:"app"`
+	HTTP     HTTPConfig      `mapstructure:"http"`
+	Database DatabaseConfig  `mapstructure:"database"`
+	Auth     AuthConfig      `mapstructure:"auth"`
+	Workspace WorkspaceConfig `mapstructure:"workspace"`
+	Eventbus EventbusConfig  `mapstructure:"eventbus"`
+	Ring     RingConfig      `mapstructure:"ring"`
+	Daemon   DaemonConfig    `mapstructure:"daemon"`
 }
 
 type AppConfig struct {
@@ -33,6 +34,11 @@ type DatabaseConfig struct {
 	DSN string `mapstructure:"dsn"`
 }
 type AuthConfig struct {
+	Target        string `mapstructure:"target"`
+	UseTLS        bool   `mapstructure:"useTLS"`
+	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
+}
+type WorkspaceConfig struct {
 	Target        string `mapstructure:"target"`
 	UseTLS        bool   `mapstructure:"useTLS"`
 	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
@@ -56,6 +62,11 @@ type DaemonConfig struct {
 	CloudURL             string          `mapstructure:"cloudUrl"`
 	CloudSecret          string          `mapstructure:"cloudSecret"`
 	MetricsInterval      time.Duration   `mapstructure:"metricsInterval"`
+	StreamInterval       time.Duration   `mapstructure:"streamInterval"`
+	ContainersInterval   time.Duration   `mapstructure:"containersInterval"`
+	ProcessesInterval    time.Duration   `mapstructure:"processesInterval"`
+	SystemdInterval      time.Duration   `mapstructure:"systemdInterval"`
+	ProcessesLimit       int             `mapstructure:"processesLimit"`
 	RequestTimeout       time.Duration   `mapstructure:"requestTimeout"`
 	ScriptTimeout        time.Duration   `mapstructure:"scriptTimeout"`
 	MaxBodyBytes         int64           `mapstructure:"maxBodyBytes"`
@@ -90,6 +101,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("auth.target", "")
 	viper.SetDefault("auth.useTLS", true)
 	viper.SetDefault("auth.tlsSkipVerify", false)
+	viper.SetDefault("workspace.target", "")
+	viper.SetDefault("workspace.useTLS", true)
+	viper.SetDefault("workspace.tlsSkipVerify", false)
 	viper.SetDefault("eventbus.url", "")
 	viper.SetDefault("ring.target", "")
 	viper.SetDefault("ring.useTLS", false)
@@ -101,6 +115,11 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
+	viper.SetDefault("daemon.streamInterval", time.Second)
+	viper.SetDefault("daemon.containersInterval", 5*time.Second)
+	viper.SetDefault("daemon.processesInterval", 10*time.Second)
+	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
+	viper.SetDefault("daemon.processesLimit", 50)
 	viper.SetDefault("daemon.requestTimeout", 10*time.Second)
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
@@ -122,14 +141,18 @@ func Load(configPath string) (*Config, error) {
 func applyEnvAliases() {
 	aliases := map[string]string{
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
+		"WORKSPACE_TARGET": "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
-		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
-		"DAEMON_SCRIPT_TIMEOUT": "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
+		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
+		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
+		"DAEMON_SYSTEMD_INTERVAL": "daemon.systemdInterval", "DAEMON_PROCESSES_LIMIT": "daemon.processesLimit",
+		"DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
+		"DAEMON_SCRIPT_TIMEOUT":  "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
 		"DAEMON_MAX_CONCURRENT_RUNS": "daemon.maxConcurrentRuns",
 	}
 	for env, key := range aliases {
@@ -145,6 +168,9 @@ func (c *Config) ValidateCloud() error {
 	}
 	if strings.TrimSpace(c.Auth.Target) == "" {
 		return fmt.Errorf("auth.target is required in cloud mode")
+	}
+	if strings.TrimSpace(c.Workspace.Target) == "" {
+		return fmt.Errorf("workspace.target is required in cloud mode")
 	}
 	if err := validatePort(c.HTTP.Port); err != nil {
 		return fmt.Errorf("http.port: %w", err)
@@ -173,6 +199,21 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.MetricsInterval <= 0 {
 		return fmt.Errorf("daemon.metricsInterval must be positive")
+	}
+	if c.Daemon.StreamInterval <= 0 {
+		return fmt.Errorf("daemon.streamInterval must be positive")
+	}
+	if c.Daemon.ContainersInterval < 0 {
+		return fmt.Errorf("daemon.containersInterval must not be negative")
+	}
+	if c.Daemon.ProcessesInterval < 0 {
+		return fmt.Errorf("daemon.processesInterval must not be negative")
+	}
+	if c.Daemon.SystemdInterval < 0 {
+		return fmt.Errorf("daemon.systemdInterval must not be negative")
+	}
+	if c.Daemon.ProcessesLimit < 1 || c.Daemon.ProcessesLimit > 500 {
+		return fmt.Errorf("daemon.processesLimit must be between 1 and 500")
 	}
 	if c.Daemon.MetricsRetentionDays < 0 || c.Daemon.MetricsRetentionDays > 30 {
 		return fmt.Errorf("daemon.metricsRetentionDays must be 0 (default) or between 1 and 30")

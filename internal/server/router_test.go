@@ -15,6 +15,15 @@ import (
 type routePublisher struct{}
 
 func (routePublisher) Publish(context.Context, cloud.NotificationEvent) error { return nil }
+
+// routeWorkspaces grants account-a member access to ws-a only, mirroring the
+// production DyWorkspaceService contract.
+type routeWorkspaces struct{}
+
+func (routeWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accountID string, _ []int32) (bool, error) {
+	return workspaceID == "ws-a" && accountID == "account-a", nil
+}
+
 func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	db, err := database.NewSQLite()
 	if err != nil {
@@ -24,7 +33,7 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
-	svc := cloud.NewService(db, routePublisher{})
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
 	router := NewRouter(nil, svc, nil)
 
 	health := httptest.NewRecorder()
@@ -53,7 +62,7 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 		}
 	}
 
-	daemon, err := svc.CreateDaemon(context.Background(), "account-a", "host")
+	daemon, err := svc.CreateDaemon(context.Background(), "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}

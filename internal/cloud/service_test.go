@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -17,7 +18,25 @@ func (f *fakePublisher) Publish(_ context.Context, event NotificationEvent) erro
 	return nil
 }
 
-func testService(t *testing.T) (*Service, *database.DB, *fakePublisher) {
+// fakeWorkspaces grants membership to the accounts listed for each workspace.
+type fakeWorkspaces struct {
+	members map[string][]string
+	err     error
+}
+
+func (f *fakeWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accountID string, requiredRoles []int32) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	for _, account := range f.members[workspaceID] {
+		if account == accountID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func testService(t *testing.T) (*Service, *database.DB, *fakePublisher, *fakeWorkspaces) {
 	t.Helper()
 	db, err := database.NewSQLite()
 	if err != nil {
@@ -27,13 +46,14 @@ func testService(t *testing.T) (*Service, *database.DB, *fakePublisher) {
 		t.Fatal(err)
 	}
 	publisher := &fakePublisher{}
-	return NewService(db, publisher), db, publisher
+	workspaces := &fakeWorkspaces{members: map[string][]string{"ws-a": {"account-a"}, "ws-b": {"account-a"}}}
+	return NewService(db, publisher, workspaces), db, publisher, workspaces
 }
 func TestDaemonCredentialsOwnershipAndRotation(t *testing.T) {
-	svc, db, _ := testService(t)
+	svc, db, _, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	created, err := svc.CreateDaemon(ctx, "account-a", "host")
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,10 +88,10 @@ func TestDaemonCredentialsOwnershipAndRotation(t *testing.T) {
 	}
 }
 func TestNotificationPersistenceAndEventPublication(t *testing.T) {
-	svc, db, publisher := testService(t)
+	svc, db, publisher, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	daemon, err := svc.CreateDaemon(ctx, "account-a", "host")
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +102,7 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 	if len(publisher.events) != 1 || publisher.events[0].NotificationID != notification.ID {
 		t.Fatalf("event mismatch: %#v", publisher.events)
 	}
-	rows, err := svc.ListNotifications(ctx, "account-a", true, "", 50, nil)
+	rows, err := svc.ListNotifications(ctx, "account-a", "ws-a", true, "", 50, nil)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("unread listing: %v %#v", err, rows)
 	}
@@ -92,19 +112,19 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 	if err := svc.MarkNotificationRead(ctx, "account-a", notification.ID); err != nil {
 		t.Fatal(err)
 	}
-	rows, err = svc.ListNotifications(ctx, "account-a", true, "", 50, nil)
+	rows, err = svc.ListNotifications(ctx, "account-a", "ws-a", true, "", 50, nil)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("read acknowledgement: %v %#v", err, rows)
 	}
-	if _, err := svc.ListNotifications(ctx, "account-b", false, "", 50, nil); err != nil {
-		t.Fatal(err)
+	if _, err := svc.ListNotifications(ctx, "account-b", "ws-a", false, "", 50, nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-member listing expected forbidden, got %v", err)
 	}
 }
 func TestMetricHistoryIsOwnedAndOrdered(t *testing.T) {
-	svc, db, _ := testService(t)
+	svc, db, _, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	daemon, err := svc.CreateDaemon(ctx, "account-a", "host")
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,10 +144,10 @@ func TestMetricHistoryIsOwnedAndOrdered(t *testing.T) {
 	}
 }
 func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
-	svc, db, publisher := testService(t)
+	svc, db, publisher, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	daemon, err := svc.CreateDaemon(ctx, "account-a", "host")
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +157,7 @@ func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
 	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{SentAt: time.Now(), CPUPercent: 90}); err != nil {
 		t.Fatal(err)
 	}
-	notifications, err := svc.ListNotifications(ctx, "account-a", false, daemon.ID, 50, nil)
+	notifications, err := svc.ListNotifications(ctx, "account-a", "ws-a", false, daemon.ID, 50, nil)
 	if err != nil || len(notifications) != 1 || notifications[0].Kind != "daemon.alarm.cpu_percent" {
 		t.Fatalf("alarm notification: %v %#v", err, notifications)
 	}
@@ -153,10 +173,10 @@ func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
 }
 
 func TestWebhookRelayLifecycle(t *testing.T) {
-	svc, db, _ := testService(t)
+	svc, db, _, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	created, err := svc.CreateDaemon(ctx, "account-a", "host")
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,10 +231,10 @@ func TestWebhookRelayLifecycle(t *testing.T) {
 }
 
 func TestWebhookRelayReclaimsExpiredLeases(t *testing.T) {
-	svc, db, _ := testService(t)
+	svc, db, _, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
-	created, err := svc.CreateDaemon(ctx, "account-a", "host")
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,5 +256,71 @@ func TestWebhookRelayReclaimsExpiredLeases(t *testing.T) {
 	}
 	if len(pending) != 1 || pending[0].ID != enqueued.ID {
 		t.Fatalf("expired lease not reclaimed: %#v", pending)
+	}
+}
+
+func TestWorkspaceMembershipGatesDaemonAccess(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	// account-b is not a member of ws-a: creation must fail closed.
+	if _, err := svc.CreateDaemon(ctx, "account-b", "ws-a", "intruder"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-member create expected forbidden, got %v", err)
+	}
+	if _, err := svc.ListDaemons(ctx, "account-b", "ws-a"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-member list expected forbidden, got %v", err)
+	}
+
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.WorkspaceID != "ws-a" {
+		t.Fatalf("daemon workspace not persisted: %#v", created)
+	}
+	// Direct id access without membership is forbidden, not just creation.
+	if _, err := svc.GetDaemon(ctx, "account-b", created.ID); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-member read expected forbidden, got %v", err)
+	}
+	if _, err := svc.ListMetrics(ctx, "account-b", created.ID, 10, nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-member metrics expected forbidden, got %v", err)
+	}
+
+	// Daemons only appear in their own workspace listing.
+	daemons, err := svc.ListDaemons(ctx, "account-a", "ws-b")
+	if err != nil || len(daemons) != 0 {
+		t.Fatalf("workspace isolation: %v %#v", err, daemons)
+	}
+	daemons, err = svc.ListDaemons(ctx, "account-a", "ws-a")
+	if err != nil || len(daemons) != 1 || daemons[0].ID != created.ID {
+		t.Fatalf("workspace listing: %v %#v", err, daemons)
+	}
+}
+
+func TestWorkspaceServiceFailureFailsClosed(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.err = errors.New("workspace service unreachable")
+
+	if _, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host"); err == nil {
+		t.Fatal("creation granted while workspace service is down")
+	}
+	// Seed a daemon row directly so the read path is exercised.
+	if err := db.Create(&database.Daemon{ID: "d-1", AccountID: "account-a", WorkspaceID: "ws-a", Name: "host", SecretHash: "hash", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.GetDaemon(ctx, "account-a", "d-1"); err == nil {
+		t.Fatal("read granted while workspace service is down")
+	}
+}
+
+func TestCreateDaemonRequiresWorkspace(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := svc.CreateDaemon(ctx, "account-a", "", "host"); err == nil {
+		t.Fatal("daemon created without workspace_id")
 	}
 }

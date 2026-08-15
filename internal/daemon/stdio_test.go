@@ -19,6 +19,8 @@ func TestStdioActionProtocol(t *testing.T) {
 		ID:                "host-stdio",
 		Transport:         "stdio",
 		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Second,
+		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
 		MaxBodyBytes:      1024,

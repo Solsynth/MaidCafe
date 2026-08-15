@@ -3,6 +3,7 @@ package cloud
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,12 +16,73 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
+	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
+	gen "src.solsynth.dev/sosys/go/proto"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
 var ErrNotFound = errors.New("not found")
 var ErrForbidden = errors.New("forbidden")
+
+// workspaceMemberRole is the minimum DyWorkspace member role level required
+// to manage daemons inside a workspace. Role levels follow the workspace
+// contract in ../SolarNetwork/Spec/proto/workspace.proto:
+// Owner=100, Admin=75, Member=50, Viewer=25.
+const workspaceMemberRole int32 = 50
+
+// WorkspaceClient is the small slice of the DyWorkspaceService gRPC surface
+// MaidCafe needs. Keeping it an interface lets the service run against a fake
+// in tests while the production implementation talks to the workspace service
+// through the DysonGo SDK (src.solsynth.dev/sosys/go/proto).
+type WorkspaceClient interface {
+	IsMemberWithRole(ctx context.Context, workspaceID, accountID string, requiredRoles []int32) (bool, error)
+}
+
+// GrpcWorkspaceClient adapts the generated DyWorkspaceServiceClient to
+// WorkspaceClient.
+type GrpcWorkspaceClient struct {
+	client gen.DyWorkspaceServiceClient
+}
+
+func (c GrpcWorkspaceClient) IsMemberWithRole(ctx context.Context, workspaceID, accountID string, requiredRoles []int32) (bool, error) {
+	if c.client == nil {
+		return false, errors.New("workspace client is not configured")
+	}
+	resp, err := c.client.IsMemberWithRole(ctx, &gen.DyIsWorkspaceMemberWithRoleRequest{
+		WorkspaceId:   workspaceID,
+		AccountId:     accountID,
+		RequiredRoles: requiredRoles,
+	})
+	if err != nil {
+		return false, err
+	}
+	return resp.GetValue(), nil
+}
+
+// NewWorkspaceClient dials the DyWorkspaceService gRPC endpoint hosted by the
+// workspace service using the same TLS conventions as the auth client.
+func NewWorkspaceClient(cfg config.WorkspaceConfig) (WorkspaceClient, *grpc.ClientConn, error) {
+	target, useTLS := dyauth.NormalizeAuthGRPCTarget(cfg.Target, cfg.UseTLS)
+	if strings.TrimSpace(target) == "" {
+		return nil, nil, errors.New("workspace gRPC target is empty")
+	}
+	var transportCredentials credentials.TransportCredentials
+	if useTLS {
+		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSSkipVerify})
+	} else {
+		transportCredentials = insecure.NewCredentials()
+	}
+	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(transportCredentials))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial workspace service: %w", err)
+	}
+	return GrpcWorkspaceClient{client: gen.NewDyWorkspaceServiceClient(conn)}, conn, nil
+}
 
 // PushPublisher is deliberately small so event fan-out can be disabled or faked.
 type PushPublisher interface {
@@ -46,6 +108,7 @@ type NotificationEvent struct {
 	EventID        string          `json:"event_id"`
 	Timestamp      time.Time       `json:"timestamp"`
 	AccountID      string          `json:"account_id"`
+	WorkspaceID    string          `json:"workspace_id"`
 	DaemonID       string          `json:"daemon_id"`
 	NotificationID string          `json:"notification_id"`
 	Kind           string          `json:"kind"`
@@ -54,6 +117,9 @@ type NotificationEvent struct {
 	Metadata       json.RawMessage `json:"metadata,omitempty"`
 }
 
+// daemonForAccount loads a daemon and verifies the account may access it.
+// Access is granted through workspace membership: the daemon belongs to a
+// workspace and every member (role >= Member) of that workspace can manage it.
 func (s *Service) daemonForAccount(ctx context.Context, accountID, id string) (database.Daemon, error) {
 	var d database.Daemon
 	if err := s.db.WithContext(ctx).Where("id = ?", id).First(&d).Error; err != nil {
@@ -62,43 +128,63 @@ func (s *Service) daemonForAccount(ctx context.Context, accountID, id string) (d
 		}
 		return d, err
 	}
-	if d.AccountID != accountID {
-		return database.Daemon{}, ErrForbidden
+	if err := s.authorizeWorkspace(ctx, accountID, d.WorkspaceID); err != nil {
+		return database.Daemon{}, err
 	}
 	return d, nil
 }
 
-type Service struct {
-	db        *database.DB
-	publisher PushPublisher
+// authorizeWorkspace fails closed: only a confirmed workspace member with the
+// member role level (or higher) passes. An unreachable workspace service is an
+// error, never a grant.
+func (s *Service) authorizeWorkspace(ctx context.Context, accountID, workspaceID string) error {
+	if s.workspaces == nil {
+		return ErrForbidden
+	}
+	member, err := s.workspaces.IsMemberWithRole(ctx, workspaceID, accountID, []int32{workspaceMemberRole})
+	if err != nil {
+		return fmt.Errorf("check workspace membership: %w", err)
+	}
+	if !member {
+		return ErrForbidden
+	}
+	return nil
 }
 
-func NewService(db *database.DB, publisher PushPublisher) *Service {
-	return &Service{db: db, publisher: publisher}
+type Service struct {
+	db         *database.DB
+	publisher  PushPublisher
+	workspaces WorkspaceClient
+}
+
+func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceClient) *Service {
+	return &Service{db: db, publisher: publisher, workspaces: workspaces}
 }
 
 type DaemonView struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Enabled    bool       `json:"enabled"`
-	LastSeenAt *time.Time `json:"last_seen_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	ID          string     `json:"id"`
+	WorkspaceID string     `json:"workspace_id"`
+	Name        string     `json:"name"`
+	Enabled     bool       `json:"enabled"`
+	LastSeenAt  *time.Time `json:"last_seen_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 type Credential struct {
 	DaemonView
 	Secret string `json:"secret"`
 }
 type NotificationView struct {
-	ID        string         `json:"id"`
-	AccountID string         `json:"account_id"`
-	DaemonID  string         `json:"daemon_id"`
-	Kind      string         `json:"kind"`
-	Title     string         `json:"title"`
-	Body      string         `json:"body"`
-	Metadata  datatypes.JSON `json:"metadata"`
-	ReadAt    *time.Time     `json:"read_at"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID          string         `json:"id"`
+	AccountID   string         `json:"account_id"`
+	WorkspaceID string         `json:"workspace_id"`
+	DaemonID    string         `json:"daemon_id"`
+	Kind        string         `json:"kind"`
+	Title       string         `json:"title"`
+	Body        string         `json:"body"`
+	Metadata    datatypes.JSON `json:"metadata"`
+	ReadAt      *time.Time     `json:"read_at"`
+	CreatedAt   time.Time      `json:"created_at"`
 }
 type MetricInput struct {
 	SentAt             time.Time `json:"sent_at"`
@@ -157,12 +243,19 @@ func generateSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 func viewDaemon(d database.Daemon) DaemonView {
-	return DaemonView{ID: d.ID, Name: d.Name, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
+	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
 }
-func (s *Service) CreateDaemon(ctx context.Context, accountID, name string) (Credential, error) {
+func (s *Service) CreateDaemon(ctx context.Context, accountID, workspaceID, name string) (Credential, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return Credential{}, fmt.Errorf("workspace_id is required")
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Credential{}, fmt.Errorf("name is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return Credential{}, err
 	}
 	secret, err := generateSecret()
 	if err != nil {
@@ -172,15 +265,22 @@ func (s *Service) CreateDaemon(ctx context.Context, accountID, name string) (Cre
 	if err != nil {
 		return Credential{}, err
 	}
-	d := database.Daemon{ID: uuid.NewString(), AccountID: accountID, Name: name, SecretHash: string(hash), Enabled: true}
+	d := database.Daemon{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: workspaceID, Name: name, SecretHash: string(hash), Enabled: true}
 	if err := s.db.WithContext(ctx).Create(&d).Error; err != nil {
 		return Credential{}, err
 	}
 	return Credential{DaemonView: viewDaemon(d), Secret: secret}, nil
 }
-func (s *Service) ListDaemons(ctx context.Context, accountID string) ([]DaemonView, error) {
+func (s *Service) ListDaemons(ctx context.Context, accountID, workspaceID string) ([]DaemonView, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return nil, err
+	}
 	var rows []database.Daemon
-	if err := s.db.WithContext(ctx).Where("account_id = ?", accountID).Order("created_at desc").Find(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("workspace_id = ?", workspaceID).Order("created_at desc").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]DaemonView, len(rows))
@@ -324,8 +424,8 @@ func (s *Service) DisableDaemon(ctx context.Context, accountID, id string) error
 			}
 			return err
 		}
-		if d.AccountID != accountID {
-			return ErrForbidden
+		if err := s.authorizeWorkspace(ctx, accountID, d.WorkspaceID); err != nil {
+			return err
 		}
 		d.Enabled = false
 		return tx.Save(&d).Error
@@ -382,7 +482,7 @@ func (s *Service) evaluateAlarms(ctx context.Context, daemon database.Daemon, in
 			continue
 		}
 		notification := database.Notification{
-			ID: uuid.NewString(), AccountID: daemon.AccountID, DaemonID: daemon.ID,
+			ID: uuid.NewString(), AccountID: daemon.AccountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemon.ID,
 			Kind:      "daemon.alarm." + alarm.Kind,
 			Title:     fmt.Sprintf("%s threshold exceeded", alarm.Kind),
 			Body:      fmt.Sprintf("%s reached %.2f%% (threshold %.2f%%)", alarm.Kind, value, alarm.Threshold),
@@ -408,6 +508,7 @@ func (s *Service) publishNotification(ctx context.Context, notification database
 		EventID:        uuid.NewString(),
 		Timestamp:      notification.CreatedAt,
 		AccountID:      notification.AccountID,
+		WorkspaceID:    notification.WorkspaceID,
 		DaemonID:       notification.DaemonID,
 		NotificationID: notification.ID,
 		Kind:           notification.Kind,
@@ -418,7 +519,8 @@ func (s *Service) publishNotification(ctx context.Context, notification database
 	_ = s.publisher.Publish(ctx, event)
 }
 func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonID string, input NotificationInput) (NotificationView, error) {
-	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
+	if err != nil {
 		return NotificationView{}, err
 	}
 	kind, err := bound(input.Kind, 128)
@@ -445,7 +547,7 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err != nil || len(normalized) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
-	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, DaemonID: daemonID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
+	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemonID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
 	}
@@ -491,7 +593,7 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err != nil || len(metadata) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
-	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, DaemonID: d.ID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
+	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID, DaemonID: d.ID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err
 	}
@@ -499,16 +601,23 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	return notificationView(n), nil
 }
 func notificationView(n database.Notification) NotificationView {
-	return NotificationView{ID: n.ID, AccountID: n.AccountID, DaemonID: n.DaemonID, Kind: n.Kind, Title: n.Title, Body: n.Body, Metadata: n.Metadata, ReadAt: n.ReadAt, CreatedAt: n.CreatedAt}
+	return NotificationView{ID: n.ID, AccountID: n.AccountID, WorkspaceID: n.WorkspaceID, DaemonID: n.DaemonID, Kind: n.Kind, Title: n.Title, Body: n.Body, Metadata: n.Metadata, ReadAt: n.ReadAt, CreatedAt: n.CreatedAt}
 }
-func (s *Service) ListNotifications(ctx context.Context, accountID string, unread bool, daemonID string, limit int, before *time.Time) ([]NotificationView, error) {
+func (s *Service) ListNotifications(ctx context.Context, accountID, workspaceID string, unread bool, daemonID string, limit int, before *time.Time) ([]NotificationView, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	q := s.db.WithContext(ctx).Where("account_id = ?", accountID)
+	q := s.db.WithContext(ctx).Where("workspace_id = ?", workspaceID)
 	if unread {
 		q = q.Where("read_at IS NULL")
 	}
@@ -536,8 +645,8 @@ func (s *Service) MarkNotificationRead(ctx context.Context, accountID, id string
 		}
 		return err
 	}
-	if n.AccountID != accountID {
-		return ErrForbidden
+	if err := s.authorizeWorkspace(ctx, accountID, n.WorkspaceID); err != nil {
+		return err
 	}
 	if n.ReadAt == nil {
 		now := time.Now().UTC()

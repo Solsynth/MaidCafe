@@ -87,14 +87,19 @@ func serviceStatus(c *gin.Context, err error) {
 func createDaemon(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var in struct {
-			Name string `json:"name"`
+			WorkspaceID string `json:"workspace_id"`
+			Name        string `json:"name"`
 		}
 		if !parseJSON(c, &in) {
 			return
 		}
-		out, err := s.CreateDaemon(c, accountID(c), in.Name)
+		out, err := s.CreateDaemon(c, accountID(c), in.WorkspaceID, in.Name)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
 		c.JSON(http.StatusCreated, out)
@@ -102,9 +107,13 @@ func createDaemon(s *cloud.Service) gin.HandlerFunc {
 }
 func listDaemons(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		out, err := s.ListDaemons(c, accountID(c))
+		out, err := s.ListDaemons(c, accountID(c), c.Query("workspace_id"))
 		if err != nil {
-			serviceStatus(c, err)
+			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
 		c.JSON(http.StatusOK, out)
@@ -320,9 +329,13 @@ func listNotifications(s *cloud.Service) gin.HandlerFunc {
 			}
 			before = &parsed
 		}
-		out, e := s.ListNotifications(c, accountID(c), unread, c.Query("daemon_id"), limit, before)
+		out, e := s.ListNotifications(c, accountID(c), c.Query("workspace_id"), unread, c.Query("daemon_id"), limit, before)
 		if e != nil {
-			serviceStatus(c, e)
+			if errors.Is(e, cloud.ErrForbidden) || errors.Is(e, cloud.ErrNotFound) {
+				serviceStatus(c, e)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": e.Error()})
+			}
 			return
 		}
 		c.JSON(http.StatusOK, out)

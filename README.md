@@ -20,7 +20,9 @@ implemented.
 - Gin HTTP server with recovery middleware and request validation.
 - PostgreSQL persistence through GORM and startup `AutoMigrate`.
 - Solar Network bearer-token authentication for user routes.
-- Account ownership checks for daemon and notification resources.
+- Workspace membership checks through the Solar workspace service
+  (`DyWorkspaceService`): every daemon belongs to a workspace, and any member
+  of that workspace can manage its daemons and notifications.
 - Daemon registration with one-time randomly generated credentials.
 - bcrypt storage for daemon credentials; plaintext secrets are never persisted.
 - Secret rotation that invalidates the previous secret.
@@ -107,35 +109,36 @@ registered daemon secret instead; a daemon secret cannot access user routes.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/daemons` | Create a daemon; returns the one-time secret |
-| `GET` | `/api/daemons` | List owned daemons |
-| `GET` | `/api/daemons/:id` | Read an owned daemon |
+| `POST` | `/api/daemons` | Create a daemon in a workspace; returns the one-time secret |
+| `GET` | `/api/daemons?workspace_id=` | List daemons in a workspace |
+| `GET` | `/api/daemons/:id` | Read a workspace daemon |
 | `PATCH` | `/api/daemons/:id` | Change name or enabled state |
 | `POST` | `/api/daemons/:id/rotate-secret` | Rotate the one-time secret |
 | `DELETE` | `/api/daemons/:id` | Disable daemon and delete its metrics |
 | `POST` | `/api/daemons/:id/metrics` | Ingest daemon metrics |
 | `POST` | `/api/daemons/:id/notifications` | Create a daemon notification |
 
-Create a daemon:
+Create a daemon inside a workspace you belong to:
 
 ```sh
 curl -X POST http://localhost:8080/api/daemons \
   -H 'Authorization: Bearer <solar-token>' \
   -H 'Content-Type: application/json' \
-  -d '{"name":"managed-host-01"}'
+  -d '{"workspace_id":"<workspace-id>","name":"managed-host-01"}'
 ```
 
-The response contains `id`, `name`, and `secret`. Store the secret in the
-managed host configuration. It is not returned by list or read endpoints.
+The response contains `id`, `workspace_id`, `name`, and `secret`. Store the
+secret in the managed host configuration. It is not returned by list or read
+endpoints.
 
 ### Notifications
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/notifications` | List owned notifications |
-| `POST` | `/api/notifications/:id/read` | Mark an owned notification read |
+| `GET` | `/api/notifications?workspace_id=` | List workspace notifications |
+| `POST` | `/api/notifications/:id/read` | Mark a workspace notification read |
 
-`GET /api/notifications` supports `unread`, `daemon_id`, `limit` up to `100`,
+`GET /api/notifications` requires `workspace_id` and additionally supports
 and an RFC3339 `before` cursor.
 
 ## Daemon API
@@ -166,6 +169,41 @@ POST /api/v1/actions/:name
 Authorization: Bearer <metrics-secret>
 ```
 
+### Realtime event stream
+
+`GET /api/v1/stream` serves a Server-Sent Events stream of realtime daemon
+state over HTTP, authenticated with the same metrics secret:
+
+```text
+GET /api/v1/stream?events=metric,containers,processes,systemd
+Authorization: Bearer <metrics-secret>
+```
+
+- `events` is a comma-separated whitelist of event types; omitted means all.
+  Unknown names return `400`.
+- Every frame is standard SSE (`event:`/`data:` lines terminated by a blank
+  line); a `: ping` comment is emitted every 15s while idle.
+- The first frame is always `hello`, carrying the stream version, daemon
+  version, and the configured collection intervals in seconds so clients can
+  detect staleness:
+
+```json
+{"stream":"v1","version":"0.1.0","intervals":{"metric":1,"containers":5,"processes":10,"systemd":30}}
+```
+
+- `metric` frames are the same payload as `GET /api/v1/metrics`, delivered
+  every `streamInterval` (default `1s`) while at least one client subscribes.
+- `containers` frames (every `containersInterval`, default `5s`) report the
+  podman/docker container list, including the compose project extracted from
+  container labels.
+- `processes` frames (every `processesInterval`, default `10s`) report the top
+  `processesLimit` (default `50`, valid `1..500`) CPU consumers.
+- `systemd` frames (every `systemdInterval`, default `30s`) report the merged
+  systemd unit list, including enabled-but-inactive units.
+- Setting a collector interval to `0` disables that collector. Collection is
+  gated on active subscribers and never persists or writes to disk; metrics
+  persistence and cloud publishing stay on `metricsInterval`.
+
 Webhook secrets are separate from the metrics secret. The daemon does not
 provide an HTTP configuration API; MaidKit updates the managed TOML
 configuration over SSH and restarts the service when needed.
@@ -194,6 +232,7 @@ Cloud requires:
 
 - `database.dsn`
 - `auth.target`
+- `workspace.target`
 - `http.port` (default `8080`)
 
 Daemon requires:

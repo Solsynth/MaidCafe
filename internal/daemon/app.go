@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,14 +19,16 @@ import (
 )
 
 type App struct {
-	cfg       config.DaemonConfig
-	executor  *WebhookExecutor
-	metrics   *MetricsCollector
-	publisher *CloudPublisher
-	relay     *WebhookRelay
-	server    *http.Server
-	listener  net.Listener
-	logger    *slog.Logger
+	cfg        config.DaemonConfig
+	executor   *WebhookExecutor
+	metrics    *MetricsCollector
+	publisher  *CloudPublisher
+	relay      *WebhookRelay
+	hub        *StreamHub
+	server     *http.Server
+	listenerMu sync.RWMutex
+	listener   net.Listener
+	logger     *slog.Logger
 }
 
 func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
@@ -43,7 +47,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
-	app := &App{cfg: cfg, executor: executor, metrics: metrics, publisher: publisher, logger: logger}
+	app := &App{cfg: cfg, executor: executor, metrics: metrics, publisher: publisher, hub: NewStreamHub(), logger: logger}
 	app.relay = NewWebhookRelay(publisher, executor, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
@@ -96,6 +100,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	})
 	router.GET("/api/v1/metrics", authorizeMetrics, func(c *gin.Context) {
 		c.JSON(http.StatusOK, app.metrics.Collect())
+	})
+	router.GET("/api/v1/stream", authorizeMetrics, func(c *gin.Context) {
+		handleStream(c, app.hub, cfg)
 	})
 	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
 		parseTime := func(name string) (*time.Time, error) {
@@ -183,7 +190,9 @@ func (a *App) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen daemon: %w", err)
 	}
+	a.listenerMu.Lock()
 	a.listener = listener
+	a.listenerMu.Unlock()
 	a.server.Addr = listener.Addr().String()
 	go func() {
 		if err := a.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -194,6 +203,8 @@ func (a *App) Start() error {
 }
 
 func (a *App) ListenAddr() string {
+	a.listenerMu.RLock()
+	defer a.listenerMu.RUnlock()
 	if a.listener == nil {
 		return ""
 	}
@@ -213,6 +224,7 @@ func (a *App) Run(ctx context.Context) error {
 	if a.relay != nil {
 		go a.relay.Run(ctx)
 	}
+	a.startStreamCollectors(ctx)
 	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -236,4 +248,49 @@ func (a *App) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	return a.server.Shutdown(ctx)
+}
+
+// startStreamCollectors launches one ticker goroutine per enabled stream event
+// type (HTTP transport only). Each collector runs only while at least one SSE
+// subscriber wants its type; the metric collector reuses MetricsCollector.
+// Collect (no persistence), never Record.
+func (a *App) startStreamCollectors(ctx context.Context) {
+	a.runStreamCollector(ctx, "metric", a.cfg.StreamInterval, func(ctx context.Context) ([]byte, error) {
+		return json.Marshal(a.metrics.Collect())
+	})
+	containers := &ContainersCollector{}
+	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, containers.collect)
+	processes := &ProcessesCollector{limit: a.cfg.ProcessesLimit}
+	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, processes.collect)
+	systemd := &SystemdCollector{}
+	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, systemd.collect)
+}
+
+func (a *App) runStreamCollector(ctx context.Context, event string, interval time.Duration, collect func(context.Context) ([]byte, error)) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Per-type gating: zero subscribers means zero collection work.
+				if a.hub.Subscribers(event) == 0 {
+					continue
+				}
+				data, err := collect(ctx)
+				if err != nil {
+					a.logger.Debug("stream collector failed", "event", event, "error", err)
+					continue
+				}
+				if len(data) > 0 {
+					a.hub.Broadcast(event, data)
+				}
+			}
+		}
+	}()
 }

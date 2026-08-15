@@ -27,10 +27,18 @@ func newRelayCloud(t *testing.T) (*cloud.Service, string) {
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
-	svc := cloud.NewService(db, nil)
+	svc := cloud.NewService(db, nil, relayWorkspaces{})
 	cloudServer := httptest.NewServer(server.NewRouter(nil, svc, nil))
 	t.Cleanup(cloudServer.Close)
 	return svc, cloudServer.URL
+}
+
+// relayWorkspaces grants account-a member access to ws-a, mirroring the
+// production DyWorkspaceService contract.
+type relayWorkspaces struct{}
+
+func (relayWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accountID string, _ []int32) (bool, error) {
+	return workspaceID == "ws-a" && accountID == "account-a", nil
 }
 
 func relayDaemonConfig(id, cloudURL, cloudSecret, command string) config.DaemonConfig {
@@ -51,7 +59,7 @@ func relayDaemonConfig(id, cloudURL, cloudSecret, command string) config.DaemonC
 func TestWebhookRelayExecutesAndReportsThroughCloud(t *testing.T) {
 	svc, cloudURL := newRelayCloud(t)
 	ctx := context.Background()
-	daemon, err := svc.CreateDaemon(ctx, "account-a", "host")
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +107,7 @@ func TestWebhookRelayExecutesAndReportsThroughCloud(t *testing.T) {
 func TestWebhookRelayRejectsBadSignatureWithoutExecuting(t *testing.T) {
 	svc, cloudURL := newRelayCloud(t)
 	ctx := context.Background()
-	daemon, err := svc.CreateDaemon(ctx, "account-a", "host")
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
 	if err != nil {
 		t.Fatal(err)
 	}
