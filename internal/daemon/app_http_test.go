@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -116,10 +117,13 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	if metrics.StatusCode != http.StatusOK {
 		t.Fatalf("metrics status = %d", metrics.StatusCode)
 	}
-	app.metrics.Record()
+	sample := app.metrics.Record()
+	historyURL := baseURL + "/api/v1/metrics/history?limit=1&from=" +
+		url.QueryEscape(sample.SentAt.Add(-time.Second).Format(time.RFC3339Nano)) +
+		"&to=" + url.QueryEscape(sample.SentAt.Add(time.Second).Format(time.RFC3339Nano))
 	historyRequest, err := http.NewRequest(
 		http.MethodGet,
-		baseURL+"/api/v1/metrics/history?limit=1",
+		historyURL,
 		nil,
 	)
 	if err != nil {

@@ -46,20 +46,22 @@ type EventbusConfig struct {
 	URL string `mapstructure:"url"`
 }
 type DaemonConfig struct {
-	ID                string          `mapstructure:"id"`
-	Version           string          `mapstructure:"version"`
-	Transport         string          `mapstructure:"transport"`
-	Listen            string          `mapstructure:"listen"`
-	MetricsSecret     string          `mapstructure:"metricsSecret"`
-	CloudURL          string          `mapstructure:"cloudUrl"`
-	CloudSecret       string          `mapstructure:"cloudSecret"`
-	MetricsInterval   time.Duration   `mapstructure:"metricsInterval"`
-	RequestTimeout    time.Duration   `mapstructure:"requestTimeout"`
-	ScriptTimeout     time.Duration   `mapstructure:"scriptTimeout"`
-	MaxBodyBytes      int64           `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns int             `mapstructure:"maxConcurrentRuns"`
-	Webhooks          []WebhookConfig `mapstructure:"webhooks"`
-	Actions           []WebhookConfig `mapstructure:"actions"`
+	ID                   string          `mapstructure:"id"`
+	Version              string          `mapstructure:"version"`
+	Transport            string          `mapstructure:"transport"`
+	Listen               string          `mapstructure:"listen"`
+	MetricsSecret        string          `mapstructure:"metricsSecret"`
+	MetricsHistoryPath   string          `mapstructure:"metricsHistoryPath"`
+	MetricsRetentionDays int             `mapstructure:"metricsRetentionDays"`
+	CloudURL             string          `mapstructure:"cloudUrl"`
+	CloudSecret          string          `mapstructure:"cloudSecret"`
+	MetricsInterval      time.Duration   `mapstructure:"metricsInterval"`
+	RequestTimeout       time.Duration   `mapstructure:"requestTimeout"`
+	ScriptTimeout        time.Duration   `mapstructure:"scriptTimeout"`
+	MaxBodyBytes         int64           `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns    int             `mapstructure:"maxConcurrentRuns"`
+	Webhooks             []WebhookConfig `mapstructure:"webhooks"`
+	Actions              []WebhookConfig `mapstructure:"actions"`
 }
 type WebhookConfig struct {
 	Name            string   `mapstructure:"name"`
@@ -91,10 +93,11 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("eventbus.url", "")
 	viper.SetDefault("ring.target", "")
 	viper.SetDefault("ring.useTLS", false)
-	viper.SetDefault("ring.tlsSkipVerify", false)
 	viper.SetDefault("daemon.transport", "http")
 	viper.SetDefault("daemon.listen", "127.0.0.1:8747")
 	viper.SetDefault("daemon.metricsSecret", "")
+	viper.SetDefault("daemon.metricsHistoryPath", "/var/lib/maidcafe/metrics")
+	viper.SetDefault("daemon.metricsRetentionDays", 7)
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -121,8 +124,10 @@ func applyEnvAliases() {
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
-		"DAEMON_METRICS_SECRET": "daemon.metricsSecret",
-		"DAEMON_CLOUD_URL":      "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
+		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
+		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
+		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
+		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
 		"DAEMON_SCRIPT_TIMEOUT": "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
 		"DAEMON_MAX_CONCURRENT_RUNS": "daemon.maxConcurrentRuns",
@@ -168,6 +173,9 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.MetricsInterval <= 0 {
 		return fmt.Errorf("daemon.metricsInterval must be positive")
+	}
+	if c.Daemon.MetricsRetentionDays < 0 || c.Daemon.MetricsRetentionDays > 30 {
+		return fmt.Errorf("daemon.metricsRetentionDays must be 0 (default) or between 1 and 30")
 	}
 	if c.Daemon.RequestTimeout <= 0 {
 		return fmt.Errorf("daemon.requestTimeout must be positive")

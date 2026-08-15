@@ -30,8 +30,13 @@ command = "/bin/cat"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Daemon.Listen != "127.0.0.1:8747" || cfg.Daemon.CloudURL != "https://mk.solsynth.dev" || cfg.Daemon.CloudSecret != "" || cfg.Daemon.MetricsInterval != time.Minute || cfg.Daemon.MaxBodyBytes != 65536 {
-		t.Fatalf("defaults not loaded: %#v", cfg.Daemon)
+	if cfg.Daemon.Listen != "127.0.0.1:8747" ||
+		cfg.Daemon.CloudURL != "https://mk.solsynth.dev" ||
+		cfg.Daemon.CloudSecret != "" ||
+		cfg.Daemon.MetricsInterval != time.Minute ||
+		cfg.Daemon.MetricsHistoryPath != "/var/lib/maidcafe/metrics" ||
+		cfg.Daemon.MetricsRetentionDays != 7 ||
+		cfg.Daemon.MaxBodyBytes != 65536 {
 	}
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatal(err)
@@ -54,6 +59,22 @@ func TestHTTPDaemonRequiresMetricsSecret(t *testing.T) {
 	cfg.Daemon.MetricsSecret = "metrics-secret"
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatalf("HTTP daemon with metrics secret rejected: %v", err)
+	}
+}
+
+func TestDaemonRejectsRetentionOverThirtyDays(t *testing.T) {
+	cfg := Config{Daemon: DaemonConfig{
+		ID:                   "host-1",
+		Transport:            "stdio",
+		MetricsRetentionDays: 31,
+		MetricsInterval:      time.Minute,
+		RequestTimeout:       time.Second,
+		ScriptTimeout:        time.Second,
+		MaxBodyBytes:         1,
+		MaxConcurrentRuns:    1,
+	}}
+	if err := cfg.ValidateDaemon(); err == nil {
+		t.Fatal("expected retention limit validation error")
 	}
 }
 

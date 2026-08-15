@@ -38,7 +38,11 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	app := &App{cfg: cfg, executor: executor, metrics: NewMetricsCollector(cfg, executor), publisher: publisher, logger: logger}
+	metrics, err := NewMetricsCollector(cfg, executor)
+	if err != nil {
+		return nil, fmt.Errorf("open metrics history: %w", err)
+	}
+	app := &App{cfg: cfg, executor: executor, metrics: metrics, publisher: publisher, logger: logger}
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
 			return
@@ -79,16 +83,44 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, app.metrics.Collect())
 	})
 	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
-		limit := metricHistoryLimit
+		parseTime := func(name string) (*time.Time, error) {
+			raw := strings.TrimSpace(c.Query(name))
+			if raw == "" {
+				return nil, nil
+			}
+			value, err := time.Parse(time.RFC3339Nano, raw)
+			if err != nil {
+				return nil, fmt.Errorf("%s must be RFC3339", name)
+			}
+			return &value, nil
+		}
+		from, err := parseTime("from")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		to, err := parseTime("to")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		before, err := parseTime("before")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		limit := 100
 		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
-			parsed, err := strconv.Atoi(raw)
-			if err != nil || parsed <= 0 {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || parsed <= 0 {
 				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "limit must be a positive integer"})
 				return
 			}
 			limit = parsed
 		}
-		c.JSON(http.StatusOK, gin.H{"metrics": app.metrics.History(limit)})
+		c.JSON(http.StatusOK, gin.H{"metrics": app.metrics.History(MetricsHistoryQuery{
+			From: from, To: to, Before: before, Limit: limit,
+		})})
 	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
