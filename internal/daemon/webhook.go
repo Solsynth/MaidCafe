@@ -136,24 +136,48 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if !signatureValid(hook.Secret, body, r.Header.Get("X-MaidCafe-Signature")) {
 		return executionResponse{}, 0, &requestError{status: http.StatusUnauthorized, message: "unauthorized"}
 	}
+	response, status := e.execute(r.Context(), hook, body)
+	if status == http.StatusTooManyRequests {
+		return executionResponse{}, 0, &requestError{status: status, message: "too many concurrent runs"}
+	}
+	return response, status, nil
+}
+
+// ExecuteWebhook verifies the HMAC signature over [body] and runs the named
+// webhook. Used by the MaidKit cloud relay, where the request is delivered by
+// polling instead of an HTTP handler.
+func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string) (executionResponse, int) {
+	hook, exists := e.hooks[name]
+	if !exists || !hook.Enabled {
+		return executionResponse{}, http.StatusNotFound
+	}
+	if !signatureValid(hook.Secret, body, signature) {
+		return executionResponse{}, http.StatusUnauthorized
+	}
+	return e.execute(context.Background(), hook, body)
+}
+
+// execute runs a hook's command with [body] on stdin under the concurrency
+// slot and script timeout, updating counters and completion notifications.
+func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig, body []byte) (executionResponse, int) {
 	select {
 	case e.slots <- struct{}{}:
 		defer func() { <-e.slots }()
 	default:
-		return executionResponse{}, 0, &requestError{status: http.StatusTooManyRequests, message: "too many concurrent runs"}
+		return executionResponse{}, http.StatusTooManyRequests
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), e.scriptTimeout)
+	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, hook.Command, hook.Args...)
+	cmd := exec.CommandContext(runCtx, hook.Command, hook.Args...)
 	cmd.Dir = "/"
 	cmd.Stdin = bytes.NewReader(body)
 	stdout, stderr := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	start := time.Now()
-	err = cmd.Run()
+	err := cmd.Run()
 	duration := time.Since(start)
 	exitCode, status := 0, http.StatusOK
-	timedOut := ctx.Err() == context.DeadlineExceeded
+	timedOut := runCtx.Err() == context.DeadlineExceeded
 	if err != nil {
 		e.counts.failures.Add(1)
 		status = http.StatusBadGateway
@@ -169,7 +193,13 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if e.onComplete != nil {
 		e.onComplete(hook, err == nil, exitCode, stderr.String(), duration)
 	}
-	return executionResponse{OK: err == nil, Name: name, ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}, status, nil
+	return executionResponse{
+		OK:       err == nil,
+		Name:     hook.Name,
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+	}, status
 }
 
 // RunAction executes a configured action through an authenticated SSH/stdin
@@ -193,44 +223,14 @@ func (e *WebhookExecutor) RunAction(
 			message: "not found",
 		}
 	}
-	select {
-	case e.slots <- struct{}{}:
-		defer func() { <-e.slots }()
-	default:
+	response, status := e.execute(ctx, hook, body)
+	if status == http.StatusTooManyRequests {
 		return executionResponse{}, &requestError{
 			status:  http.StatusTooManyRequests,
 			message: "too many concurrent runs",
 		}
 	}
-	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, hook.Command, hook.Args...)
-	cmd.Dir = "/"
-	cmd.Stdin = bytes.NewReader(body)
-	stdout, stderr := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	start := time.Now()
-	err := cmd.Run()
-	duration := time.Since(start)
-	exitCode := 0
-	if err != nil {
-		e.counts.failures.Add(1)
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		}
-	} else {
-		e.counts.successes.Add(1)
-	}
-	if e.onComplete != nil {
-		e.onComplete(hook, err == nil, exitCode, stderr.String(), duration)
-	}
-	return executionResponse{
-		OK:       err == nil,
-		Name:     name,
-		ExitCode: exitCode,
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-	}, nil
+	return response, nil
 }
 
 func (e *WebhookExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request) {

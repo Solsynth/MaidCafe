@@ -31,7 +31,7 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		Listen:            "127.0.0.1:0",
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Hour,
-		RequestTimeout:    time.Second,
+		RequestTimeout:    5 * time.Second,
 		ScriptTimeout:     time.Second,
 		MaxBodyBytes:      1024,
 		MaxConcurrentRuns: 1,

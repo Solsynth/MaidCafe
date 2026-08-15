@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -148,5 +149,92 @@ func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
 		publisher.events[0].Kind != "daemon.alarm.cpu_percent" ||
 		publisher.events[1].Kind != "maintenance" {
 		t.Fatalf("notification publication mismatch: %#v", publisher.events)
+	}
+}
+
+func TestWebhookRelayLifecycle(t *testing.T) {
+	svc, db, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	created, err := svc.CreateDaemon(ctx, "account-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("backup now")
+	signature := "abc123"
+	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", body, signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enqueued.Status != "pending" || enqueued.Name != "backup" || enqueued.Body != base64.StdEncoding.EncodeToString(body) {
+		t.Fatalf("enqueued view = %#v", enqueued)
+	}
+	if _, err := svc.EnqueueWebhook(ctx, "account-b", created.ID, "backup", body, signature); err != ErrForbidden {
+		t.Fatalf("account isolation failed: %v", err)
+	}
+	if _, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "", body, signature); err == nil {
+		t.Fatalf("empty name accepted")
+	}
+
+	pending, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != enqueued.ID || pending[0].Signature != signature {
+		t.Fatalf("pending = %#v", pending)
+	}
+	// Leased requests are not returned again.
+	pendingAgain, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingAgain) != 0 {
+		t.Fatalf("leased request re-returned: %#v", pendingAgain)
+	}
+	if _, err := svc.ListPendingWebhooks(ctx, created.ID, "wrong-secret", 10); err != ErrUnauthorized {
+		t.Fatalf("bad daemon secret: %v", err)
+	}
+
+	if err := svc.CompleteWebhook(ctx, created.ID, created.Secret, enqueued.ID, 200, []byte("ok"), ""); err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.GetWebhookResult(ctx, "account-a", created.ID, enqueued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "done" || result.ResultCode != 200 || result.ResultBody != base64.StdEncoding.EncodeToString([]byte("ok")) {
+		t.Fatalf("result = %#v", result)
+	}
+	if _, err := svc.GetWebhookResult(ctx, "account-b", created.ID, enqueued.ID); err != ErrForbidden {
+		t.Fatalf("result isolation failed: %v", err)
+	}
+}
+
+func TestWebhookRelayReclaimsExpiredLeases(t *testing.T) {
+	svc, db, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	created, err := svc.CreateDaemon(ctx, "account-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", []byte("x"), "sig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10); err != nil {
+		t.Fatal(err)
+	}
+	expired := time.Now().UTC().Add(-10 * time.Minute)
+	if err := db.Model(&database.WebhookRequest{}).Where("id = ?", enqueued.ID).
+		Update("leased_at", expired).Error; err != nil {
+		t.Fatal(err)
+	}
+	pending, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != enqueued.ID {
+		t.Fatalf("expired lease not reclaimed: %#v", pending)
 	}
 }

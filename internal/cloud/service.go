@@ -547,3 +547,154 @@ func (s *Service) MarkNotificationRead(ctx context.Context, accountID, id string
 	}
 	return nil
 }
+
+// Webhook relay: clients enqueue signed webhook invocations through the
+// cloud; daemons poll for them and post results back. Polling only — no
+// long-lived connections or push channels.
+
+const (
+	webhookStatusPending = "pending"
+	webhookStatusLeased  = "leased"
+	webhookStatusDone    = "done"
+
+	webhookLeaseDuration = 2 * time.Minute
+	webhookBodyLimit     = 256 * 1024
+	webhookPendingLimit  = 50
+)
+
+type WebhookRequestView struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Body        string    `json:"body"`
+	Signature   string    `json:"signature"`
+	Status      string    `json:"status"`
+	ResultCode  int       `json:"result_code,omitempty"`
+	ResultBody  string    `json:"result_body,omitempty"`
+	ResultError string    `json:"result_error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func viewWebhookRequest(row database.WebhookRequest) WebhookRequestView {
+	return WebhookRequestView{
+		ID:          row.ID,
+		Name:        row.Name,
+		Body:        base64.StdEncoding.EncodeToString(row.Body),
+		Signature:   row.Signature,
+		Status:      row.Status,
+		ResultCode:  row.ResultCode,
+		ResultBody:  base64.StdEncoding.EncodeToString(row.ResultBody),
+		ResultError: row.ResultError,
+		CreatedAt:   row.CreatedAt,
+		UpdatedAt:   row.UpdatedAt,
+	}
+}
+
+// EnqueueWebhook queues a signed webhook invocation for [daemonID].
+func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name string, body []byte, signature string) (WebhookRequestView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return WebhookRequestView{}, err
+	}
+	if strings.TrimSpace(name) == "" || len(body) == 0 || len(body) > webhookBodyLimit || strings.TrimSpace(signature) == "" {
+		return WebhookRequestView{}, errors.New("webhook request requires a name, body and signature")
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return WebhookRequestView{}, err
+	}
+	now := time.Now().UTC()
+	row := database.WebhookRequest{
+		ID:        id.String(),
+		DaemonID:  daemonID,
+		Name:      strings.TrimSpace(name),
+		Body:      body,
+		Signature: strings.TrimSpace(signature),
+		Status:    webhookStatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
+		return WebhookRequestView{}, err
+	}
+	return viewWebhookRequest(row), nil
+}
+
+// ListPendingWebhooks leases and returns up to [limit] pending webhook
+// invocations for the daemon. Leases older than webhookLeaseDuration are
+// reclaimed first so a daemon that died mid-execution does not lose requests.
+func (s *Service) ListPendingWebhooks(ctx context.Context, daemonID, secret string, limit int) ([]WebhookRequestView, error) {
+	if _, err := s.authenticateDaemon(ctx, daemonID, secret); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > webhookPendingLimit {
+		limit = webhookPendingLimit
+	}
+	now := time.Now().UTC()
+	if err := s.db.WithContext(ctx).Model(&database.WebhookRequest{}).
+		Where("daemon_id = ? AND status = ? AND leased_at < ?", daemonID, webhookStatusLeased, now.Add(-webhookLeaseDuration)).
+		Updates(map[string]any{"status": webhookStatusPending, "leased_at": nil, "updated_at": now}).Error; err != nil {
+		return nil, err
+	}
+	var rows []database.WebhookRequest
+	if err := s.db.WithContext(ctx).Where("daemon_id = ? AND status = ?", daemonID, webhookStatusPending).
+		Order("created_at ASC").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return []WebhookRequestView{}, nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	if err := s.db.WithContext(ctx).Model(&database.WebhookRequest{}).
+		Where("daemon_id = ? AND id IN ?", daemonID, ids).
+		Updates(map[string]any{"status": webhookStatusLeased, "leased_at": now, "updated_at": now}).Error; err != nil {
+		return nil, err
+	}
+	views := make([]WebhookRequestView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, viewWebhookRequest(row))
+	}
+	return views, nil
+}
+
+// CompleteWebhook stores the execution result for a leased request.
+func (s *Service) CompleteWebhook(ctx context.Context, daemonID, secret, requestID string, code int, body []byte, resultError string) error {
+	if _, err := s.authenticateDaemon(ctx, daemonID, secret); err != nil {
+		return err
+	}
+	if len(resultError) > 512 {
+		resultError = resultError[:512]
+	}
+	res := s.db.WithContext(ctx).Model(&database.WebhookRequest{}).
+		Where("daemon_id = ? AND id = ? AND status = ?", daemonID, requestID, webhookStatusLeased).
+		Updates(map[string]any{
+			"status": webhookStatusDone, "result_code": code,
+			"result_body": body, "result_error": resultError,
+			"updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetWebhookResult returns a relayed webhook request (and its result once the
+// daemon completed it) to the owning account.
+func (s *Service) GetWebhookResult(ctx context.Context, accountID, daemonID, requestID string) (WebhookRequestView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return WebhookRequestView{}, err
+	}
+	var row database.WebhookRequest
+	if err := s.db.WithContext(ctx).Where("daemon_id = ? AND id = ?", daemonID, requestID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return WebhookRequestView{}, ErrNotFound
+		}
+		return WebhookRequestView{}, err
+	}
+	return viewWebhookRequest(row), nil
+}

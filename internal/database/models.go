@@ -55,3 +55,21 @@ type Notification struct {
 	ReadAt    *time.Time
 	CreatedAt time.Time
 }
+
+// WebhookRequest is a webhook invocation queued through the MaidKit cloud
+// relay. The daemon polls for pending requests, verifies the HMAC signature
+// against its own config, executes the webhook and stores the result here.
+type WebhookRequest struct {
+	ID          string `gorm:"type:char(36);primaryKey"`
+	DaemonID    string `gorm:"size:191;index;not null"`
+	Name        string `gorm:"size:128;not null"`
+	Body        []byte `gorm:"type:bytea;not null"`
+	Signature   string `gorm:"size:128;not null"`
+	Status      string `gorm:"size:16;not null;index"`
+	LeasedAt    *time.Time
+	ResultCode  int
+	ResultBody  []byte `gorm:"type:bytea"`
+	ResultError string `gorm:"size:512"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}

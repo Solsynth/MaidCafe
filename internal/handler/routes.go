@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,9 +35,13 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.DELETE("/daemons/:id", disableDaemon(svc))
 	user.GET("/notifications", listNotifications(svc))
 	user.POST("/notifications/:id/read", markRead(svc))
+	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
+	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
 	daemon := r.Group("/api/daemons/:id")
 	daemon.POST("/metrics", ingestMetric(svc))
 	daemon.POST("/notifications", createNotification(svc))
+	daemon.GET("/webhook-requests/pending", listPendingWebhooks(svc))
+	daemon.POST("/webhook-requests/:request_id/result", completeWebhook(svc))
 }
 
 func requireUser() gin.HandlerFunc {
@@ -326,6 +331,94 @@ func listNotifications(s *cloud.Service) gin.HandlerFunc {
 func markRead(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if err := s.MarkNotificationRead(c, accountID(c), c.Param("id")); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+func enqueueWebhook(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var in struct {
+			Name      string `json:"name"`
+			Body      string `json:"body"`
+			Signature string `json:"signature"`
+		}
+		if !parseJSON(c, &in) {
+			return
+		}
+		body, err := base64.StdEncoding.DecodeString(in.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+			return
+		}
+		out, err := s.EnqueueWebhook(c, accountID(c), c.Param("id"), in.Name, body, in.Signature)
+		if err != nil {
+			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
+				serviceStatus(c, err)
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"id": out.ID, "status": out.Status, "created_at": out.CreatedAt})
+	}
+}
+func getWebhookResult(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.GetWebhookResult(c, accountID(c), c.Param("id"), c.Param("request_id"))
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+func listPendingWebhooks(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		secret, ok := daemonSecret(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		limit := 50
+		if raw := c.Query("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 50 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+				return
+			}
+			limit = parsed
+		}
+		out, err := s.ListPendingWebhooks(c, c.Param("id"), secret, limit)
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"requests": out})
+	}
+}
+func completeWebhook(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		secret, ok := daemonSecret(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		var in struct {
+			Code  int    `json:"code"`
+			Body  string `json:"body"`
+			Error string `json:"error"`
+		}
+		if !parseJSON(c, &in) {
+			return
+		}
+		body, err := base64.StdEncoding.DecodeString(in.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+			return
+		}
+		if err := s.CompleteWebhook(c, c.Param("id"), secret, c.Param("request_id"), in.Code, body, in.Error); err != nil {
 			serviceStatus(c, err)
 			return
 		}

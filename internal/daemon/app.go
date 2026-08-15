@@ -21,6 +21,7 @@ type App struct {
 	executor  *WebhookExecutor
 	metrics   *MetricsCollector
 	publisher *CloudPublisher
+	relay     *WebhookRelay
 	server    *http.Server
 	listener  net.Listener
 	logger    *slog.Logger
@@ -43,6 +44,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
 	app := &App{cfg: cfg, executor: executor, metrics: metrics, publisher: publisher, logger: logger}
+	app.relay = NewWebhookRelay(publisher, executor, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
 			return
@@ -208,6 +210,9 @@ func (a *App) Run(ctx context.Context) error {
 	ticker := time.NewTicker(a.cfg.MetricsInterval)
 	defer ticker.Stop()
 	a.metrics.Record()
+	if a.relay != nil {
+		go a.relay.Run(ctx)
+	}
 	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
