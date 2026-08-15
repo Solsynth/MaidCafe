@@ -31,7 +31,7 @@ func TestWebhookExecutesOpaqueBodyAndRejectsBadSecret(t *testing.T) {
 	defer server.Close()
 	body := `{"x":"$(touch ` + filepath.Join(t.TempDir(), "sentinel") + `)"}`
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/webhooks/hook", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-MaidCafe-Signature", signedHeader("secret", []byte(body)))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -48,13 +48,13 @@ func TestWebhookExecutesOpaqueBodyAndRejectsBadSecret(t *testing.T) {
 		t.Fatalf("stdin mismatch: %q", got)
 	}
 	bad, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/webhooks/hook", strings.NewReader(body))
-	bad.Header.Set("Authorization", "Bearer wrong")
+	bad.Header.Set("X-MaidCafe-Signature", signedHeader("wrong", []byte(body)))
 	resp, err = http.DefaultClient.Do(bad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("bad secret status %d", resp.StatusCode)
+		t.Fatalf("bad signature status %d", resp.StatusCode)
 	}
 }
 func TestWebhookFailureTimeoutAndBodyLimit(t *testing.T) {
@@ -64,7 +64,7 @@ func TestWebhookFailureTimeoutAndBodyLimit(t *testing.T) {
 	server := httptest.NewServer(executor)
 	defer server.Close()
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/webhooks/slow", strings.NewReader("x"))
-	req.Header.Set("Authorization", "Bearer s")
+	req.Header.Set("X-MaidCafe-Signature", signedHeader("s", []byte("x")))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +73,7 @@ func TestWebhookFailureTimeoutAndBodyLimit(t *testing.T) {
 		t.Fatalf("timeout status %d", resp.StatusCode)
 	}
 	large, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/webhooks/slow", strings.NewReader("large"))
-	large.Header.Set("Authorization", "Bearer s")
+	large.Header.Set("X-MaidCafe-Signature", signedHeader("s", []byte("large")))
 	resp, err = http.DefaultClient.Do(large)
 	if err != nil {
 		t.Fatal(err)

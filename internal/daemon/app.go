@@ -141,6 +141,16 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
 			return
 		}
+		if int64(len(body)) > cfg.MaxBodyBytes {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
+			return
+		}
+		// The Bearer check above authenticates the caller; the signature binds
+		// the request to this exact body so it cannot be tampered in transit.
+		if !signatureValid(cfg.MetricsSecret, body, c.GetHeader("X-MaidCafe-Signature")) {
+			c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "unauthorized"})
+			return
+		}
 		response, requestErr := executor.RunAction(
 			c.Request.Context(),
 			c.Param("name"),

@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +15,12 @@ import (
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
+
+func signedHeader(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	action := executable(t, "#!/bin/sh\nprintf '%s' action-ok\n")
@@ -60,14 +69,17 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	webhookRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	webhookRequest.Header.Set(
+		"X-MaidCafe-Signature",
+		signedHeader("metrics-secret", []byte("payload")),
+	)
 	webhookResponse, err := http.DefaultClient.Do(webhookRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	webhookResponse.Body.Close()
 	if webhookResponse.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("metrics secret accepted for webhook: status = %d", webhookResponse.StatusCode)
+		t.Fatalf("wrong webhook signature accepted: status = %d", webhookResponse.StatusCode)
 	}
 	webhookRequest, err = http.NewRequest(
 		http.MethodPost,
@@ -77,7 +89,10 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	webhookRequest.Header.Set("Authorization", "Bearer webhook-secret")
+	webhookRequest.Header.Set(
+		"X-MaidCafe-Signature",
+		signedHeader("webhook-secret", []byte("payload")),
+	)
 	webhookResponse, err = http.DefaultClient.Do(webhookRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +173,33 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	}
 	actionRequest.Header.Set("Authorization", "Bearer metrics-secret")
 	actionRequest.Header.Set("Content-Type", "application/json")
+	actionRequest.Header.Set(
+		"X-MaidCafe-Signature",
+		signedHeader("wrong-secret", []byte(`{"job":"incremental"}`)),
+	)
+	badSignature, err := http.DefaultClient.Do(actionRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badSignature.Body.Close()
+	if badSignature.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong action signature accepted: status = %d", badSignature.StatusCode)
+	}
+
+	actionRequest, err = http.NewRequest(
+		http.MethodPost,
+		baseURL+"/api/v1/actions/backup",
+		strings.NewReader(`{"job":"incremental"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	actionRequest.Header.Set("Content-Type", "application/json")
+	actionRequest.Header.Set(
+		"X-MaidCafe-Signature",
+		signedHeader("metrics-secret", []byte(`{"job":"incremental"}`)),
+	)
 	actionResponse, err := http.DefaultClient.Do(actionRequest)
 	if err != nil {
 		t.Fatal(err)

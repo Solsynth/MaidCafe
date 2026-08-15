@@ -3,7 +3,10 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -97,6 +100,20 @@ func authorizedRequest(r *http.Request, expected string) bool {
 		subtle.ConstantTimeCompare([]byte(secret), []byte(expected)) == 1
 }
 
+// signatureValid reports whether [provided] is the lowercase-hex
+// HMAC-SHA256 of [body] keyed by [secret]. Webhook and action invocations are
+// authenticated this way; the transport (SSH tunnel, Tailscale or the MaidKit
+// cloud relay) already provides confidentiality.
+func signatureValid(secret string, body []byte, provided string) bool {
+	if secret == "" || provided == "" {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	computed := hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(computed), []byte(strings.TrimSpace(provided))) == 1
+}
+
 type requestError struct {
 	status  int
 	message string
@@ -107,8 +124,16 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if !exists || !hook.Enabled {
 		return executionResponse{}, 0, &requestError{status: http.StatusNotFound, message: "not found"}
 	}
-	secret, ok := bearerSecret(r)
-	if !ok || subtle.ConstantTimeCompare([]byte(secret), []byte(hook.Secret)) != 1 {
+	body, err := io.ReadAll(io.LimitReader(r.Body, e.maxBodyBytes+1))
+	if err != nil {
+		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: "read request body"}
+	}
+	if int64(len(body)) > e.maxBodyBytes {
+		return executionResponse{}, 0, &requestError{status: http.StatusRequestEntityTooLarge, message: "request body too large"}
+	}
+	// The signature is the only credential a webhook needs: it proves the
+	// caller holds the hook secret and that the body is untampered.
+	if !signatureValid(hook.Secret, body, r.Header.Get("X-MaidCafe-Signature")) {
 		return executionResponse{}, 0, &requestError{status: http.StatusUnauthorized, message: "unauthorized"}
 	}
 	select {
@@ -116,13 +141,6 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 		defer func() { <-e.slots }()
 	default:
 		return executionResponse{}, 0, &requestError{status: http.StatusTooManyRequests, message: "too many concurrent runs"}
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, e.maxBodyBytes+1))
-	if err != nil {
-		return executionResponse{}, 0, &requestError{status: http.StatusRequestEntityTooLarge, message: "request body too large"}
-	}
-	if int64(len(body)) > e.maxBodyBytes {
-		return executionResponse{}, 0, &requestError{status: http.StatusRequestEntityTooLarge, message: "request body too large"}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), e.scriptTimeout)
 	defer cancel()
