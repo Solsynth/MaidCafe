@@ -8,6 +8,9 @@ metricsRetentionDays = 7
 cloudUrl = "https://mk.solsynth.dev"
 cloudSecret = "replace-with-cloud-issued-secret"
 metricsInterval = "1m"
+# Every action/webhook execution is appended here as JSONL (rotated at 1 MiB,
+# one generation kept). Empty disables auditing.
+auditPath = "/var/lib/maidcafe/audit.jsonl"
 streamInterval = "1s"
 containersInterval = "5s"
 imagesInterval = "60s"
@@ -43,6 +46,7 @@ enabled = true
 name = "deploy"
 command = "/etc/maidcafe/actions/deploy.sh"
 script = true
+displayName = "Deploy the web app"
 cwd = "/srv/myapp"
 user = "deploy"
 env = ["CI_BUILD=42", "NODE_ENV=production"]

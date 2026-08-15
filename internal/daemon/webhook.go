@@ -103,6 +103,7 @@ type WebhookExecutor struct {
 	maxBodyBytes  int64
 	slots         chan struct{}
 	counts        counters
+	audit         *AuditLogger
 	onComplete    func(config.WebhookConfig, bool, int, string, time.Duration)
 }
 
@@ -126,6 +127,11 @@ func NewWebhookExecutor(cfg config.DaemonConfig) *WebhookExecutor {
 }
 func (e *WebhookExecutor) SetCompletionHandler(handler func(config.WebhookConfig, bool, int, string, time.Duration)) {
 	e.onComplete = handler
+}
+
+// SetAuditLogger wires the durable execution log; nil disables auditing.
+func (e *WebhookExecutor) SetAuditLogger(audit *AuditLogger) {
+	e.audit = audit
 }
 func (e *WebhookExecutor) Counts() (uint64, uint64) { return e.counts.values() }
 
@@ -179,6 +185,7 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if !exists || !hook.Enabled {
 		return executionResponse{}, 0, &requestError{status: http.StatusNotFound, message: "not found"}
 	}
+	ctx := r.Context()
 	body, err := io.ReadAll(io.LimitReader(r.Body, e.maxBodyBytes+1))
 	if err != nil {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: "read request body"}
@@ -191,7 +198,7 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if !signatureValid(hook.Secret, body, r.Header.Get("X-MaidCafe-Signature")) {
 		return executionResponse{}, 0, &requestError{status: http.StatusUnauthorized, message: "unauthorized"}
 	}
-	response, status := e.execute(r.Context(), hook, body)
+	response, status := e.execute(ctx, hook, body, "http")
 	if status == http.StatusTooManyRequests {
 		return executionResponse{}, 0, &requestError{status: status, message: "too many concurrent runs"}
 	}
@@ -200,8 +207,8 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 
 // ExecuteWebhook verifies the HMAC signature over [body] and runs the named
 // webhook. Used by the MaidKit cloud relay, where the request is delivered by
-// polling instead of an HTTP handler.
-func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string) (executionResponse, int) {
+// polling instead of an HTTP handler. [source] is recorded in the audit log.
+func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string, source string) (executionResponse, int) {
 	hook, exists := e.hooks[name]
 	if !exists || !hook.Enabled {
 		return executionResponse{}, http.StatusNotFound
@@ -209,7 +216,7 @@ func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature str
 	if !signatureValid(hook.Secret, body, signature) {
 		return executionResponse{}, http.StatusUnauthorized
 	}
-	return e.execute(context.Background(), hook, body)
+	return e.execute(context.Background(), hook, body, source)
 }
 
 // buildRunCommand returns the exec.Cmd for a configured hook, honoring the
@@ -298,15 +305,55 @@ func renderScriptTemp(hook config.WebhookConfig, script []byte) (string, func(),
 	return name, cleanup, nil
 }
 
+// auditErrorTail captures a short human-readable failure reason for the
+// audit log: the request-level error when there is one, else a truncated
+// stderr tail. Never more than 512 bytes so one bad run cannot bloat the log.
+func auditErrorTail(response executionResponse) string {
+	body := response.Error
+	if body == "" {
+		body = response.Stderr
+	}
+	if body == "" {
+		return ""
+	}
+	if len(body) > 512 {
+		body = body[:512]
+	}
+	return body
+}
+
 // execute runs a hook's command with [body] on stdin under the concurrency
-// slot and script timeout, updating counters and completion notifications.
-func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig, body []byte) (executionResponse, int) {
+// slot and script timeout, updating counters, completion notifications and
+// the audit log. [source] records how the run was triggered (http, stdio or
+// relay); concurrency rejections are not logged — they are not executions.
+func (e *WebhookExecutor) execute(
+	ctx context.Context,
+	hook config.WebhookConfig,
+	body []byte,
+	source string,
+) (response executionResponse, status int) {
 	select {
 	case e.slots <- struct{}{}:
 		defer func() { <-e.slots }()
 	default:
 		return executionResponse{}, http.StatusTooManyRequests
 	}
+	started := time.Now()
+	defer func() {
+		if e.audit == nil {
+			return
+		}
+		e.audit.Record(auditEntry{
+			Timestamp:   time.Now().UTC(),
+			Name:        hook.Name,
+			DisplayName: strings.TrimSpace(hook.DisplayName),
+			Source:      source,
+			OK:          response.OK,
+			ExitCode:    response.ExitCode,
+			DurationMS:  time.Since(started).Milliseconds(),
+			Error:       auditErrorTail(response),
+		})
+	}()
 	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
 	defer cancel()
 	command, args := hook.Command, hook.Args
@@ -316,19 +363,21 @@ func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig
 		// on disk stays untouched.
 		script, err := substituteScriptTemplate(command, body)
 		if err != nil {
-			return executionResponse{
+			response = executionResponse{
 				OK:    false,
 				Name:  hook.Name,
 				Error: err.Error(),
-			}, http.StatusBadRequest
+			}
+			return response, http.StatusBadRequest
 		}
 		rendered, cleanup, err := renderScriptTemp(hook, script)
 		if err != nil {
-			return executionResponse{
+			response = executionResponse{
 				OK:    false,
 				Name:  hook.Name,
 				Error: err.Error(),
-			}, http.StatusInternalServerError
+			}
+			return response, http.StatusInternalServerError
 		}
 		defer cleanup()
 		command = rendered
@@ -337,9 +386,8 @@ func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig
 	cmd.Stdin = bytes.NewReader(body)
 	stdout, stderr := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	start := time.Now()
 	err := cmd.Run()
-	duration := time.Since(start)
+	duration := time.Since(started)
 	exitCode, status := 0, http.StatusOK
 	timedOut := runCtx.Err() == context.DeadlineExceeded
 	if err != nil {
@@ -357,22 +405,24 @@ func (e *WebhookExecutor) execute(ctx context.Context, hook config.WebhookConfig
 	if e.onComplete != nil {
 		e.onComplete(hook, err == nil, exitCode, stderr.String(), duration)
 	}
-	return executionResponse{
+	response = executionResponse{
 		OK:       err == nil,
 		Name:     hook.Name,
 		ExitCode: exitCode,
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
-	}, status
+	}
+	return response, status
 }
 
 // RunAction executes a configured action through an authenticated SSH/stdin
 // transport. SSH already provides the transport boundary, so action secrets
-// are not required in this mode.
+// are not required in this mode. [source] is recorded in the audit log.
 func (e *WebhookExecutor) RunAction(
 	ctx context.Context,
 	name string,
 	body []byte,
+	source string,
 ) (executionResponse, *requestError) {
 	if int64(len(body)) > e.maxBodyBytes {
 		return executionResponse{}, &requestError{
@@ -387,7 +437,7 @@ func (e *WebhookExecutor) RunAction(
 			message: "not found",
 		}
 	}
-	response, status := e.execute(ctx, hook, body)
+	response, status := e.execute(ctx, hook, body, source)
 	if status == http.StatusTooManyRequests {
 		return executionResponse{}, &requestError{
 			status:  http.StatusTooManyRequests,

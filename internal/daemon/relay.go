@@ -83,7 +83,7 @@ func (r *WebhookRelay) process(ctx context.Context, request relayWebhookRequest)
 		r.report(ctx, request.ID, relayResultPayload{Error: "invalid request body encoding"})
 		return
 	}
-	response, status := r.executor.ExecuteWebhook(request.Name, body, request.Signature)
+	response, status := r.executor.ExecuteWebhook(request.Name, body, request.Signature, "relay")
 	result := relayResultPayload{Code: status}
 	if response.OK {
 		result.Body = base64.StdEncoding.EncodeToString([]byte(response.Stdout))

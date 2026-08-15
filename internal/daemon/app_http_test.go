@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,7 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		ScriptTimeout:     time.Second,
 		MaxBodyBytes:      1024,
 		MaxConcurrentRuns: 1,
+		AuditPath:         filepath.Join(t.TempDir(), "audit.jsonl"),
 		Actions: []config.WebhookConfig{
 			{Name: "backup", Command: action, Enabled: true},
 		},
@@ -217,6 +219,40 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "action-ok") {
 		t.Fatalf("action response = %s", body)
+	}
+
+	// The run is durably recorded and readable over the audit endpoint.
+	auditRequest, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/audit", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	auditResponse, err := http.DefaultClient.Do(auditRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auditResponse.Body.Close()
+	if auditResponse.StatusCode != http.StatusOK {
+		t.Fatalf("audit status = %d", auditResponse.StatusCode)
+	}
+	var auditBody struct {
+		Entries []auditEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(auditResponse.Body).Decode(&auditBody); err != nil {
+		t.Fatal(err)
+	}
+	// Both the earlier webhook run and this action run are durably recorded;
+	// the newest entry (the action) comes first.
+	if len(auditBody.Entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(auditBody.Entries))
+	}
+	entry := auditBody.Entries[0]
+	if entry.Name != "backup" || entry.Source != "http" || !entry.OK {
+		t.Fatalf("unexpected audit entry: %+v", entry)
+	}
+	webhookEntry := auditBody.Entries[1]
+	if webhookEntry.Name != "hook" || webhookEntry.Source != "http" {
+		t.Fatalf("unexpected webhook audit entry: %+v", webhookEntry)
 	}
 }
 

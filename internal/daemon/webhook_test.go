@@ -266,7 +266,7 @@ func TestExecuteHonorsCwdAndEnv(t *testing.T) {
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
-	result, requestErr := executor.RunAction(context.Background(), "where", nil)
+	result, requestErr := executor.RunAction(context.Background(), "where", nil, "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -354,7 +354,7 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
-	result, requestErr := executor.RunAction(context.Background(), "as-user", nil)
+	result, requestErr := executor.RunAction(context.Background(), "as-user", nil, "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -389,6 +389,7 @@ func TestScriptActionSubstitutesTemplate(t *testing.T) {
 		context.Background(),
 		"greet",
 		[]byte(`{"NAME":"world"}`),
+		"test",
 	)
 	if requestErr != nil {
 		t.Fatal(requestErr)
@@ -398,7 +399,7 @@ func TestScriptActionSubstitutesTemplate(t *testing.T) {
 	}
 
 	// Missing values fail with a clear message and no script exit code.
-	result, requestErr = executor.RunAction(context.Background(), "greet", []byte(`{}`))
+	result, requestErr = executor.RunAction(context.Background(), "greet", []byte(`{}`), "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}

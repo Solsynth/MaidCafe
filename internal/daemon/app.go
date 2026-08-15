@@ -43,6 +43,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		logger = slog.Default()
 	}
 	executor := NewWebhookExecutor(cfg)
+	executor.SetAuditLogger(NewAuditLogger(cfg.AuditPath, logger))
 	publisher, err := NewCloudPublisher(cfg, logger)
 	if err != nil {
 		return nil, err
@@ -69,9 +70,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
 			return
 		}
-		kind, title := "webhook.failure", "Webhook "+hook.Name+" failed"
+		kind, title := "webhook.failure", "Webhook "+hook.Label()+" failed"
 		if ok {
-			kind, title = "webhook.success", "Webhook "+hook.Name+" completed"
+			kind, title = "webhook.success", "Webhook "+hook.Label()+" completed"
 		}
 		body := strings.TrimSpace(stderr)
 		if len(body) > 4096 {
@@ -215,6 +216,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			c.Request.Context(),
 			c.Param("name"),
 			body,
+			"http",
 		)
 		if requestErr != nil {
 			c.JSON(
@@ -224,6 +226,18 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			return
 		}
 		c.JSON(http.StatusOK, response)
+	})
+	router.GET("/api/v1/audit", authorizeMetrics, func(c *gin.Context) {
+		limit := 50
+		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || parsed <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "limit must be a positive integer"})
+				return
+			}
+			limit = parsed
+		}
+		c.JSON(http.StatusOK, gin.H{"entries": executor.audit.Recent(limit)})
 	})
 	router.POST("/api/v1/webhooks/:name", executor.GinHandler())
 	app.server = &http.Server{

@@ -36,6 +36,7 @@ command = "/bin/cat"
 		cfg.Daemon.CloudSecret != "" ||
 		cfg.Daemon.MetricsInterval != time.Minute ||
 		cfg.Daemon.MetricsHistoryPath != "/var/lib/maidcafe/metrics" ||
+		cfg.Daemon.AuditPath != "/var/lib/maidcafe/audit.jsonl" ||
 		cfg.Daemon.MetricsRetentionDays != 7 ||
 		cfg.Daemon.MaxBodyBytes != 65536 ||
 		cfg.Daemon.StreamInterval != time.Second ||
@@ -288,6 +289,21 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestWebhookLabelFallsBackToName(t *testing.T) {
+	named := WebhookConfig{Name: "deploy", DisplayName: "Deploy the app"}
+	if named.Label() != "Deploy the app" {
+		t.Fatalf("Label() = %q", named.Label())
+	}
+	plain := WebhookConfig{Name: "deploy"}
+	if plain.Label() != "deploy" {
+		t.Fatalf("Label() fallback = %q", plain.Label())
+	}
+	blank := WebhookConfig{Name: "deploy", DisplayName: "   "}
+	if blank.Label() != "deploy" {
+		t.Fatalf("Label() blank display = %q", blank.Label())
 	}
 }
 

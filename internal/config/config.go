@@ -61,6 +61,7 @@ type DaemonConfig struct {
 	MetricsSecret        string          `mapstructure:"metricsSecret"`
 	MetricsHistoryPath   string          `mapstructure:"metricsHistoryPath"`
 	MetricsRetentionDays int             `mapstructure:"metricsRetentionDays"`
+	AuditPath            string          `mapstructure:"auditPath"`
 	CloudURL             string          `mapstructure:"cloudUrl"`
 	CloudSecret          string          `mapstructure:"cloudSecret"`
 	MetricsInterval      time.Duration   `mapstructure:"metricsInterval"`
@@ -85,6 +86,10 @@ type WebhookConfig struct {
 	Enabled         bool     `mapstructure:"enabled"`
 	NotifyOnSuccess bool     `mapstructure:"notifyOnSuccess"`
 	NotifyOnFailure bool     `mapstructure:"notifyOnFailure"`
+	// DisplayName is an optional human-readable label. [Name] is the slug
+	// used for the API route, the deployed script file and audit records;
+	// DisplayName is what notifications and clients show when present.
+	DisplayName string `mapstructure:"displayName"`
 	// Script marks command as a MaidKit-deployed script body. The executor
 	// substitutes {{ name }} template variables from the request body into
 	// the script before running it. Plain commands keep Script false.
@@ -105,6 +110,15 @@ type WebhookConfig struct {
 }
 
 var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+
+// Label returns the human-readable name for display in notifications and
+// clients, falling back to the API slug when no display name is configured.
+func (h WebhookConfig) Label() string {
+	if name := strings.TrimSpace(h.DisplayName); name != "" {
+		return name
+	}
+	return h.Name
+}
 
 func validateHookExecution(hook WebhookConfig, kind string, index int) error {
 	if hook.Cwd != "" && !filepath.IsAbs(hook.Cwd) {
@@ -152,6 +166,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.metricsSecret", "")
 	viper.SetDefault("daemon.metricsHistoryPath", "/var/lib/maidcafe/metrics")
 	viper.SetDefault("daemon.metricsRetentionDays", 7)
+	viper.SetDefault("daemon.auditPath", "/var/lib/maidcafe/audit.jsonl")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -188,6 +203,7 @@ func applyEnvAliases() {
 		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
+		"DAEMON_AUDIT_PATH":             "daemon.auditPath",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",

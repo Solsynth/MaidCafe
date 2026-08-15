@@ -56,7 +56,9 @@ GET /health
 - Static configured arguments only.
 - Absolute command paths and controlled working directory.
 - Per-hook `cwd` (absolute working directory), `env` (`KEY=VALUE`
-  assignments), and `user` (run as another account).
+  assignments), `user` (run as another account), and `displayName` (optional
+  human-readable label; `name` stays the API slug and is what audit records
+  and the `/api/v1/actions/:name` route use).
 - `user` runs are delegated to `sudo -H -u <user>`, so the daemon process
   itself stays unprivileged. Environment assignments are passed as
   command-line `VAR=value` entries (sudo applies them on top of its reset
@@ -181,8 +183,19 @@ Metrics and configured actions use the daemon metrics secret:
 GET /health
 GET /api/v1/metrics
 POST /api/v1/actions/:name
+GET /api/v1/audit?limit=N
 Authorization: Bearer <metrics-secret>
 ```
+
+Every execution — HTTP webhooks, actions, and cloud-relayed webhooks — is
+appended to `daemon.auditPath` (default `/var/lib/maidcafe/audit.jsonl`) as
+one JSON line per run: timestamp, `name` (API slug), optional `display_name`,
+`source` (`http` | `stdio` | `relay`), `ok`, `exit_code`, `duration_ms`, and a
+truncated failure reason. The file rotates at 1 MiB keeping one generation
+(`audit.jsonl.1`). Logging is best-effort: an unwritable path disables it with
+a warning and never affects execution. `GET /api/v1/audit?limit=N` returns the
+newest entries (default 50, max 500) newest first, authenticated with the
+metrics secret.
 
 ### Realtime event stream
 
