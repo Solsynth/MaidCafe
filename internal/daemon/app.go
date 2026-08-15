@@ -64,6 +64,19 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	router := gin.New()
 	router.Use(gin.Recovery())
+	// Log every control-plane request so connection problems are visible in
+	// journald: 401 distinguishes an auth/secret mismatch from requests that
+	// never reach the daemon (missing, or refused by the network).
+	router.Use(func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		logger.Info("http request",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
 	authorizeMetrics := func(c *gin.Context) {
 		if !authorizedRequest(c.Request, cfg.MetricsSecret) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "unauthorized"})
