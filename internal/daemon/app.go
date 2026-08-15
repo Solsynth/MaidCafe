@@ -25,6 +25,9 @@ type App struct {
 	publisher  *CloudPublisher
 	relay      *WebhookRelay
 	hub        *StreamHub
+	containers *ContainersCollector
+	processes  *ProcessesCollector
+	systemd    *SystemdCollector
 	server     *http.Server
 	listenerMu sync.RWMutex
 	listener   net.Listener
@@ -47,7 +50,17 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
-	app := &App{cfg: cfg, executor: executor, metrics: metrics, publisher: publisher, hub: NewStreamHub(), logger: logger}
+	app := &App{
+		cfg:        cfg,
+		executor:   executor,
+		metrics:    metrics,
+		publisher:  publisher,
+		hub:        NewStreamHub(),
+		containers: &ContainersCollector{},
+		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
+		systemd:    &SystemdCollector{},
+		logger:     logger,
+	}
 	app.relay = NewWebhookRelay(publisher, executor, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
@@ -143,6 +156,33 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, gin.H{"metrics": app.metrics.History(MetricsHistoryQuery{
 			From: from, To: to, Before: before, Limit: limit,
 		})})
+	})
+	// One-shot snapshots of the same data the SSE stream pushes, so clients
+	// can paint first data from the daemon instead of an SSH fallback. They
+	// reuse the stream collectors' probe cache and rate limits.
+	router.GET("/api/v1/containers", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.containers.snapshot(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	router.GET("/api/v1/processes", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.processes.collect(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	router.GET("/api/v1/systemd", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.systemd.snapshot(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
 	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
@@ -258,12 +298,9 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	a.runStreamCollector(ctx, "metric", a.cfg.StreamInterval, func(ctx context.Context) ([]byte, error) {
 		return json.Marshal(a.metrics.Collect())
 	})
-	containers := &ContainersCollector{}
-	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, containers.collect)
-	processes := &ProcessesCollector{limit: a.cfg.ProcessesLimit}
-	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, processes.collect)
-	systemd := &SystemdCollector{}
-	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, systemd.collect)
+	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, a.containers.collect)
+	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, a.processes.collect)
+	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
 }
 
 func (a *App) runStreamCollector(ctx context.Context, event string, interval time.Duration, collect func(context.Context) ([]byte, error)) {

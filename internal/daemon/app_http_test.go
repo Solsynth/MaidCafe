@@ -385,3 +385,94 @@ func TestSSEStreamHelloAndMetricFrames(t *testing.T) {
 		t.Fatalf("app.Run returned: %v", err)
 	}
 }
+
+func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
+	cfg := config.DaemonConfig{
+		ID:                "snapshot-host",
+		Version:           "v9.9.9",
+		Transport:         "http",
+		Listen:            "127.0.0.1:0",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Second,
+		ProcessesLimit:    50,
+		RequestTimeout:    5 * time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+	}
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- app.Run(ctx) }()
+
+	baseURL := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for baseURL == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon did not start listening")
+		}
+		if addr := app.ListenAddr(); addr != "" {
+			baseURL = "http://" + addr
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	for _, endpoint := range []string{"/api/v1/containers", "/api/v1/processes", "/api/v1/systemd"} {
+		unauthorized, err := http.Get(baseURL + endpoint)
+		if err != nil {
+			t.Fatalf("%s: %v", endpoint, err)
+		}
+		unauthorized.Body.Close()
+		if unauthorized.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s without secret status = %d", endpoint, unauthorized.StatusCode)
+		}
+
+		request, err := http.NewRequest(http.MethodGet, baseURL+endpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer metrics-secret")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("%s: %v", endpoint, err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", endpoint, response.StatusCode, body)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("%s body %q: %v", endpoint, body, err)
+		}
+		// Shape-only assertions: content depends on the host's runtimes/tools.
+		switch endpoint {
+		case "/api/v1/containers":
+			if _, ok := payload["runtimes"]; !ok {
+				t.Fatalf("containers payload missing runtimes: %#v", payload)
+			}
+		case "/api/v1/processes":
+			if _, ok := payload["processes"]; !ok {
+				t.Fatalf("processes payload missing processes: %#v", payload)
+			}
+		case "/api/v1/systemd":
+			if _, ok := payload["available"]; !ok {
+				t.Fatalf("systemd payload missing available: %#v", payload)
+			}
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("app.Run returned: %v", err)
+	}
+}

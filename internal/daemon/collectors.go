@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -57,100 +56,116 @@ type containerEntry struct {
 	ComposeProject string `json:"compose_project"`
 }
 
-type containersPayload struct {
-	Runtime    *string          `json:"runtime"`
+type containersRuntimePayload struct {
+	Runtime    string           `json:"runtime"`
 	Available  bool             `json:"available"`
 	Error      *string          `json:"error"`
 	Containers []containerEntry `json:"containers"`
 }
 
-// ContainersCollector probes for podman/docker once, caches the probe result,
-// and re-probes every 60s while unavailable. It emits one "unavailable" event
-// per availability flip and otherwise only collects while a runtime exists.
+type containersPayload struct {
+	Runtimes []containersRuntimePayload `json:"runtimes"`
+}
+
+// ContainersCollector probes podman and docker (podman first), caching the
+// probe result and re-probing every 60s while a runtime is unavailable. The
+// stream uses collect(), which announces an empty runtimes list once per
+// availability flip; the HTTP endpoints use snapshot(), which always returns
+// a payload.
 type ContainersCollector struct {
 	mu        sync.Mutex
-	runtime   string // "podman" | "docker" | "" while unavailable
-	available bool
-	errMsg    string
+	runtimes  []string // found runtimes, podman before docker
 	probed    bool
 	lastProbe time.Time
-	announced bool // whether the current availability state was already sent
+	announced bool   // whether the current runtimes state was already sent
+	lastState string // fingerprint of the last probed runtimes set
 }
 
 func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	if !c.probed || (!c.available && now.Sub(c.lastProbe) >= containerReProbeInterval) {
+	if !c.probed || (len(c.runtimes) == 0 && now.Sub(c.lastProbe) >= containerReProbeInterval) {
 		c.probe(ctx)
 		c.probed = true
 		c.lastProbe = now
 	}
-	if !c.available {
+	if len(c.runtimes) == 0 {
 		if !c.announced {
 			c.announced = true
-			return c.marshal(nil, false, strPtr(c.errMsg))
+			return c.marshal()
 		}
 		return nil, nil
 	}
 	c.announced = true
-	return c.collectContainers(ctx)
+	return c.collectRuntimes(ctx)
+}
+
+// snapshot always returns a payload — unlike collect, which the stream uses
+// and which skips re-announcing an already-announced unavailable state.
+func (c *ContainersCollector) snapshot(ctx context.Context) ([]byte, error) {
+	data, err := c.collect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		return data, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.marshal()
 }
 
 func (c *ContainersCollector) probe(ctx context.Context) {
-	prev := c.available
-	c.available = false
-	c.errMsg = ""
-	runtime, err := probeContainerRuntime(ctx)
-	if err == nil {
-		c.runtime = runtime
-		c.available = true
-	} else {
-		c.errMsg = err.Error()
-	}
-	if c.available != prev {
+	runtimes := probeContainerRuntimes(ctx)
+	state := strings.Join(runtimes, ",")
+	if state != c.lastState {
 		c.announced = false
 	}
+	c.runtimes = runtimes
+	c.lastState = state
 }
 
-func (c *ContainersCollector) collectContainers(ctx context.Context) ([]byte, error) {
-	out, err := runCommand(ctx, c.runtime, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
-	if err != nil {
-		return c.marshal(nil, true, strPtr("list containers: "+err.Error()))
+func (c *ContainersCollector) collectRuntimes(ctx context.Context) ([]byte, error) {
+	payload := containersPayload{
+		Runtimes: make([]containersRuntimePayload, 0, len(c.runtimes)),
 	}
-	entries, err := parseContainerLines(out)
-	if err != nil {
-		return c.marshal(nil, true, strPtr("parse container list: "+err.Error()))
+	for _, runtime := range c.runtimes {
+		out, err := runCommand(ctx, runtime, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
+		if err != nil {
+			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
+				Runtime: runtime, Available: true, Error: strPtr("list containers: " + err.Error()),
+			})
+			continue
+		}
+		entries, err := parseContainerLines(out)
+		if err != nil {
+			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
+				Runtime: runtime, Available: true, Error: strPtr("parse container list: " + err.Error()),
+			})
+			continue
+		}
+		payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
+			Runtime: runtime, Available: true, Containers: entries,
+		})
 	}
-	return c.marshal(entries, true, nil)
+	return json.Marshal(payload)
 }
 
-func (c *ContainersCollector) marshal(entries []containerEntry, available bool, errMsg *string) ([]byte, error) {
-	if entries == nil {
-		entries = []containerEntry{}
-	}
-	var runtime *string
-	if c.runtime != "" {
-		runtime = strPtr(c.runtime)
-	}
-	return json.Marshal(containersPayload{
-		Runtime:    runtime,
-		Available:  available,
-		Error:      errMsg,
-		Containers: entries,
-	})
+func (c *ContainersCollector) marshal() ([]byte, error) {
+	return json.Marshal(containersPayload{Runtimes: []containersRuntimePayload{}})
 }
 
-// probeContainerRuntime resolves the preferred container runtime via
-// `command -v`, matching the client-side SSH probes.
-func probeContainerRuntime(ctx context.Context) (string, error) {
-	if out, err := runShell(ctx, "command -v podman 2>/dev/null"); err == nil && strings.TrimSpace(string(out)) != "" {
-		return "podman", nil
+// probeContainerRuntimes resolves the available container runtimes via
+// `command -v`, podman preferred, matching the client-side SSH probes.
+func probeContainerRuntimes(ctx context.Context) []string {
+	var runtimes []string
+	for _, candidate := range []string{"podman", "docker"} {
+		if out, err := runShell(ctx, "command -v "+candidate+" 2>/dev/null"); err == nil && strings.TrimSpace(string(out)) != "" {
+			runtimes = append(runtimes, candidate)
+		}
 	}
-	if out, err := runShell(ctx, "command -v docker 2>/dev/null"); err == nil && strings.TrimSpace(string(out)) != "" {
-		return "docker", nil
-	}
-	return "", errors.New("no container runtime found (podman or docker)")
+	return runtimes
 }
 
 // containerJSONLine mirrors the fields of one `ps -a --format '{{json .}}'`
@@ -348,6 +363,21 @@ func (s *SystemdCollector) collect(ctx context.Context) ([]byte, error) {
 	}
 	s.announced = true
 	return s.collectUnits(ctx)
+}
+
+// snapshot always returns a payload — for the HTTP endpoints, unlike collect
+// which is used by the stream and skips re-announcing an unavailable state.
+func (s *SystemdCollector) snapshot(ctx context.Context) ([]byte, error) {
+	data, err := s.collect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		return data, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.marshal(nil, false, strPtr(s.errMsg))
 }
 
 func (s *SystemdCollector) probe(ctx context.Context) {

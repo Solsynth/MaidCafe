@@ -204,6 +204,22 @@ Authorization: Bearer <metrics-secret>
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.
 
+### Snapshot endpoints
+
+The same state the stream pushes is also available as one-shot responses, so
+clients can paint first data from the daemon instead of an SSH fallback. They
+reuse the stream collectors' probe cache and rate limits:
+
+- `GET /api/v1/containers` — same payload as the `containers` event: a
+  `runtimes` list covering every runtime found on the host (podman first),
+  each with `runtime`, `available`, `error` and `containers`.
+- `GET /api/v1/processes` — same payload as the `processes` event.
+- `GET /api/v1/systemd` — same payload as the `systemd` event.
+
+All three are authenticated with the same metrics secret and cost one
+collection on demand; repeated calls are rate-limited by the shared probe
+cache.
+
 Webhook secrets are separate from the metrics secret. The daemon does not
 provide an HTTP configuration API; MaidKit updates the managed TOML
 configuration over SSH and restarts the service when needed.
