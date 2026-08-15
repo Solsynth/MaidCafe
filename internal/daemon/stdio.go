@@ -72,6 +72,7 @@ func (a *App) runStdio(ctx context.Context) error {
 	results := make(chan stdioActionResult)
 	ticker := time.NewTicker(a.cfg.MetricsInterval)
 	defer ticker.Stop()
+	a.metrics.Record()
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,7 +136,7 @@ func (a *App) runStdio(ctx context.Context) error {
 				return err
 			}
 		case <-ticker.C:
-			metrics := a.metrics.Collect()
+			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
 			}

@@ -222,8 +222,12 @@ func validateListen(value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("must not be empty")
 	}
-	if _, err := net.ResolveTCPAddr("tcp", value); err != nil {
+	address, err := net.ResolveTCPAddr("tcp", value)
+	if err != nil {
 		return fmt.Errorf("invalid address: %w", err)
+	}
+	if address.Port != 0 && address.Port < 1024 {
+		return fmt.Errorf("port %d requires root or CAP_NET_BIND_SERVICE; use a port >= 1024", address.Port)
 	}
 	return nil
 }

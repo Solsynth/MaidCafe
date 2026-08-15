@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +78,18 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router.GET("/api/v1/metrics", authorizeMetrics, func(c *gin.Context) {
 		c.JSON(http.StatusOK, app.metrics.Collect())
 	})
+	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
+		limit := metricHistoryLimit
+		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "limit must be a positive integer"})
+				return
+			}
+			limit = parsed
+		}
+		c.JSON(http.StatusOK, gin.H{"metrics": app.metrics.History(limit)})
+	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
 		if err != nil {
@@ -137,26 +150,23 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Start(); err != nil {
 		return err
 	}
-	var ticker *time.Ticker
-	if a.publisher != nil {
-		ticker = time.NewTicker(a.cfg.MetricsInterval)
-		defer ticker.Stop()
-	}
+	ticker := time.NewTicker(a.cfg.MetricsInterval)
+	defer ticker.Stop()
+	a.metrics.Record()
 	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return a.Shutdown(shutdownCtx)
 	}
 	for {
-		if ticker == nil {
-			<-ctx.Done()
-			return shutdown()
-		}
 		select {
 		case <-ctx.Done():
 			return shutdown()
 		case <-ticker.C:
-			a.publisher.PublishMetrics(context.Background(), a.metrics.Collect())
+			metrics := a.metrics.Record()
+			if a.publisher != nil {
+				a.publisher.PublishMetrics(context.Background(), metrics)
+			}
 		}
 	}
 }

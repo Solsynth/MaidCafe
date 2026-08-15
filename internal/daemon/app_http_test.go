@@ -116,6 +116,33 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	if metrics.StatusCode != http.StatusOK {
 		t.Fatalf("metrics status = %d", metrics.StatusCode)
 	}
+	app.metrics.Record()
+	historyRequest, err := http.NewRequest(
+		http.MethodGet,
+		baseURL+"/api/v1/metrics/history?limit=1",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	history, err := http.DefaultClient.Do(historyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Body.Close()
+	if history.StatusCode != http.StatusOK {
+		t.Fatalf("metrics history status = %d", history.StatusCode)
+	}
+	var historyBody struct {
+		Metrics []MetricsPayload `json:"metrics"`
+	}
+	if err := json.NewDecoder(history.Body).Decode(&historyBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(historyBody.Metrics) != 1 {
+		t.Fatalf("metrics history length = %d", len(historyBody.Metrics))
+	}
 
 	actionRequest, err := http.NewRequest(
 		http.MethodPost,

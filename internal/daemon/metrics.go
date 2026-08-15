@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -21,13 +22,47 @@ type MetricsPayload struct {
 	WebhookFailures    uint64    `json:"webhook_failures"`
 }
 
+const metricHistoryLimit = 1440
+
 type MetricsCollector struct {
 	started  time.Time
 	executor *WebhookExecutor
+	mu       sync.RWMutex
+	history  []MetricsPayload
 }
 
 func NewMetricsCollector(_ config.DaemonConfig, executor *WebhookExecutor) *MetricsCollector {
-	return &MetricsCollector{started: time.Now(), executor: executor}
+	return &MetricsCollector{
+		started:  time.Now(),
+		executor: executor,
+		history:  make([]MetricsPayload, 0, metricHistoryLimit),
+	}
+}
+
+// Record collects one snapshot and retains it for the history endpoint.
+func (m *MetricsCollector) Record() MetricsPayload {
+	payload := m.Collect()
+	m.mu.Lock()
+	m.history = append(m.history, payload)
+	if len(m.history) > metricHistoryLimit {
+		m.history = m.history[len(m.history)-metricHistoryLimit:]
+	}
+	m.mu.Unlock()
+	return payload
+}
+
+// History returns the newest retained samples in chronological order.
+func (m *MetricsCollector) History(limit int) []MetricsPayload {
+	if limit <= 0 || limit > metricHistoryLimit {
+		limit = metricHistoryLimit
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	start := len(m.history) - limit
+	if start < 0 {
+		start = 0
+	}
+	return append([]MetricsPayload(nil), m.history[start:]...)
 }
 
 func (m *MetricsCollector) Collect() MetricsPayload {

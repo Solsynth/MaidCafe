@@ -109,6 +109,22 @@ func TestDaemonCloudURLValidation(t *testing.T) {
 		})
 	}
 }
+func TestDaemonRejectsPrivilegedListenPort(t *testing.T) {
+	cfg := Config{Daemon: DaemonConfig{
+		ID:                "host-1",
+		Transport:         "http",
+		Listen:            "127.0.0.1:80",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Minute,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+	}}
+	if err := cfg.ValidateDaemon(); err == nil {
+		t.Fatal("expected privileged daemon port to be rejected")
+	}
+}
 
 func TestEnvironmentOverrides(t *testing.T) {
 	t.Setenv("DAEMON_ID", "env-host")
