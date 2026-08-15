@@ -49,9 +49,14 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	router.ServeHTTP(landing, httptest.NewRequest(http.MethodGet, "/", nil))
 	if landing.Code != http.StatusOK ||
 		!strings.Contains(landing.Header().Get("Content-Type"), "text/html") ||
-		!strings.Contains(landing.Body.String(), "Your MaidCafe cloud is ready.") ||
-		!strings.Contains(landing.Body.String(), "Use MaidKit to connect") {
+		!strings.Contains(landing.Body.String(), "MaidKit Cloud is up and running") {
 		t.Fatalf("landing page response %d %q", landing.Code, landing.Body.String())
+	}
+
+	favicon := httptest.NewRecorder()
+	router.ServeHTTP(favicon, httptest.NewRequest(http.MethodGet, "/favicon.png", nil))
+	if favicon.Code != http.StatusOK || !strings.Contains(favicon.Header().Get("Content-Type"), "image/png") {
+		t.Fatalf("favicon response %d %q", favicon.Code, favicon.Header().Get("Content-Type"))
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodPost} {

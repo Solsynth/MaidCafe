@@ -19,6 +19,8 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	r.GET("/", func(c *gin.Context) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cloudLandingPageHTML))
 	})
+	r.GET("/favicon.png", serveFavicon)
+	r.GET("/favicon.ico", serveFavicon)
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "cloud"}) })
 	user := r.Group("/api")
 	user.Use(userAuth, requireUser())
