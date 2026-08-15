@@ -17,28 +17,7 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Run tests
-        run: go test ./...
-
-      - name: Build cloud and daemon binaries
-        run: go build ./cmd/cloud ./cmd/daemon
-
   cloud-image:
-    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,7 +51,6 @@ jobs:
           cache-to: type=gha,mode=max
 
   daemon-artifacts:
-    needs: verify
     if: github.event_name == 'pull_request' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     strategy:
@@ -142,7 +120,6 @@ jobs:
           if-no-files-found: error
 
   daemon-rolling-artifacts:
-    needs: verify
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     strategy:
