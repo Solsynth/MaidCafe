@@ -51,9 +51,24 @@ GET /health
 - Request bodies are opaque stdin bytes. They are never parsed, templated, or
   appended to command arguments.
 - Commands run directly with `exec.CommandContext`; the daemon never invokes
-  `sh -c`.
+  `sh -c` except for the fixed working-directory wrapper of user-switching
+  runs (see below).
 - Static configured arguments only.
 - Absolute command paths and controlled working directory.
+- Per-hook `cwd` (absolute working directory), `env` (`KEY=VALUE`
+  assignments), and `user` (run as another account).
+- `user` runs are delegated to `sudo -H -u <user>`, so the daemon process
+  itself stays unprivileged. Environment assignments are passed as
+  command-line `VAR=value` entries (sudo applies them on top of its reset
+  environment) and the working directory is applied by a fixed `sh -c`
+  wrapper; no request-controlled input is ever interpolated into it. The
+  sudoers rule granting the daemon the right to run MaidKit-deployed scripts
+  as the configured users is installed by MaidKit; hand-configured entries
+  must provide their own rule.
+- Script actions that run as another user render their substituted body next
+  to the deployed script under a hidden `.run` directory (0755, created on
+  demand), so the target account can read and execute them; the daemon user
+  needs write access to the scripts directory for that to work.
 - Request body size limits.
 - Maximum concurrent execution limit with `429` on exhaustion.
 - Script timeout handling with `504` responses.
@@ -175,7 +190,7 @@ Authorization: Bearer <metrics-secret>
 state over HTTP, authenticated with the same metrics secret:
 
 ```text
-GET /api/v1/stream?events=metric,containers,processes,systemd
+GET /api/v1/stream?events=metric,containers,images,processes,systemd
 Authorization: Bearer <metrics-secret>
 ```
 
@@ -188,7 +203,7 @@ Authorization: Bearer <metrics-secret>
   detect staleness:
 
 ```json
-{"stream":"v1","version":"0.1.0","intervals":{"metric":1,"containers":5,"processes":10,"systemd":30}}
+{"stream":"v1","version":"0.1.0","intervals":{"metric":1,"containers":5,"images":60,"processes":10,"systemd":30}}
 ```
 
 - `metric` frames are the same payload as `GET /api/v1/metrics`, delivered
@@ -196,10 +211,17 @@ Authorization: Bearer <metrics-secret>
 - `containers` frames (every `containersInterval`, default `5s`) report the
   podman/docker container list, including the compose project extracted from
   container labels.
+- `images` frames (every `imagesInterval`, default `60s`) report the
+  podman/docker image list (`id`, `tags`, `size`, `created`, `digest`).
 - `processes` frames (every `processesInterval`, default `10s`) report the top
   `processesLimit` (default `50`, valid `1..500`) CPU consumers.
 - `systemd` frames (every `systemdInterval`, default `30s`) report the merged
   systemd unit list, including enabled-but-inactive units.
+- Container and image listing retries through `sudo -n` when the direct query
+  fails or returns nothing and the daemon is not root, so root-owned
+  containers stay visible to a non-root daemon (e.g. the systemd `maidcafe`
+  user) when passwordless sudo is available. The retry is never interactive
+  and the direct result stands otherwise.
 - Setting a collector interval to `0` disables that collector. Collection is
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.
@@ -213,10 +235,12 @@ reuse the stream collectors' probe cache and rate limits:
 - `GET /api/v1/containers` — same payload as the `containers` event: a
   `runtimes` list covering every runtime found on the host (podman first),
   each with `runtime`, `available`, `error` and `containers`.
+- `GET /api/v1/images` — same payload as the `images` event: a `runtimes`
+  list, each with `runtime`, `available`, `error` and `images`.
 - `GET /api/v1/processes` — same payload as the `processes` event.
 - `GET /api/v1/systemd` — same payload as the `systemd` event.
 
-All three are authenticated with the same metrics secret and cost one
+All four are authenticated with the same metrics secret and cost one
 collection on demand; repeated calls are rate-limited by the shared probe
 cache.
 
@@ -322,6 +346,22 @@ sudo systemctl enable --now maidcafe-daemon
 
 The unit runs as `maidcafe`, restarts after failure, and applies systemd
 hardening. Webhook commands must be readable and executable by that account.
+
+Actions that run as another account (`user = "..."` in `[[daemon.actions]]`
+or `[[daemon.webhooks]]`) are executed through sudo and render their
+substituted scripts under `/etc/maidcafe/actions/.run`. For those, the unit
+needs `NoNewPrivileges=false` (sudo's setuid bit) and `ReadWritePaths=/etc/maidcafe/actions`,
+and the daemon account needs a sudoers rule such as:
+
+```sh
+sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidcafe-actions <<'EOF'
+maidcafe ALL=(deploy) NOPASSWD: /etc/maidcafe/actions/*
+EOF
+```
+
+The same rule must exist for the SSH user that runs the daemon in `stdio`
+transport mode. MaidKit deploys all of this automatically when an action
+selects a run-as user.
 
 ## CI artifacts
 

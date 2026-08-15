@@ -1,6 +1,11 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -112,5 +117,113 @@ func TestMergeSystemdUnitsIncludesEnabledButInactive(t *testing.T) {
 	}
 	if merged[3].Name != "backup.service" {
 		t.Fatalf("merged[3] = %s, want backup.service", merged[3].Name)
+	}
+}
+
+func TestParseContainerLinesEmptyReturnsEmptySlice(t *testing.T) {
+	entries, err := parseContainerLines(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries == nil {
+		t.Fatal("empty container list parsed as nil; must marshal to [] not null")
+	}
+	if len(entries) != 0 {
+		t.Fatalf("parsed %d containers from empty input", len(entries))
+	}
+	if raw, marshalErr := json.Marshal(entries); marshalErr != nil || string(raw) != "[]" {
+		t.Fatalf("empty container list marshals to %s, %v; want []", raw, marshalErr)
+	}
+}
+
+func TestParseImageLinesDockerAndPodmanForms(t *testing.T) {
+	input := `{"ID":"abc123def456","Repository":"nginx","Tag":"latest","Size":"192560829","Created":1730000000,"Digest":"<none>"}` + "\n" +
+		`{"Id":"sha256:ffffffffffff","RepoTags":["docker.io/library/postgres:16","localhost/dev:edge"],"Size":98765432,"Created":1730000001,"Digest":"sha256:aaaa"}` + "\n" +
+		`{"ID":"unused12345","Repository":"<none>","Tag":"<none>","Size":"123","Created":1730000002}` + "\n"
+	entries, err := parseImageLines([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("parsed %d images, want 3", len(entries))
+	}
+	first := entries[0]
+	if first.ID != "abc123def456" || len(first.Tags) != 1 || first.Tags[0] != "nginx:latest" ||
+		first.Size != 192560829 || first.Created != 1730000000 || first.Digest != "" {
+		t.Fatalf("docker image parsed as %#v", first)
+	}
+	second := entries[1]
+	if second.ID != "sha256:ffffffffffff" || len(second.Tags) != 2 ||
+		second.Tags[0] != "docker.io/library/postgres:16" || second.Tags[1] != "localhost/dev:edge" ||
+		second.Size != 98765432 || second.Digest != "sha256:aaaa" {
+		t.Fatalf("podman image parsed as %#v", second)
+	}
+	third := entries[2]
+	if len(third.Tags) != 0 || third.Size != 123 {
+		t.Fatalf("untagged image parsed as %#v", third)
+	}
+}
+
+func TestParseImageLinesEmptyReturnsEmptySlice(t *testing.T) {
+	entries, err := parseImageLines(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries == nil || len(entries) != 0 {
+		t.Fatalf("empty image list parsed as %#v; want non-nil empty slice", entries)
+	}
+	if raw, marshalErr := json.Marshal(entries); marshalErr != nil || string(raw) != "[]" {
+		t.Fatalf("empty image list marshals to %s, %v; want []", raw, marshalErr)
+	}
+}
+
+// TestRunRuntimeListElevatedFallback pins the root-visibility retry: an
+// empty direct listing is retried through `sudo -n` so containers/images
+// owned by root stay visible to a non-root daemon with passwordless sudo,
+// while a successful direct listing never escalates.
+func TestRunRuntimeListElevatedFallback(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires a non-root test user to exercise the sudo retry")
+	}
+	dir := t.TempDir()
+	mk := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// Fake runtime: the "root-owned" container is only visible through the
+	// elevated retry (env marker set by the fake sudo shim).
+	runtimePath := mk("podman", `if [ "$MAIDCAFE_ROOT" = "1" ]; then echo '{"ID":"rootctr"}'; fi`)
+	sudoMarker := filepath.Join(dir, "sudo-ran")
+	mk("sudo", `shift; : > "`+sudoMarker+`"; MAIDCAFE_ROOT=1 exec "$@"`)
+	mk("podman-visible", `echo '{"ID":"seenas-user"}'`)
+	t.Setenv("PATH", dir)
+
+	ctx := context.Background()
+
+	// Direct success short-circuits the elevated retry.
+	out, err := runRuntimeList(ctx, filepath.Join(dir, "podman-visible"), "ps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("seenas-user")) {
+		t.Fatalf("direct listing output = %q", out)
+	}
+	if _, statErr := os.Stat(sudoMarker); statErr == nil {
+		t.Fatal("elevated retry ran although the direct listing succeeded")
+	}
+
+	// Empty direct listing retries through sudo and sees the root container.
+	out, err = runRuntimeList(ctx, runtimePath, "ps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("rootctr")) {
+		t.Fatalf("elevated listing output = %q", out)
+	}
+	if _, statErr := os.Stat(sudoMarker); statErr != nil {
+		t.Fatal("elevated retry did not run for an empty direct listing")
 	}
 }

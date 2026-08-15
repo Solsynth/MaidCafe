@@ -132,9 +132,9 @@ func TestParseEventsParam(t *testing.T) {
 	if types, err := parseEventsParam(""); err != nil || types != nil {
 		t.Fatalf("empty events = %#v, %v; want nil, nil", types, err)
 	}
-	if types, err := parseEventsParam("metric,containers, processes "); err != nil {
+	if types, err := parseEventsParam("metric,containers,images, processes "); err != nil {
 		t.Fatalf("valid events rejected: %v", err)
-	} else if len(types) != 3 || types[0] != "metric" || types[1] != "containers" || types[2] != "processes" {
+	} else if len(types) != 4 || types[0] != "metric" || types[1] != "containers" || types[2] != "images" || types[3] != "processes" {
 		t.Fatalf("valid events parsed as %#v", types)
 	}
 	if _, err := parseEventsParam("metric,bogus"); err == nil {

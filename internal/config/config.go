@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,14 +15,14 @@ import (
 )
 
 type Config struct {
-	App      AppConfig       `mapstructure:"app"`
-	HTTP     HTTPConfig      `mapstructure:"http"`
-	Database DatabaseConfig  `mapstructure:"database"`
-	Auth     AuthConfig      `mapstructure:"auth"`
+	App       AppConfig       `mapstructure:"app"`
+	HTTP      HTTPConfig      `mapstructure:"http"`
+	Database  DatabaseConfig  `mapstructure:"database"`
+	Auth      AuthConfig      `mapstructure:"auth"`
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
-	Eventbus EventbusConfig  `mapstructure:"eventbus"`
-	Ring     RingConfig      `mapstructure:"ring"`
-	Daemon   DaemonConfig    `mapstructure:"daemon"`
+	Eventbus  EventbusConfig  `mapstructure:"eventbus"`
+	Ring      RingConfig      `mapstructure:"ring"`
+	Daemon    DaemonConfig    `mapstructure:"daemon"`
 }
 
 type AppConfig struct {
@@ -65,6 +66,7 @@ type DaemonConfig struct {
 	MetricsInterval      time.Duration   `mapstructure:"metricsInterval"`
 	StreamInterval       time.Duration   `mapstructure:"streamInterval"`
 	ContainersInterval   time.Duration   `mapstructure:"containersInterval"`
+	ImagesInterval       time.Duration   `mapstructure:"imagesInterval"`
 	ProcessesInterval    time.Duration   `mapstructure:"processesInterval"`
 	SystemdInterval      time.Duration   `mapstructure:"systemdInterval"`
 	ProcessesLimit       int             `mapstructure:"processesLimit"`
@@ -87,6 +89,38 @@ type WebhookConfig struct {
 	// substitutes {{ name }} template variables from the request body into
 	// the script before running it. Plain commands keep Script false.
 	Script bool `mapstructure:"script"`
+	// Cwd is the absolute working directory the command runs in; empty keeps
+	// the daemon's own working directory.
+	Cwd string `mapstructure:"cwd"`
+	// User runs the command as another account through sudo (the daemon
+	// itself is unprivileged). The sudoers rule granting this is deployed by
+	// MaidKit; hand-configured entries must provide their own rule. Empty
+	// runs the command as the daemon user.
+	User string `mapstructure:"user"`
+	// Env entries are KEY=VALUE assignments added to the command's
+	// environment. Without a run-as user they are appended to the daemon's
+	// environment; with one they are passed to sudo as command-line
+	// assignments, which sudo applies on top of its reset environment.
+	Env []string `mapstructure:"env"`
+}
+
+var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+
+func validateHookExecution(hook WebhookConfig, kind string, index int) error {
+	if hook.Cwd != "" && !filepath.IsAbs(hook.Cwd) {
+		return fmt.Errorf("daemon.%s[%d].cwd must be an absolute path", kind, index)
+	}
+	if hook.User != "" {
+		if _, err := user.Lookup(hook.User); err != nil {
+			return fmt.Errorf("daemon.%s[%d].user %q does not exist: %w", kind, index, hook.User, err)
+		}
+	}
+	for i, kv := range hook.Env {
+		if !envAssignmentPattern.MatchString(kv) {
+			return fmt.Errorf("daemon.%s[%d].env[%d] must be KEY=VALUE with an identifier key", kind, index, i)
+		}
+	}
+	return nil
 }
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -123,6 +157,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
 	viper.SetDefault("daemon.streamInterval", time.Second)
 	viper.SetDefault("daemon.containersInterval", 5*time.Second)
+	viper.SetDefault("daemon.imagesInterval", time.Minute)
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.processesLimit", 50)
@@ -155,7 +190,7 @@ func applyEnvAliases() {
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
-		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
+		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
 		"DAEMON_SYSTEMD_INTERVAL": "daemon.systemdInterval", "DAEMON_PROCESSES_LIMIT": "daemon.processesLimit",
 		"DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
 		"DAEMON_SCRIPT_TIMEOUT":  "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
@@ -212,6 +247,9 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.ContainersInterval < 0 {
 		return fmt.Errorf("daemon.containersInterval must not be negative")
 	}
+	if c.Daemon.ImagesInterval < 0 {
+		return fmt.Errorf("daemon.imagesInterval must not be negative")
+	}
 	if c.Daemon.ProcessesInterval < 0 {
 		return fmt.Errorf("daemon.processesInterval must not be negative")
 	}
@@ -251,6 +289,9 @@ func (c *Config) ValidateDaemon() error {
 		if !filepath.IsAbs(hook.Command) {
 			return fmt.Errorf("daemon.webhooks[%d].command must be an absolute path", i)
 		}
+		if err := validateHookExecution(hook, "webhooks", i); err != nil {
+			return err
+		}
 	}
 	for i, action := range c.Daemon.Actions {
 		if strings.TrimSpace(action.Name) == "" || !webhookNamePattern.MatchString(action.Name) {
@@ -262,6 +303,9 @@ func (c *Config) ValidateDaemon() error {
 		seen[action.Name] = struct{}{}
 		if !filepath.IsAbs(action.Command) {
 			return fmt.Errorf("daemon.actions[%d].command must be an absolute path", i)
+		}
+		if err := validateHookExecution(action, "actions", i); err != nil {
+			return err
 		}
 	}
 	if strings.TrimSpace(c.Daemon.CloudURL) != "" {

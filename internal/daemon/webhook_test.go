@@ -189,6 +189,187 @@ func TestSubstituteScriptTemplateRequiresValues(t *testing.T) {
 	}
 }
 
+func TestBuildRunCommandAppliesCwdAndEnv(t *testing.T) {
+	hook := config.WebhookConfig{Command: "/bin/echo", Cwd: "/srv/app", Env: []string{"FOO=bar", "EMPTY="}}
+	cmd := buildRunCommand(context.Background(), hook, hook.Command, []string{"-n", "hi"})
+	if cmd.Dir != "/srv/app" {
+		t.Fatalf("cwd = %q", cmd.Dir)
+	}
+	if cmd.Args[0] != "/bin/echo" || len(cmd.Args) != 3 {
+		t.Fatalf("args = %v", cmd.Args)
+	}
+	env := map[string]string{}
+	for _, kv := range cmd.Env {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			env[kv[:i]] = kv[i+1:]
+		}
+	}
+	if env["FOO"] != "bar" || env["EMPTY"] != "" {
+		t.Fatalf("env = %v", env)
+	}
+	if cmd.Env == nil {
+		t.Fatal("direct mode must inherit the daemon environment")
+	}
+
+	// Default working directory stays the daemon's own.
+	plain := buildRunCommand(context.Background(), config.WebhookConfig{Command: "/bin/true"}, "/bin/true", nil)
+	if plain.Dir != "/" {
+		t.Fatalf("default cwd = %q", plain.Dir)
+	}
+}
+
+func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
+	hook := config.WebhookConfig{
+		Command: "/etc/maidcafe/actions/deploy.sh",
+		User:    "deploy",
+		Cwd:     "/srv/myapp",
+		Env:     []string{"CI_BUILD=42", "SPACED=two words"},
+	}
+	cmd := buildRunCommand(context.Background(), hook, hook.Command, []string{"--force"})
+	want := []string{
+		"sudo", "-H", "-u", "deploy",
+		"CI_BUILD=42", "SPACED=two words",
+		"sh", "-c", `cd -- "$1" && shift && exec "$@"`,
+		"maidcafe", "/srv/myapp", "/etc/maidcafe/actions/deploy.sh", "--force",
+	}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("argv = %v", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q (full: %v)", i, cmd.Args[i], want[i], cmd.Args)
+		}
+	}
+
+	// Without a cwd the wrapper is skipped.
+	noCwd := buildRunCommand(context.Background(), config.WebhookConfig{
+		Command: "/bin/true", User: "deploy",
+	}, "/bin/true", nil)
+	if len(noCwd.Args) != 5 || noCwd.Args[0] != "sudo" || noCwd.Args[3] != "deploy" || noCwd.Args[4] != "/bin/true" {
+		t.Fatalf("no-cwd argv = %v", noCwd.Args)
+	}
+}
+
+func TestExecuteHonorsCwdAndEnv(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "result")
+	script := executable(t, "#!/bin/sh\nprintf '%s' \"$(pwd)\" > "+output+"\nprintf '%s' \"$GREETING\" >> "+output+"\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name:    "where",
+			Command: script,
+			Enabled: true,
+			Cwd:     t.TempDir(),
+			Env:     []string{"GREETING=hello"},
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+	result, requestErr := executor.RunAction(context.Background(), "where", nil)
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if !result.OK {
+		t.Fatalf("result = %+v", result)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// macOS resolves /var → /private/var in pwd; compare physical paths.
+	realCwd, err := filepath.EvalSymlinks(cfg.Actions[0].Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := realCwd + "hello"
+	if string(got) != want {
+		t.Fatalf("cwd/env result = %q, want %q", got, want)
+	}
+}
+
+func TestRenderScriptTempLocations(t *testing.T) {
+	deployed := filepath.Join(t.TempDir(), "actions", "deploy.sh")
+	// Without a run-as user the script lands in the system temp dir, 0700.
+	plain, cleanup, err := renderScriptTemp(config.WebhookConfig{Command: deployed}, []byte("#!/bin/sh\necho hi\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	plainDir, err := filepath.EvalSymlinks(filepath.Dir(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempDir, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainDir != tempDir {
+		t.Fatalf("plain temp = %q (dir %q)", plain, plainDir)
+	}
+	info, err := os.Stat(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("plain mode = %v", info.Mode().Perm())
+	}
+
+	// With a run-as user the script must be readable by the target account,
+	// so it renders next to the deployed script with 0755.
+	userRun, cleanup, err := renderScriptTemp(config.WebhookConfig{
+		Command: deployed, User: "deploy",
+	}, []byte("#!/bin/sh\necho hi\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if filepath.Dir(userRun) != filepath.Join(filepath.Dir(deployed), ".run") {
+		t.Fatalf("user temp = %q", userRun)
+	}
+	info, err = os.Stat(userRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("user mode = %v", info.Mode().Perm())
+	}
+}
+
+func TestExecuteUserActionThroughSudo(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to switch users through sudo")
+	}
+	output := filepath.Join(t.TempDir(), "who")
+	script := executable(t, "#!/bin/sh\nid -un > "+output+"\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name:    "as-user",
+			Command: script,
+			Enabled: true,
+			User:    "nobody",
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+	result, requestErr := executor.RunAction(context.Background(), "as-user", nil)
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if !result.OK {
+		t.Fatalf("result = %+v (stderr %q)", result, result.Stderr)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "nobody" {
+		t.Fatalf("ran as %q, want nobody", strings.TrimSpace(string(got)))
+	}
+}
+
 func TestScriptActionSubstitutesTemplate(t *testing.T) {
 	script := executable(t, "#!/bin/sh\necho \"hello {{ NAME }}\"\n")
 	cfg := config.DaemonConfig{

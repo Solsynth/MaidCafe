@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,6 +40,7 @@ command = "/bin/cat"
 		cfg.Daemon.MaxBodyBytes != 65536 ||
 		cfg.Daemon.StreamInterval != time.Second ||
 		cfg.Daemon.ContainersInterval != 5*time.Second ||
+		cfg.Daemon.ImagesInterval != time.Minute ||
 		cfg.Daemon.ProcessesInterval != 10*time.Second ||
 		cfg.Daemon.SystemdInterval != 30*time.Second ||
 		cfg.Daemon.ProcessesLimit != 50 {
@@ -147,6 +149,7 @@ func TestDaemonStreamValidation(t *testing.T) {
 		MetricsInterval:    time.Minute,
 		StreamInterval:     time.Second,
 		ContainersInterval: 5 * time.Second,
+		ImagesInterval:     time.Minute,
 		ProcessesInterval:  10 * time.Second,
 		SystemdInterval:    30 * time.Second,
 		ProcessesLimit:     50,
@@ -164,6 +167,7 @@ func TestDaemonStreamValidation(t *testing.T) {
 	}{
 		{name: "zero stream interval", mutate: func(d *DaemonConfig) { d.StreamInterval = 0 }},
 		{name: "negative containers interval", mutate: func(d *DaemonConfig) { d.ContainersInterval = -time.Second }},
+		{name: "negative images interval", mutate: func(d *DaemonConfig) { d.ImagesInterval = -time.Second }},
 		{name: "negative processes interval", mutate: func(d *DaemonConfig) { d.ProcessesInterval = -time.Second }},
 		{name: "negative systemd interval", mutate: func(d *DaemonConfig) { d.SystemdInterval = -time.Second }},
 		{name: "zero processes limit", mutate: func(d *DaemonConfig) { d.ProcessesLimit = 0 }},
@@ -174,6 +178,114 @@ func TestDaemonStreamValidation(t *testing.T) {
 			tc.mutate(&cfg.Daemon)
 			if err := cfg.ValidateDaemon(); err == nil {
 				t.Fatalf("expected validation error for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
+	base := DaemonConfig{
+		ID:                "host-1",
+		Transport:         "stdio",
+		MetricsInterval:   time.Minute,
+		StreamInterval:    time.Second,
+		ProcessesLimit:    50,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DaemonConfig)
+		ok     bool
+	}{
+		{
+			name: "plain action accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{Name: "a", Command: "/bin/true", Enabled: true}}
+			},
+			ok: true,
+		},
+		{
+			name: "absolute cwd and env accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					Cwd: "/srv/app", Env: []string{"KEY=value", "_X=1"},
+				}}
+			},
+			ok: true,
+		},
+		{
+			name: "existing user accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					User: current.Username,
+				}}
+			},
+			ok: true,
+		},
+		{
+			name: "relative cwd rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					Cwd: "srv/app",
+				}}
+			},
+		},
+		{
+			name: "malformed env entry rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					Env: []string{"1BAD=value"},
+				}}
+			},
+		},
+		{
+			name: "env without equals rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					Env: []string{"NOPE"},
+				}}
+			},
+		},
+		{
+			name: "missing user rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					User: "definitely-not-a-real-user-xyz",
+				}}
+			},
+		},
+		{
+			name: "webhooks validated the same way",
+			mutate: func(d *DaemonConfig) {
+				d.Webhooks = []WebhookConfig{{
+					Name: "w", Secret: "s", Command: "/bin/true", Enabled: true,
+					Cwd: "relative",
+				}}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Daemon: base}
+			tc.mutate(&cfg.Daemon)
+			err := cfg.ValidateDaemon()
+			if tc.ok && err != nil {
+				t.Fatalf("expected valid config, got %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("expected validation error")
 			}
 		})
 	}
@@ -203,6 +315,7 @@ func TestEnvironmentOverrides(t *testing.T) {
 	t.Setenv("DAEMON_REQUEST_TIMEOUT", "2s")
 	t.Setenv("DAEMON_STREAM_INTERVAL", "2s")
 	t.Setenv("DAEMON_CONTAINERS_INTERVAL", "7s")
+	t.Setenv("DAEMON_IMAGES_INTERVAL", "11s")
 	t.Setenv("DAEMON_PROCESSES_INTERVAL", "3s")
 	t.Setenv("DAEMON_SYSTEMD_INTERVAL", "45s")
 	t.Setenv("DAEMON_PROCESSES_LIMIT", "77")
@@ -216,6 +329,7 @@ func TestEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.Daemon.StreamInterval != 2*time.Second ||
 		cfg.Daemon.ContainersInterval != 7*time.Second ||
+		cfg.Daemon.ImagesInterval != 11*time.Second ||
 		cfg.Daemon.ProcessesInterval != 3*time.Second ||
 		cfg.Daemon.SystemdInterval != 45*time.Second ||
 		cfg.Daemon.ProcessesLimit != 77 {

@@ -423,7 +423,7 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 		}
 	}
 
-	for _, endpoint := range []string{"/api/v1/containers", "/api/v1/processes", "/api/v1/systemd"} {
+	for _, endpoint := range []string{"/api/v1/containers", "/api/v1/images", "/api/v1/processes", "/api/v1/systemd"} {
 		unauthorized, err := http.Get(baseURL + endpoint)
 		if err != nil {
 			t.Fatalf("%s: %v", endpoint, err)
@@ -459,6 +459,10 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 		case "/api/v1/containers":
 			if _, ok := payload["runtimes"]; !ok {
 				t.Fatalf("containers payload missing runtimes: %#v", payload)
+			}
+		case "/api/v1/images":
+			if _, ok := payload["runtimes"]; !ok {
+				t.Fatalf("images payload missing runtimes: %#v", payload)
 			}
 		case "/api/v1/processes":
 			if _, ok := payload["processes"]; !ok {

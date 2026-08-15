@@ -26,6 +26,7 @@ type App struct {
 	relay      *WebhookRelay
 	hub        *StreamHub
 	containers *ContainersCollector
+	images     *ImagesCollector
 	processes  *ProcessesCollector
 	systemd    *SystemdCollector
 	server     *http.Server
@@ -50,13 +51,15 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
+	runtimeProbe := &runtimeProbeState{}
 	app := &App{
 		cfg:        cfg,
 		executor:   executor,
 		metrics:    metrics,
 		publisher:  publisher,
 		hub:        NewStreamHub(),
-		containers: &ContainersCollector{},
+		containers: &ContainersCollector{probe: runtimeProbe},
+		images:     &ImagesCollector{probe: runtimeProbe},
 		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
 		systemd:    &SystemdCollector{},
 		logger:     logger,
@@ -162,6 +165,14 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// reuse the stream collectors' probe cache and rate limits.
 	router.GET("/api/v1/containers", authorizeMetrics, func(c *gin.Context) {
 		data, err := app.containers.snapshot(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	router.GET("/api/v1/images", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.images.snapshot(c.Request.Context())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
 			return
@@ -299,6 +310,7 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 		return json.Marshal(a.metrics.Collect())
 	})
 	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, a.containers.collect)
+	a.runStreamCollector(ctx, "images", a.cfg.ImagesInterval, a.images.collect)
 	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, a.processes.collect)
 	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
 }

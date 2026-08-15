@@ -10,6 +10,7 @@ cloudSecret = "replace-with-cloud-issued-secret"
 metricsInterval = "1m"
 streamInterval = "1s"
 containersInterval = "5s"
+imagesInterval = "60s"
 processesInterval = "10s"
 processesLimit = 50
 systemdInterval = "30s"
@@ -31,4 +32,18 @@ notifyOnFailure = true
 name = "cleanup"
 command = "/usr/local/bin/maidkit-cleanup"
 args = ["--retention-days", "7"]
+enabled = true
+
+# Deployed scripts may also pick a working directory, a run-as user, and
+# environment assignments. Running as another user goes through sudo, so the
+# daemon needs the sudoers rule MaidKit installs for it:
+#   maidcafe ALL=(<user>) NOPASSWD: /etc/maidcafe/actions/*
+# cwd must be an absolute path; env entries are KEY=VALUE.
+[[daemon.actions]]
+name = "deploy"
+command = "/etc/maidcafe/actions/deploy.sh"
+script = true
+cwd = "/srv/myapp"
+user = "deploy"
+env = ["CI_BUILD=42", "NODE_ENV=production"]
 enabled = true

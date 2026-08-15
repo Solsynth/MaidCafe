@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -68,31 +69,104 @@ type containersPayload struct {
 	Runtimes []containersRuntimePayload `json:"runtimes"`
 }
 
-// ContainersCollector probes podman and docker (podman first), caching the
-// probe result and re-probing every 60s while a runtime is unavailable. The
-// stream uses collect(), which announces an empty runtimes list once per
+// runtimeProbeState resolves which container runtimes are installed and where
+// their binaries live, probing once and re-probing every
+// containerReProbeInterval while none is found. Shared by the containers and
+// images collectors so a single probe serves both.
+type runtimeProbeState struct {
+	mu           sync.Mutex
+	runtimes     []string
+	runtimePaths map[string]string
+	probed       bool
+	lastProbe    time.Time
+}
+
+// probePathSnapshot ensures the probe has run and returns the current
+// runtime name -> binary path map.
+func (p *runtimeProbeState) probePathSnapshot(ctx context.Context) map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if !p.probed || (len(p.runtimes) == 0 && now.Sub(p.lastProbe) >= containerReProbeInterval) {
+		paths := probeContainerRuntimes(ctx)
+		names := make([]string, 0, len(paths))
+		for _, candidate := range []string{"podman", "docker"} {
+			if _, ok := paths[candidate]; ok {
+				names = append(names, candidate)
+			}
+		}
+		p.runtimes = names
+		p.runtimePaths = paths
+		p.probed = true
+		p.lastProbe = now
+	}
+	out := make(map[string]string, len(p.runtimePaths))
+	for name, path := range p.runtimePaths {
+		out[name] = path
+	}
+	return out
+}
+
+// runtimeStateKey fingerprints the probed runtime set ("podman,docker") so
+// collectors can re-announce an empty payload when the set changes.
+func runtimeStateKey(paths map[string]string) string {
+	names := make([]string, 0, 2)
+	for _, candidate := range []string{"podman", "docker"} {
+		if _, ok := paths[candidate]; ok {
+			names = append(names, candidate)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+// runRuntimeList runs a runtime CLI listing command, retrying through
+// `sudo -n` (never interactive) when the direct invocation fails or returns
+// nothing and the daemon is not root. Rootful runtimes are invisible to a
+// non-root daemon — e.g. the shipped systemd unit runs as the maidcafe user
+// while operators run containers as root — and the elevated retry sees them
+// whenever the daemon user has passwordless sudo. Without passwordless sudo
+// the retry fails fast and the direct result stands; the systemd unit's
+// NoNewPrivileges also keeps the retry inert there.
+func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, error) {
+	out, err := runCommand(ctx, path, args...)
+	if err == nil && len(bytes.TrimSpace(out)) > 0 {
+		return out, nil
+	}
+	if os.Geteuid() == 0 {
+		return out, err
+	}
+	if _, lookupErr := exec.LookPath("sudo"); lookupErr != nil {
+		return out, err
+	}
+	sudoOut, sudoErr := runCommand(ctx, "sudo", append([]string{"-n", path}, args...)...)
+	if sudoErr != nil {
+		return out, err
+	}
+	return sudoOut, nil
+}
+
+// ContainersCollector lists podman/docker containers (podman first), caching
+// the runtime probe and re-probing every 60s while a runtime is unavailable.
+// The stream uses collect(), which announces an empty runtimes list once per
 // availability flip; the HTTP endpoints use snapshot(), which always returns
 // a payload.
 type ContainersCollector struct {
-	mu           sync.Mutex
-	runtimes     []string          // found runtimes, podman before docker
-	runtimePaths map[string]string // runtime name -> resolved binary path
-	probed       bool
-	lastProbe    time.Time
-	announced    bool   // whether the current runtimes state was already sent
-	lastState    string // fingerprint of the last probed runtimes set
+	mu        sync.Mutex
+	probe     *runtimeProbeState
+	announced bool   // whether the current runtimes state was already sent
+	lastState string // fingerprint of the last probed runtimes set
 }
 
 func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := time.Now()
-	if !c.probed || (len(c.runtimes) == 0 && now.Sub(c.lastProbe) >= containerReProbeInterval) {
-		c.probe(ctx)
-		c.probed = true
-		c.lastProbe = now
+	paths := c.probe.probePathSnapshot(ctx)
+	state := runtimeStateKey(paths)
+	if state != c.lastState {
+		c.announced = false
+		c.lastState = state
 	}
-	if len(c.runtimes) == 0 {
+	if len(paths) == 0 {
 		if !c.announced {
 			c.announced = true
 			return c.marshal()
@@ -100,7 +174,7 @@ func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
 		return nil, nil
 	}
 	c.announced = true
-	return c.collectRuntimes(ctx)
+	return c.collectRuntimes(ctx, paths)
 }
 
 // snapshot always returns a payload — unlike collect, which the stream uses
@@ -118,36 +192,20 @@ func (c *ContainersCollector) snapshot(ctx context.Context) ([]byte, error) {
 	return c.marshal()
 }
 
-func (c *ContainersCollector) probe(ctx context.Context) {
-	paths := probeContainerRuntimes(ctx)
-	names := make([]string, 0, len(paths))
-	for _, candidate := range []string{"podman", "docker"} {
-		if _, ok := paths[candidate]; ok {
-			names = append(names, candidate)
-		}
-	}
-	state := strings.Join(names, ",")
-	if state != c.lastState {
-		c.announced = false
-	}
-	c.runtimes = names
-	c.runtimePaths = paths
-	c.lastState = state
-}
-
-func (c *ContainersCollector) collectRuntimes(ctx context.Context) ([]byte, error) {
+func (c *ContainersCollector) collectRuntimes(ctx context.Context, paths map[string]string) ([]byte, error) {
 	payload := containersPayload{
-		Runtimes: make([]containersRuntimePayload, 0, len(c.runtimes)),
+		Runtimes: make([]containersRuntimePayload, 0, len(paths)),
 	}
-	for _, runtime := range c.runtimes {
-		path := c.runtimePaths[runtime]
+	for _, runtime := range []string{"podman", "docker"} {
+		path := paths[runtime]
 		if path == "" {
-			path = runtime
+			continue
 		}
-		out, err := runCommand(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
+		out, err := runRuntimeList(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
 		if err != nil {
 			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
 				Runtime: runtime, Available: true, Error: strPtr("list containers: " + err.Error()),
+				Containers: []containerEntry{},
 			})
 			continue
 		}
@@ -155,6 +213,7 @@ func (c *ContainersCollector) collectRuntimes(ctx context.Context) ([]byte, erro
 		if err != nil {
 			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
 				Runtime: runtime, Available: true, Error: strPtr("parse container list: " + err.Error()),
+				Containers: []containerEntry{},
 			})
 			continue
 		}
@@ -212,7 +271,7 @@ type containerJSONLine struct {
 }
 
 func parseContainerLines(out []byte) ([]containerEntry, error) {
-	var entries []containerEntry
+	entries := make([]containerEntry, 0)
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -271,6 +330,189 @@ func parseContainerLabels(raw json.RawMessage) map[string]string {
 		}
 	}
 	return labels
+}
+
+// ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+type imageEntry struct {
+	ID      string   `json:"id"`
+	Tags    []string `json:"tags"`
+	Size    int64    `json:"size"`
+	Created int64    `json:"created"`
+	Digest  string   `json:"digest"`
+}
+
+type imagesRuntimePayload struct {
+	Runtime   string       `json:"runtime"`
+	Available bool         `json:"available"`
+	Error     *string      `json:"error"`
+	Images    []imageEntry `json:"images"`
+}
+
+type imagesPayload struct {
+	Runtimes []imagesRuntimePayload `json:"runtimes"`
+}
+
+// ImagesCollector lists podman/docker images with the same probe cache and
+// stream announcement semantics as ContainersCollector.
+type ImagesCollector struct {
+	mu        sync.Mutex
+	probe     *runtimeProbeState
+	announced bool
+	lastState string
+}
+
+func (c *ImagesCollector) collect(ctx context.Context) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	paths := c.probe.probePathSnapshot(ctx)
+	state := runtimeStateKey(paths)
+	if state != c.lastState {
+		c.announced = false
+		c.lastState = state
+	}
+	if len(paths) == 0 {
+		if !c.announced {
+			c.announced = true
+			return c.marshal()
+		}
+		return nil, nil
+	}
+	c.announced = true
+	return c.collectRuntimes(ctx, paths)
+}
+
+// snapshot always returns a payload — unlike collect, which the stream uses
+// and which skips re-announcing an already-announced unavailable state.
+func (c *ImagesCollector) snapshot(ctx context.Context) ([]byte, error) {
+	data, err := c.collect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		return data, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.marshal()
+}
+
+func (c *ImagesCollector) collectRuntimes(ctx context.Context, paths map[string]string) ([]byte, error) {
+	payload := imagesPayload{
+		Runtimes: make([]imagesRuntimePayload, 0, len(paths)),
+	}
+	for _, runtime := range []string{"podman", "docker"} {
+		path := paths[runtime]
+		if path == "" {
+			continue
+		}
+		out, err := runRuntimeList(ctx, path, "images", "--no-trunc", "--format", "{{json .}}")
+		if err != nil {
+			payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
+				Runtime: runtime, Available: true, Error: strPtr("list images: " + err.Error()),
+				Images: []imageEntry{},
+			})
+			continue
+		}
+		entries, err := parseImageLines(out)
+		if err != nil {
+			payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
+				Runtime: runtime, Available: true, Error: strPtr("parse image list: " + err.Error()),
+				Images: []imageEntry{},
+			})
+			continue
+		}
+		payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
+			Runtime: runtime, Available: true, Images: entries,
+		})
+	}
+	return json.Marshal(payload)
+}
+
+func (c *ImagesCollector) marshal() ([]byte, error) {
+	return json.Marshal(imagesPayload{Runtimes: []imagesRuntimePayload{}})
+}
+
+// imageJSONLine mirrors one `images --format '{{json .}}'` line. Podman emits
+// "Id"/"RepoTags"/"Names" and an integer Size; Docker emits "ID"/"Repository"/
+// "Tag" and a string Size.
+type imageJSONLine struct {
+	ID         string          `json:"ID"`
+	Id         string          `json:"Id"`
+	Repository string          `json:"Repository"`
+	Tag        string          `json:"Tag"`
+	RepoTags   []string        `json:"RepoTags"`
+	Names      []string        `json:"Names"`
+	Size       json.RawMessage `json:"Size"`
+	Created    int64           `json:"Created"`
+	Digest     string          `json:"Digest"`
+}
+
+func parseImageLines(out []byte) ([]imageEntry, error) {
+	entries := make([]imageEntry, 0)
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var raw imageJSONLine
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			return nil, fmt.Errorf("image line %q: %w", line, err)
+		}
+		id := raw.ID
+		if id == "" {
+			id = raw.Id
+		}
+		tags := raw.RepoTags
+		if len(tags) == 0 {
+			tags = raw.Names
+		}
+		if len(tags) == 0 && !strings.HasPrefix(raw.Repository, "<none>") {
+			tag := raw.Tag
+			if tag == "" || strings.HasPrefix(tag, "<none>") {
+				tag = "latest"
+			}
+			tags = []string{raw.Repository + ":" + tag}
+		}
+		if tags == nil {
+			tags = []string{}
+		}
+		digest := raw.Digest
+		if strings.HasPrefix(digest, "<none>") {
+			digest = ""
+		}
+		entries = append(entries, imageEntry{
+			ID:      id,
+			Tags:    tags,
+			Size:    parseImageSize(raw.Size),
+			Created: raw.Created,
+			Digest:  digest,
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// parseImageSize accepts both integer (podman) and string (docker) Size JSON.
+func parseImageSize(raw json.RawMessage) int64 {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		parsed, _ := strconv.ParseInt(s, 10, 64)
+		return parsed
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
