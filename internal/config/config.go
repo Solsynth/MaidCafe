@@ -49,7 +49,8 @@ type RingConfig struct {
 	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
 }
 type EventbusConfig struct {
-	URL string `mapstructure:"url"`
+	URL           string `mapstructure:"url"`
+	SubjectPrefix string `mapstructure:"subjectPrefix"`
 }
 type DaemonConfig struct {
 	ID                   string          `mapstructure:"id"`
@@ -105,6 +106,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("workspace.useTLS", true)
 	viper.SetDefault("workspace.tlsSkipVerify", false)
 	viper.SetDefault("eventbus.url", "")
+	viper.SetDefault("eventbus.subjectPrefix", "")
 	viper.SetDefault("ring.target", "")
 	viper.SetDefault("ring.useTLS", false)
 	viper.SetDefault("daemon.transport", "http")
@@ -143,7 +145,7 @@ func applyEnvAliases() {
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"WORKSPACE_TARGET": "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
-		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
+		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",

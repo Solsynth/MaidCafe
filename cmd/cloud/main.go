@@ -56,7 +56,7 @@ func main() {
 	defer workspaceConn.Close()
 
 	var publishers cloud.FanoutPublisher
-	bus, err := eventbus.New(cfg.Eventbus.URL, cfg.App.Name)
+	bus, err := eventbus.New(cfg.Eventbus.URL, cfg.App.Name, cfg.Eventbus.SubjectPrefix)
 	if err != nil {
 		log.Warn().Err(err).Msg("eventbus unavailable; continuing without NATS fan-out")
 	} else if bus != nil {

@@ -29,3 +29,6 @@ tlsSkipVerify = false
 [eventbus]
 # Optional NATS URL. Leave empty to disable push fan-out.
 url = ""
+# Optional subject namespace for this deployment, e.g. "staging" publishes to
+# "staging.maidcafe.notification.v1" instead of "maidcafe.notification.v1".
+subjectPrefix = ""
