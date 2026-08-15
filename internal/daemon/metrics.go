@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/shirou/gopsutil/v4/net"
@@ -55,7 +56,6 @@ type MetricsHistoryQuery struct {
 }
 
 type MetricsCollector struct {
-	started    time.Time
 	executor   *WebhookExecutor
 	mu         sync.RWMutex
 	history    []MetricsPayload
@@ -76,7 +76,6 @@ func NewMetricsCollector(cfg config.DaemonConfig, executor *WebhookExecutor) (*M
 		storageDir = strings.TrimSuffix(storageDir, ".jsonl")
 	}
 	collector := &MetricsCollector{
-		started:    time.Now(),
 		executor:   executor,
 		history:    make([]MetricsPayload, 0),
 		storageDir: storageDir,
@@ -284,9 +283,15 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 			netTxBytes += counter.BytesSent
 		}
 	}
+	// System uptime, not daemon process uptime: the value must survive daemon
+	// restarts and match the SSH collector's /proc/uptime semantics.
+	var uptimeSeconds int64
+	if uptime, err := host.Uptime(); err == nil {
+		uptimeSeconds = int64(uptime)
+	}
 	return MetricsPayload{
 		SentAt:             time.Now().UTC(),
-		UptimeSeconds:      int64(time.Since(m.started).Seconds()),
+		UptimeSeconds:      uptimeSeconds,
 		ProcessMemoryBytes: int64(stats.Alloc),
 		CPUPercent:         cpuPercent,
 		CPUCount:           runtime.NumCPU(),

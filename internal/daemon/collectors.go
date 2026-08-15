@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -73,12 +74,13 @@ type containersPayload struct {
 // availability flip; the HTTP endpoints use snapshot(), which always returns
 // a payload.
 type ContainersCollector struct {
-	mu        sync.Mutex
-	runtimes  []string // found runtimes, podman before docker
-	probed    bool
-	lastProbe time.Time
-	announced bool   // whether the current runtimes state was already sent
-	lastState string // fingerprint of the last probed runtimes set
+	mu           sync.Mutex
+	runtimes     []string          // found runtimes, podman before docker
+	runtimePaths map[string]string // runtime name -> resolved binary path
+	probed       bool
+	lastProbe    time.Time
+	announced    bool   // whether the current runtimes state was already sent
+	lastState    string // fingerprint of the last probed runtimes set
 }
 
 func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
@@ -117,12 +119,19 @@ func (c *ContainersCollector) snapshot(ctx context.Context) ([]byte, error) {
 }
 
 func (c *ContainersCollector) probe(ctx context.Context) {
-	runtimes := probeContainerRuntimes(ctx)
-	state := strings.Join(runtimes, ",")
+	paths := probeContainerRuntimes(ctx)
+	names := make([]string, 0, len(paths))
+	for _, candidate := range []string{"podman", "docker"} {
+		if _, ok := paths[candidate]; ok {
+			names = append(names, candidate)
+		}
+	}
+	state := strings.Join(names, ",")
 	if state != c.lastState {
 		c.announced = false
 	}
-	c.runtimes = runtimes
+	c.runtimes = names
+	c.runtimePaths = paths
 	c.lastState = state
 }
 
@@ -131,7 +140,11 @@ func (c *ContainersCollector) collectRuntimes(ctx context.Context) ([]byte, erro
 		Runtimes: make([]containersRuntimePayload, 0, len(c.runtimes)),
 	}
 	for _, runtime := range c.runtimes {
-		out, err := runCommand(ctx, runtime, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
+		path := c.runtimePaths[runtime]
+		if path == "" {
+			path = runtime
+		}
+		out, err := runCommand(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
 		if err != nil {
 			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
 				Runtime: runtime, Available: true, Error: strPtr("list containers: " + err.Error()),
@@ -156,16 +169,33 @@ func (c *ContainersCollector) marshal() ([]byte, error) {
 	return json.Marshal(containersPayload{Runtimes: []containersRuntimePayload{}})
 }
 
-// probeContainerRuntimes resolves the available container runtimes via
-// `command -v`, podman preferred, matching the client-side SSH probes.
-func probeContainerRuntimes(ctx context.Context) []string {
-	var runtimes []string
+// probeContainerRuntimes resolves the available container runtimes, podman
+// preferred. `command -v` can miss binaries outside the systemd service PATH
+// (e.g. /opt/homebrew/bin), so known install locations are checked as well;
+// the resolved absolute path is what the collector execs.
+func probeContainerRuntimes(ctx context.Context) map[string]string {
+	paths := make(map[string]string)
 	for _, candidate := range []string{"podman", "docker"} {
-		if out, err := runShell(ctx, "command -v "+candidate+" 2>/dev/null"); err == nil && strings.TrimSpace(string(out)) != "" {
-			runtimes = append(runtimes, candidate)
+		if resolved := resolveRuntimeBinary(ctx, candidate); resolved != "" {
+			paths[candidate] = resolved
 		}
 	}
-	return runtimes
+	return paths
+}
+
+func resolveRuntimeBinary(ctx context.Context, name string) string {
+	if out, err := runShell(ctx, "command -v "+name+" 2>/dev/null"); err == nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, dir := range []string{"/usr/local/bin", "/usr/bin", "/usr/local/sbin", "/opt/homebrew/bin"} {
+		path := filepath.Join(dir, name)
+		if out, err := runShell(ctx, "test -x "+path+" && echo ok 2>/dev/null"); err == nil && strings.TrimSpace(string(out)) == "ok" {
+			return path
+		}
+	}
+	return ""
 }
 
 // containerJSONLine mirrors the fields of one `ps -a --format '{{json .}}'`
