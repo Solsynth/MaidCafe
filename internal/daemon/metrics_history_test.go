@@ -51,7 +51,11 @@ func TestMetricsHistoryPersistsAndFiltersRange(t *testing.T) {
 		t.Fatalf("daily history files = %#v", entries)
 	}
 	history := reloaded.History(MetricsHistoryQuery{From: &from, To: &to, Limit: 10})
-	if len(history) != 1 || !history[0].SentAt.Equal(first.SentAt) {
+	if len(history) != 1 ||
+		!history[0].SentAt.Equal(first.SentAt) ||
+		history[0].NetRxBytes != first.NetRxBytes ||
+		history[0].DiskTotalKb != first.DiskTotalKb ||
+		history[0].Load1 != first.Load1 {
 		t.Fatalf("persisted history = %#v", history)
 	}
 }

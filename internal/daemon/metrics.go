@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
+	"github.com/shirou/gopsutil/v4/net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,9 +24,19 @@ type MetricsPayload struct {
 	UptimeSeconds      int64     `json:"uptime_seconds"`
 	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
 	CPUPercent         float64   `json:"cpu_percent"`
+	CPUCount           int       `json:"cpu_count"`
+	Load1              float64   `json:"load1"`
+	Load5              float64   `json:"load5"`
+	Load15             float64   `json:"load15"`
 	MemoryUsedPercent  float64   `json:"memory_used_percent"`
 	MemoryUsedBytes    uint64    `json:"memory_used_bytes"`
 	MemoryTotalBytes   uint64    `json:"memory_total_bytes"`
+	SwapTotalKb        int64     `json:"swap_total_kb"`
+	SwapFreeKb         int64     `json:"swap_free_kb"`
+	DiskTotalKb        int64     `json:"disk_total_kb"`
+	DiskAvailableKb    int64     `json:"disk_available_kb"`
+	NetRxBytes         uint64    `json:"net_rx_bytes"`
+	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
 }
@@ -240,6 +253,10 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 	if values, err := cpu.Percent(0, false); err == nil && len(values) > 0 {
 		cpuPercent = values[0]
 	}
+	var load1, load5, load15 float64
+	if values, err := load.Avg(); err == nil {
+		load1, load5, load15 = values.Load1, values.Load5, values.Load15
+	}
 	var memoryUsedPercent float64
 	var memoryUsedBytes, memoryTotalBytes uint64
 	if stats, err := mem.VirtualMemory(); err == nil {
@@ -247,14 +264,44 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 		memoryUsedBytes = stats.Used
 		memoryTotalBytes = stats.Total
 	}
+	var swapTotalKb, swapFreeKb int64
+	if values, err := mem.SwapMemory(); err == nil {
+		swapTotalKb = int64(values.Total / 1024)
+		swapFreeKb = int64(values.Free / 1024)
+	}
+	var diskTotalKb, diskAvailableKb int64
+	if usage, err := disk.Usage("/"); err == nil {
+		diskTotalKb = int64(usage.Total / 1024)
+		diskAvailableKb = int64(usage.Free / 1024)
+	}
+	var netRxBytes, netTxBytes uint64
+	if counters, err := net.IOCounters(true); err == nil {
+		for _, counter := range counters {
+			if counter.Name == "lo" || counter.Name == "lo0" {
+				continue
+			}
+			netRxBytes += counter.BytesRecv
+			netTxBytes += counter.BytesSent
+		}
+	}
 	return MetricsPayload{
 		SentAt:             time.Now().UTC(),
 		UptimeSeconds:      int64(time.Since(m.started).Seconds()),
 		ProcessMemoryBytes: int64(stats.Alloc),
 		CPUPercent:         cpuPercent,
+		CPUCount:           runtime.NumCPU(),
+		Load1:              load1,
+		Load5:              load5,
+		Load15:             load15,
 		MemoryUsedPercent:  memoryUsedPercent,
 		MemoryUsedBytes:    memoryUsedBytes,
 		MemoryTotalBytes:   memoryTotalBytes,
+		SwapTotalKb:        swapTotalKb,
+		SwapFreeKb:         swapFreeKb,
+		DiskTotalKb:        diskTotalKb,
+		DiskAvailableKb:    diskAvailableKb,
+		NetRxBytes:         netRxBytes,
+		NetTxBytes:         netTxBytes,
 		WebhookExecutions:  successes + failures,
 		WebhookFailures:    failures,
 	}
