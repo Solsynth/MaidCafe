@@ -91,6 +91,12 @@ func bearerSecret(r *http.Request) (string, bool) {
 	return secret, secret != ""
 }
 
+func authorizedRequest(r *http.Request, expected string) bool {
+	secret, ok := bearerSecret(r)
+	return ok && strings.TrimSpace(expected) != "" &&
+		subtle.ConstantTimeCompare([]byte(secret), []byte(expected)) == 1
+}
+
 type requestError struct {
 	status  int
 	message string

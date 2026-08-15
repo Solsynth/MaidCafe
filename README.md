@@ -157,6 +157,19 @@ curl -X POST http://127.0.0.1:8747/api/v1/webhooks/backup \
 
 Successful execution returns `200`; non-zero exit returns `502`; timeout returns
 `504`; oversized bodies return `413`; exhausted concurrency returns `429`.
+Metrics and configured actions use the daemon metrics secret:
+
+```text
+GET /health
+GET /api/v1/metrics
+POST /api/v1/actions/:name
+Authorization: Bearer <metrics-secret>
+```
+
+Webhook secrets are separate from the metrics secret. The daemon does not
+provide an HTTP configuration API; MaidKit updates the managed TOML
+configuration over SSH and restarts the service when needed.
+
 
 Example response:
 

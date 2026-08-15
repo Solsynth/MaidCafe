@@ -20,6 +20,7 @@ func TestLoadDefaultsAndDaemonValidation(t *testing.T) {
 	path := writeConfig(t, `
 [daemon]
 id = "host-1"
+metricsSecret = "metrics-secret"
 [[daemon.webhooks]]
 name = "backup"
 secret = "secret"
@@ -34,6 +35,25 @@ command = "/bin/cat"
 	}
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatal(err)
+	}
+}
+func TestHTTPDaemonRequiresMetricsSecret(t *testing.T) {
+	cfg := Config{Daemon: DaemonConfig{
+		ID:                "host-1",
+		Transport:         "http",
+		Listen:            "127.0.0.1:8747",
+		MetricsInterval:   time.Minute,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+	}}
+	if err := cfg.ValidateDaemon(); err == nil {
+		t.Fatal("expected HTTP daemon without metrics secret to be rejected")
+	}
+	cfg.Daemon.MetricsSecret = "metrics-secret"
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatalf("HTTP daemon with metrics secret rejected: %v", err)
 	}
 }
 
@@ -67,7 +87,7 @@ command = "/bin/cat"
 }
 
 func TestDaemonCloudURLValidation(t *testing.T) {
-	base := DaemonConfig{ID: "host-1", Listen: "127.0.0.1:8747", MetricsInterval: time.Minute, RequestTimeout: time.Second, ScriptTimeout: time.Second, MaxBodyBytes: 1, MaxConcurrentRuns: 1}
+	base := DaemonConfig{ID: "host-1", Listen: "127.0.0.1:8747", MetricsSecret: "metrics-secret", MetricsInterval: time.Minute, RequestTimeout: time.Second, ScriptTimeout: time.Second, MaxBodyBytes: 1, MaxConcurrentRuns: 1}
 	for _, tc := range []struct {
 		name string
 		url  string

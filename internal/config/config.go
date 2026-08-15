@@ -50,6 +50,7 @@ type DaemonConfig struct {
 	Version           string          `mapstructure:"version"`
 	Transport         string          `mapstructure:"transport"`
 	Listen            string          `mapstructure:"listen"`
+	MetricsSecret     string          `mapstructure:"metricsSecret"`
 	CloudURL          string          `mapstructure:"cloudUrl"`
 	CloudSecret       string          `mapstructure:"cloudSecret"`
 	MetricsInterval   time.Duration   `mapstructure:"metricsInterval"`
@@ -93,6 +94,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("ring.tlsSkipVerify", false)
 	viper.SetDefault("daemon.transport", "http")
 	viper.SetDefault("daemon.listen", "127.0.0.1:8747")
+	viper.SetDefault("daemon.metricsSecret", "")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -119,7 +121,8 @@ func applyEnvAliases() {
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
-		"DAEMON_CLOUD_URL": "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
+		"DAEMON_METRICS_SECRET": "daemon.metricsSecret",
+		"DAEMON_CLOUD_URL":      "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
 		"DAEMON_SCRIPT_TIMEOUT": "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
 		"DAEMON_MAX_CONCURRENT_RUNS": "daemon.maxConcurrentRuns",
@@ -158,6 +161,9 @@ func (c *Config) ValidateDaemon() error {
 	if transport == "http" {
 		if err := validateListen(c.Daemon.Listen); err != nil {
 			return fmt.Errorf("daemon.listen: %w", err)
+		}
+		if strings.TrimSpace(c.Daemon.MetricsSecret) == "" {
+			return fmt.Errorf("daemon.metricsSecret is required for http transport")
 		}
 	}
 	if c.Daemon.MetricsInterval <= 0 {

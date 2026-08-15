@@ -19,6 +19,7 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		Version:           "v1.2.3",
 		Transport:         "http",
 		Listen:            "127.0.0.1:0",
+		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Hour,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
@@ -26,6 +27,9 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		MaxConcurrentRuns: 1,
 		Actions: []config.WebhookConfig{
 			{Name: "backup", Command: action, Enabled: true},
+		},
+		Webhooks: []config.WebhookConfig{
+			{Name: "hook", Secret: "webhook-secret", Command: action, Enabled: true},
 		},
 	}
 	app, err := NewApp(cfg, nil)
@@ -38,9 +42,55 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	defer app.Shutdown(ctx)
-
 	baseURL := "http://" + app.ListenAddr()
-	health, err := http.Get(baseURL + "/health")
+	unauthorizedMetrics, err := http.Get(baseURL + "/api/v1/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorizedMetrics.Body.Close()
+	if unauthorizedMetrics.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized metrics status = %d", unauthorizedMetrics.StatusCode)
+	}
+	webhookRequest, err := http.NewRequest(
+		http.MethodPost,
+		baseURL+"/api/v1/webhooks/hook",
+		strings.NewReader("payload"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	webhookResponse, err := http.DefaultClient.Do(webhookRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookResponse.Body.Close()
+	if webhookResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("metrics secret accepted for webhook: status = %d", webhookResponse.StatusCode)
+	}
+	webhookRequest, err = http.NewRequest(
+		http.MethodPost,
+		baseURL+"/api/v1/webhooks/hook",
+		strings.NewReader("payload"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookRequest.Header.Set("Authorization", "Bearer webhook-secret")
+	webhookResponse, err = http.DefaultClient.Do(webhookRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer webhookResponse.Body.Close()
+	if webhookResponse.StatusCode != http.StatusOK {
+		t.Fatalf("webhook status = %d", webhookResponse.StatusCode)
+	}
+	healthRequest, err := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	health, err := http.DefaultClient.Do(healthRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +103,12 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		t.Fatalf("health version = %v", healthBody["version"])
 	}
 
-	metrics, err := http.Get(baseURL + "/api/v1/metrics")
+	metricsRequest, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	metrics, err := http.DefaultClient.Do(metricsRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +117,17 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		t.Fatalf("metrics status = %d", metrics.StatusCode)
 	}
 
-	actionResponse, err := http.Post(
+	actionRequest, err := http.NewRequest(
+		http.MethodPost,
 		baseURL+"/api/v1/actions/backup",
-		"application/json",
 		strings.NewReader(`{"job":"incremental"}`),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	actionRequest.Header.Set("Content-Type", "application/json")
+	actionResponse, err := http.DefaultClient.Do(actionRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
