@@ -236,8 +236,11 @@ Authorization: Bearer <metrics-secret>
 - Container and image listing retries through `sudo -n` when the direct query
   fails or returns nothing and the daemon is not root, so root-owned
   containers stay visible to a non-root daemon (e.g. the systemd `maidcafe`
-  user) when passwordless sudo is available. The retry is never interactive
-  and the direct result stands otherwise.
+  user) when passwordless sudo is available. The retry is never interactive.
+  A failed direct query keeps its own error; an empty direct listing whose
+  elevated retry also fails is reported as an error rather than a misleading
+  empty list, so invisible root-owned containers never look like "no
+  containers".
 - Setting a collector interval to `0` disables that collector. Collection is
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.

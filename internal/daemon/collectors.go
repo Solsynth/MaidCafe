@@ -124,9 +124,11 @@ func runtimeStateKey(paths map[string]string) string {
 // nothing and the daemon is not root. Rootful runtimes are invisible to a
 // non-root daemon — e.g. the shipped systemd unit runs as the maidcafe user
 // while operators run containers as root — and the elevated retry sees them
-// whenever the daemon user has passwordless sudo. Without passwordless sudo
-// the retry fails fast and the direct result stands; the systemd unit's
-// NoNewPrivileges also keeps the retry inert there.
+// whenever the daemon user has passwordless sudo. The retry is never
+// interactive; the systemd unit's NoNewPrivileges keeps it inert there. An
+// empty direct listing whose elevated retry also fails is reported as an
+// error rather than a misleading empty list, so invisible root-owned
+// containers never masquerade as "no containers".
 func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, error) {
 	out, err := runCommand(ctx, path, args...)
 	if err == nil && len(bytes.TrimSpace(out)) > 0 {
@@ -140,7 +142,15 @@ func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, e
 	}
 	sudoOut, sudoErr := runCommand(ctx, "sudo", append([]string{"-n", path}, args...)...)
 	if sudoErr != nil {
-		return out, err
+		if err != nil {
+			// The direct failure stays the primary signal.
+			return out, err
+		}
+		// The direct listing succeeded but returned nothing and the
+		// elevated retry failed: root-owned containers are invisible to
+		// this daemon. Surface the retry failure instead of a misleading
+		// empty list.
+		return nil, fmt.Errorf("empty listing, elevated retry failed: %w", sudoErr)
 	}
 	return sudoOut, nil
 }

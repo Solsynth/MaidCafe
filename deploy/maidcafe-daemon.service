@@ -24,6 +24,9 @@ PrivateDevices=true
 # write the runtime scripts:
 #   NoNewPrivileges=false
 #   ReadWritePaths=/etc/maidcafe/actions
+# The container/image collectors' root-visibility retry (`sudo -n`) needs
+# the same NoNewPrivileges relaxation (plus a passwordless sudoers rule for
+# the maidcafe user) when root-owned containers must be listed.
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 LockPersonality=true

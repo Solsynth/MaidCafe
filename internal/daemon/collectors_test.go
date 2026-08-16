@@ -180,7 +180,8 @@ func TestParseImageLinesEmptyReturnsEmptySlice(t *testing.T) {
 // TestRunRuntimeListElevatedFallback pins the root-visibility retry: an
 // empty direct listing is retried through `sudo -n` so containers/images
 // owned by root stay visible to a non-root daemon with passwordless sudo,
-// while a successful direct listing never escalates.
+// while a successful direct listing never escalates and a failed elevated
+// retry is surfaced as an error instead of a misleading empty list.
 func TestRunRuntimeListElevatedFallback(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("requires a non-root test user to exercise the sudo retry")
@@ -225,5 +226,16 @@ func TestRunRuntimeListElevatedFallback(t *testing.T) {
 	}
 	if _, statErr := os.Stat(sudoMarker); statErr != nil {
 		t.Fatal("elevated retry did not run for an empty direct listing")
+	}
+
+	// Empty direct listing with a failing elevated retry surfaces the sudo
+	// error instead of masking the empty direct result as "no containers".
+	mk("sudo", `shift; exit 7`)
+	out, err = runRuntimeList(ctx, runtimePath, "ps")
+	if err == nil {
+		t.Fatal("elevated retry failure was masked as a successful empty listing")
+	}
+	if len(out) != 0 {
+		t.Fatalf("masked output = %q", out)
 	}
 }
