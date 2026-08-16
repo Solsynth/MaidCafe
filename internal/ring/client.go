@@ -15,7 +15,7 @@ import (
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 )
 
-const maidKitAppID = "dev.solsynth.maidkit"
+const maidKitAppID = "dev.solsynth.maid"
 
 // Client publishes account notifications through Metoer/Ring.
 type Client struct {

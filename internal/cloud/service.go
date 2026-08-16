@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ import (
 var ErrUnauthorized = errors.New("unauthorized")
 var ErrNotFound = errors.New("not found")
 var ErrForbidden = errors.New("forbidden")
+var ErrPublishFailed = errors.New("notification publish failed")
 
 // workspaceMemberRole is the minimum DyWorkspace member role level required
 // to manage daemons inside a workspace. Role levels follow the workspace
@@ -158,10 +160,11 @@ type Service struct {
 	db         *database.DB
 	publisher  PushPublisher
 	workspaces WorkspaceClient
+	logger     *slog.Logger
 }
 
 func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceClient) *Service {
-	return &Service{db: db, publisher: publisher, workspaces: workspaces}
+	return &Service{db: db, publisher: publisher, workspaces: workspaces, logger: slog.Default()}
 }
 
 type DaemonView struct {
@@ -512,9 +515,9 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}
 	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(updates).Error
 }
-func (s *Service) publishNotification(ctx context.Context, notification database.Notification) {
+func (s *Service) publishNotification(ctx context.Context, notification database.Notification) error {
 	if s.publisher == nil {
-		return
+		return nil
 	}
 	event := NotificationEvent{
 		EventID:        uuid.NewString(),
@@ -528,7 +531,14 @@ func (s *Service) publishNotification(ctx context.Context, notification database
 		Body:           notification.Body,
 		Metadata:       json.RawMessage(notification.Metadata),
 	}
-	_ = s.publisher.Publish(ctx, event)
+	if err := s.publisher.Publish(ctx, event); err != nil {
+		s.logger.Error("publish notification to Metoer failed",
+			"notification_id", notification.ID,
+			"daemon_id", notification.DaemonID,
+			"error", err)
+		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+	}
+	return nil
 }
 func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonID string, input NotificationInput) (NotificationView, error) {
 	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
@@ -563,7 +573,9 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
 	}
-	s.publishNotification(ctx, row)
+	if err := s.publishNotification(ctx, row); err != nil {
+		return NotificationView{}, err
+	}
 	return notificationView(row), nil
 }
 func bound(value string, max int) (string, error) {
@@ -609,7 +621,9 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err
 	}
-	s.publishNotification(ctx, n)
+	if err := s.publishNotification(ctx, n); err != nil {
+		return NotificationView{}, err
+	}
 	return notificationView(n), nil
 }
 func notificationView(n database.Notification) NotificationView {

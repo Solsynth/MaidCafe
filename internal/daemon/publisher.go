@@ -97,7 +97,7 @@ func (p *CloudPublisher) request(ctx context.Context, method, suffix string, pay
 
 func (p *CloudPublisher) post(ctx context.Context, suffix string, payload any) {
 	if err := p.request(ctx, http.MethodPost, suffix, payload, nil); err != nil {
-		p.logger.Warn("cloud publish failed", "suffix", suffix, "error", err)
+		p.logger.Error("cloud publish failed", "suffix", suffix, "error", err)
 	}
 }
 

@@ -157,6 +157,8 @@ func serviceStatus(c *gin.Context, err error) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 	case errors.Is(err, cloud.ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	case errors.Is(err, cloud.ErrPublishFailed):
+		c.JSON(http.StatusBadGateway, gin.H{"error": "notification publish failed"})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 	}
@@ -232,7 +234,9 @@ func requestPushNotification(s *cloud.Service) gin.HandlerFunc {
 		}
 		out, err := s.CreatePushNotification(c, accountID(c), c.Param("id"), input)
 		if err != nil {
-			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
+			if errors.Is(err, cloud.ErrForbidden) ||
+				errors.Is(err, cloud.ErrNotFound) ||
+				errors.Is(err, cloud.ErrPublishFailed) {
 				serviceStatus(c, err)
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -367,7 +371,7 @@ func createNotification(s *cloud.Service) gin.HandlerFunc {
 		}
 		out, err := s.CreateNotification(c, c.Param("id"), secret, in)
 		if err != nil {
-			if errors.Is(err, cloud.ErrUnauthorized) {
+			if errors.Is(err, cloud.ErrUnauthorized) || errors.Is(err, cloud.ErrPublishFailed) {
 				serviceStatus(c, err)
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
