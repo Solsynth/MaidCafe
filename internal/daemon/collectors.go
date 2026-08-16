@@ -929,9 +929,10 @@ type RuntimesCollector struct {
 	jdk      *jdkProbeState
 	runtimes []string
 	watched  *watchedProcessStore
+	history  *processHistoryStore
 }
 
-func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
+func (r *RuntimesCollector) readProcessTable(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
 	// GNU ps carries the nlwp thread count; fall back to the BSD form (no
 	// nlwp) when the GNU-sort form fails, e.g. on macOS.
 	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args= --sort=-%cpu | head -n "+strconv.Itoa(runtimeProcessTableLimit))
@@ -940,10 +941,17 @@ func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm=,args= -r | head -n "+strconv.Itoa(runtimeProcessTableLimit))
 		hasThreads = false
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	entries := parseRuntimeProcesses(string(out), hasThreads)
+	return parseRuntimeProcesses(string(out), hasThreads), hasThreads, nil
+}
+
+func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
+	entries, _, err := r.readProcessTable(ctx)
+	if err != nil {
+		return nil, err
+	}
 	runtimeNames := r.runtimes
 	if len(runtimeNames) == 0 {
 		runtimeNames = []string{"java", "dotnet", "python"}
@@ -963,6 +971,46 @@ func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 		watched = []watchedProcessGroup{}
 	}
 	return json.Marshal(runtimePayload{Runtimes: groups, Watched: watched})
+}
+
+// recordHistory appends one usage sample per watched process to the history
+// store. It runs on its own ungated ticker so history accumulates even while
+// no SSE subscriber is connected. Groups with no matching process record a
+// zero-count sample so charts show downtime explicitly.
+func (r *RuntimesCollector) recordHistory(ctx context.Context) {
+	if r.history == nil || r.watched == nil {
+		return
+	}
+	entries, _, err := r.readProcessTable(ctx)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, group := range groupWatchedProcesses(entries, r.limit, r.watched.List()) {
+		var cpu float64
+		var rss int64
+		var threads int64
+		var threadCount int
+		for _, entry := range group.Processes {
+			cpu += entry.CPUPercent
+			rss += entry.RSSKb
+			if entry.Threads != nil {
+				threads += *entry.Threads
+				threadCount++
+			}
+		}
+		sample := processHistorySample{
+			Name:         group.Name,
+			TS:           now,
+			CPUPercent:   cpu,
+			RSSKb:        rss,
+			ProcessCount: len(group.Processes),
+		}
+		if threadCount > 0 {
+			sample.Threads = &threads
+		}
+		r.history.Append(sample)
+	}
 }
 
 // collectJavaDetail runs jps -l and per-pid jstat -gcutil for the first

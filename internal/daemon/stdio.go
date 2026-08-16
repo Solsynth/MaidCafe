@@ -159,6 +159,58 @@ func (a *App) runStdio(ctx context.Context) error {
 				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: map[string]any{"processes": processes}}); err != nil {
 					return err
 				}
+			case "process-history":
+				body, err := stdioBody(request.Body)
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				var req struct {
+					Name  string `json:"name"`
+					From  string `json:"from"`
+					To    string `json:"to"`
+					Limit int    `json:"limit"`
+				}
+				if err := json.Unmarshal(body, &req); err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "invalid JSON body"}); err != nil {
+						return err
+					}
+					continue
+				}
+				name := strings.TrimSpace(req.Name)
+				if !config.ValidWatchedProcessName(name) {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "name must match [A-Za-z0-9][A-Za-z0-9._-]*"}); err != nil {
+						return err
+					}
+					continue
+				}
+				var from, to *time.Time
+				if req.From != "" {
+					parsed, parseErr := time.Parse(time.RFC3339, req.From)
+					if parseErr != nil {
+						if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "from must be RFC3339"}); err != nil {
+							return err
+						}
+						continue
+					}
+					from = &parsed
+				}
+				if req.To != "" {
+					parsed, parseErr := time.Parse(time.RFC3339, req.To)
+					if parseErr != nil {
+						if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "to must be RFC3339"}); err != nil {
+							return err
+						}
+						continue
+					}
+					to = &parsed
+				}
+				samples := a.runtimes.history.Query(name, from, to, req.Limit)
+				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: map[string]any{"name": name, "samples": samples}}); err != nil {
+					return err
+				}
 			case "action", "invoke":
 				body, err := stdioBody(request.Body)
 				if err != nil {

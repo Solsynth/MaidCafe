@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +58,11 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	runtimeProbe := &runtimeProbeState{}
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
+	historyDir := ""
+	if strings.TrimSpace(cfg.MetricsHistoryPath) != "" {
+		historyDir = filepath.Join(cfg.MetricsHistoryPath, "process-history")
+	}
+	historyStore := newProcessHistoryStore(historyDir, cfg.MetricsRetentionDays)
 	app := &App{
 		cfg:        cfg,
 		executor:   executor,
@@ -68,7 +74,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		images:     &ImagesCollector{probe: runtimeProbe},
 		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
 		systemd:    &SystemdCollector{},
-		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore},
+		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
 		watched:    watchedStore,
 		logger:     logger,
 	}
@@ -254,6 +260,47 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		}
 		c.JSON(http.StatusOK, gin.H{"processes": processes})
 	})
+	// Per-watched-process usage history recorded by the daemon's ungated
+	// history ticker, pruned by metricsRetentionDays.
+	router.GET("/api/v1/process-history", authorizeMetrics, func(c *gin.Context) {
+		name := strings.TrimSpace(c.Query("name"))
+		if !config.ValidWatchedProcessName(name) {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "name must match [A-Za-z0-9][A-Za-z0-9._-]*"})
+			return
+		}
+		parseTime := func(raw string) (*time.Time, error) {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				return nil, nil
+			}
+			value, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				return nil, fmt.Errorf("must be RFC3339")
+			}
+			return &value, nil
+		}
+		from, err := parseTime(c.Query("from"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "from " + err.Error()})
+			return
+		}
+		to, err := parseTime(c.Query("to"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "to " + err.Error()})
+			return
+		}
+		limit := 500
+		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || parsed <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "limit must be a positive integer"})
+				return
+			}
+			limit = parsed
+		}
+		samples := app.runtimes.history.Query(name, from, to, limit)
+		c.JSON(http.StatusOK, gin.H{"name": name, "samples": samples})
+	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
 		if err != nil {
@@ -414,6 +461,29 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, a.processes.collect)
 	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
 	a.runStreamCollector(ctx, "runtimes", a.cfg.RuntimesInterval, a.runtimes.collect)
+	// Process history accumulates regardless of SSE subscribers so charts
+	// show usage even while no client is connected.
+	a.runHistoryCollector(ctx, a.cfg.RuntimesInterval, a.runtimes.recordHistory)
+}
+
+// runHistoryCollector ticks a recording callback at interval without the
+// subscriber gate stream collectors use. Disabled when interval <= 0.
+func (a *App) runHistoryCollector(ctx context.Context, interval time.Duration, record func(context.Context)) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				record(ctx)
+			}
+		}
+	}()
 }
 
 func (a *App) runStreamCollector(ctx context.Context, event string, interval time.Duration, collect func(context.Context) ([]byte, error)) {
