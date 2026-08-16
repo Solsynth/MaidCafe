@@ -511,3 +511,36 @@ func TestScriptActionSubstitutesTemplate(t *testing.T) {
 		t.Fatalf("error should name the missing variable: %+v", result)
 	}
 }
+
+func TestRelayExecutesSecretlessActions(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "body")
+	script := executable(t, "#!/bin/sh\nprintf '%s' ok > "+output+"\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout: time.Second, MaxBodyBytes: 1024, MaxConcurrentRuns: 1,
+		Actions:  []config.WebhookConfig{{Name: "cleanup", Command: script, Enabled: true}},
+		Webhooks: []config.WebhookConfig{{Name: "hook", Secret: "secret", Command: script, Enabled: true}},
+	}
+	executor := NewWebhookExecutor(cfg)
+
+	// Actions carry no secret by design: the relay runs them without a
+	// signature because the request came through the daemon's own
+	// cloud-authenticated poll.
+	resp, status := executor.ExecuteWebhook("cleanup", []byte("{}"), "", "relay")
+	if status != http.StatusOK || !resp.OK {
+		t.Fatalf("secretless action rejected: status %d ok %v err %q", status, resp.OK, resp.Stderr)
+	}
+	// Webhooks still require their signature on the relay path.
+	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), "", "relay")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("webhook without signature expected unauthorized, got %d", status)
+	}
+	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), signedHeader("secret", []byte("{}")), "relay")
+	if status != http.StatusOK {
+		t.Fatalf("signed webhook relay rejected: %d", status)
+	}
+	// Unknown names stay 404.
+	resp, status = executor.ExecuteWebhook("missing", []byte("{}"), "", "relay")
+	if status != http.StatusNotFound {
+		t.Fatalf("unknown action expected 404, got %d", status)
+	}
+}

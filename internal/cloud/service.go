@@ -238,6 +238,32 @@ type NotificationInput struct {
 	Metadata json.RawMessage `json:"metadata"`
 }
 
+// ActionInput is one action the daemon reports for cloud-side listing. The
+// script body and any secret stay on the host; invocation happens through
+// the webhook relay.
+type ActionInput struct {
+	Name            string `json:"name"`
+	DisplayName     string `json:"display_name,omitempty"`
+	Enabled         bool   `json:"enabled"`
+	NotifyOnSuccess bool   `json:"notify_on_success"`
+	NotifyOnFailure bool   `json:"notify_on_failure"`
+	Timeout         string `json:"timeout,omitempty"`
+	Cwd             string `json:"cwd,omitempty"`
+	User            string `json:"user,omitempty"`
+}
+
+type ActionView struct {
+	Name            string    `json:"name"`
+	DisplayName     string    `json:"display_name"`
+	Enabled         bool      `json:"enabled"`
+	NotifyOnSuccess bool      `json:"notify_on_success"`
+	NotifyOnFailure bool      `json:"notify_on_failure"`
+	Timeout         string    `json:"timeout"`
+	Cwd             string    `json:"cwd"`
+	User            string    `json:"user"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 func generateSecret() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -386,6 +412,66 @@ func (s *Service) authenticateDaemon(ctx context.Context, id, secret string) (da
 		return database.Daemon{}, ErrUnauthorized
 	}
 	return d, nil
+}
+// SyncActions replaces the action list the daemon reported for cloud-side
+// listing. Authenticated with the daemon secret, like metric ingest.
+func (s *Service) SyncActions(ctx context.Context, id, secret string, input []ActionInput) error {
+	d, err := s.authenticateDaemon(ctx, id, secret)
+	if err != nil {
+		return ErrUnauthorized
+	}
+	names := make(map[string]struct{}, len(input))
+	for i := range input {
+		name := strings.TrimSpace(input[i].Name)
+		if name == "" || len(name) > 128 || !utf8.ValidString(name) {
+			return fmt.Errorf("action name exceeds bounds or is empty")
+		}
+		if _, ok := names[name]; ok {
+			return fmt.Errorf("duplicate action name %q", name)
+		}
+		names[name] = struct{}{}
+		input[i].Name = name
+		input[i].DisplayName = strings.TrimSpace(input[i].DisplayName)
+		if len(input[i].DisplayName) > 128 || len(input[i].Timeout) > 32 ||
+			len(input[i].Cwd) > 1024 || len(input[i].User) > 64 {
+			return fmt.Errorf("action field exceeds bounds")
+		}
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("daemon_id = ?", d.ID).Delete(&database.DaemonAction{}).Error; err != nil {
+			return err
+		}
+		if len(input) == 0 {
+			return nil
+		}
+		now := time.Now().UTC()
+		rows := make([]database.DaemonAction, 0, len(input))
+		for _, action := range input {
+			rows = append(rows, database.DaemonAction{
+				DaemonID: d.ID, Name: action.Name, DisplayName: action.DisplayName,
+				Enabled: action.Enabled, NotifyOnSuccess: action.NotifyOnSuccess,
+				NotifyOnFailure: action.NotifyOnFailure, Timeout: action.Timeout,
+				Cwd: action.Cwd, User: action.User, UpdatedAt: now,
+			})
+		}
+		return tx.Create(&rows).Error
+	})
+}
+
+// ListActions returns the actions the daemon reported, for the cloud page.
+func (s *Service) ListActions(ctx context.Context, accountID, daemonID string) ([]ActionView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return nil, err
+	}
+	var rows []database.DaemonAction
+	if err := s.db.WithContext(ctx).Where("daemon_id = ?", daemonID).Order("name asc").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]ActionView, len(rows))
+	for i, row := range rows {
+		out[i] = ActionView{Name: row.Name, DisplayName: row.DisplayName, Enabled: row.Enabled, NotifyOnSuccess: row.NotifyOnSuccess, NotifyOnFailure: row.NotifyOnFailure, Timeout: row.Timeout, Cwd: row.Cwd, User: row.User, UpdatedAt: row.UpdatedAt}
+	}
+	return out, nil
 }
 func (s *Service) IngestMetric(ctx context.Context, id, secret string, input MetricInput) error {
 	d, err := s.authenticateDaemon(ctx, id, secret)
@@ -616,13 +702,17 @@ func viewWebhookRequest(row database.WebhookRequest) WebhookRequestView {
 	}
 }
 
-// EnqueueWebhook queues a signed webhook invocation for [daemonID].
+// EnqueueWebhook queues a webhook or action invocation for [daemonID]. The
+// signature is optional: webhooks carry their own secret that the daemon
+// verifies at execution, while actions have no secret (the daemon runs them
+// because the request arrived through its own cloud-authenticated poll), so
+// the cloud only stores what it is given.
 func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name string, body []byte, signature string) (WebhookRequestView, error) {
 	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
 		return WebhookRequestView{}, err
 	}
-	if strings.TrimSpace(name) == "" || len(body) == 0 || len(body) > webhookBodyLimit || strings.TrimSpace(signature) == "" {
-		return WebhookRequestView{}, errors.New("webhook request requires a name, body and signature")
+	if strings.TrimSpace(name) == "" || len(body) == 0 || len(body) > webhookBodyLimit {
+		return WebhookRequestView{}, errors.New("webhook request requires a name and body")
 	}
 	id, err := uuid.NewRandom()
 	if err != nil {

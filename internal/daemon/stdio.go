@@ -139,6 +139,7 @@ func (a *App) runStdio(ctx context.Context) error {
 			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
+				a.publisher.PublishActions(context.Background(), a.cfg.Actions)
 			}
 			if err := write(stdioEvent{Type: "event", Event: "metrics", Data: metrics}); err != nil {
 				return err

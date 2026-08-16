@@ -43,6 +43,19 @@ type DaemonMetric struct {
 	WebhookFailures    uint64
 }
 
+type DaemonAction struct {
+	DaemonID        string `gorm:"size:191;primaryKey;not null"`
+	Name            string `gorm:"size:128;primaryKey;not null"`
+	DisplayName     string `gorm:"size:128"`
+	Enabled         bool   `gorm:"not null"`
+	NotifyOnSuccess bool   `gorm:"not null"`
+	NotifyOnFailure bool   `gorm:"not null"`
+	Timeout         string `gorm:"size:32"`
+	Cwd             string `gorm:"size:1024"`
+	User            string `gorm:"size:64"`
+	UpdatedAt       time.Time
+}
+
 type Notification struct {
 	ID          string         `gorm:"type:char(36);primaryKey"`
 	AccountID   string         `gorm:"size:191;index;not null"`

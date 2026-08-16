@@ -208,12 +208,18 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 // ExecuteWebhook verifies the HMAC signature over [body] and runs the named
 // webhook. Used by the MaidKit cloud relay, where the request is delivered by
 // polling instead of an HTTP handler. [source] is recorded in the audit log.
+//
+// Hooks without a secret (actions, which carry none by design) skip the
+// signature check: the relay only delivers requests the daemon itself pulled
+// with its cloud secret, so the cloud's workspace-member authorization is the
+// credential. The local HTTP endpoint keeps requiring a signature for every
+// hook.
 func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string, source string) (executionResponse, int) {
 	hook, exists := e.hooks[name]
 	if !exists || !hook.Enabled {
 		return executionResponse{}, http.StatusNotFound
 	}
-	if !signatureValid(hook.Secret, body, signature) {
+	if hook.Secret != "" && !signatureValid(hook.Secret, body, signature) {
 		return executionResponse{}, http.StatusUnauthorized
 	}
 	return e.execute(context.Background(), hook, body, source)

@@ -370,9 +370,44 @@ sequenceDiagram
     C-->>U: request with result
 ```
 
+#### `GET /api/daemons/:id/actions`
+
+List the actions the daemon reported, so the cloud page can show what it can
+invoke. `200` returns an array of actions.
+
+```sh
+curl http://localhost:8080/api/daemons/:id/actions \
+  -H 'Authorization: Bearer <solar-token>'
+```
+
+```json
+[
+  {
+    "name": "backup",
+    "display_name": "Backup data",
+    "enabled": true,
+    "notify_on_success": false,
+    "notify_on_failure": true,
+    "timeout": "2m",
+    "cwd": "/srv",
+    "user": "root",
+    "updated_at": "2026-08-15T10:00:00Z"
+  }
+]
+```
+
+Script bodies and secrets never leave the host; only the invocation metadata
+is reported (on every metrics tick, so the list tracks the daemon's config).
+
+#### `POST /api/daemons/:id/actions`
+
+The daemon replaces its reported action list with the current configuration.
+Daemon-secret authenticated; `204` on success. An empty array clears the
+list. Duplicate names and over-long fields are rejected.
+
 #### `POST /api/daemons/:id/webhook-requests`
 
-Enqueue a signed webhook invocation.
+Enqueue a webhook or action invocation.
 
 ```sh
 curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests \
@@ -386,6 +421,11 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests \
 ```json
 {"id": "3f9a...", "status": "pending", "created_at": "2026-08-15T10:00:00Z"}
 ```
+
+`signature` is the lowercase-hex HMAC-SHA256 of the raw body keyed by the
+webhook's secret; the daemon verifies it at execution. Actions carry no
+secret, so invoking one omits the signature — the daemon runs it because the
+request arrived through its own cloud-authenticated poll.
 
 | Field | Type | Constraints |
 | --- | --- | --- |

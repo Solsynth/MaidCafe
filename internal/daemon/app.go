@@ -249,6 +249,21 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 	router.POST("/api/v1/webhooks/:name", executor.GinHandler())
+	// Manual smoke test of the notification pipeline: the daemon pushes a
+	// test notification to the cloud (which forwards it to Ring/Metoer), so
+	// the whole daemon -> cloud -> feed path can be verified on demand.
+	router.POST("/api/v1/notifications/test", authorizeMetrics, func(c *gin.Context) {
+		if app.publisher == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "cloud relay is not configured"})
+			return
+		}
+		app.publisher.PublishNotification(context.Background(), notificationPayload{
+			Kind:  "test.notification",
+			Title: "Test notification",
+			Body:  "This is a test notification from the MaidCafe daemon.",
+		})
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 	app.server = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           router,
@@ -312,6 +327,7 @@ func (a *App) Run(ctx context.Context) error {
 			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
+				a.publisher.PublishActions(context.Background(), a.cfg.Actions)
 				now := time.Now()
 				for _, notification := range a.alarms.evaluate(a.cfg.Alarms, metrics, now) {
 					a.publisher.PublishNotification(context.Background(), notification)

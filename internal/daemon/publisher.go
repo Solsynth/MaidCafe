@@ -106,6 +106,46 @@ func (p *CloudPublisher) PublishMetrics(ctx context.Context, payload MetricsPayl
 		p.post(ctx, "/metrics", payload)
 	}
 }
+
+// actionReportPayload is the wire shape of one configured action the daemon
+// reports to the cloud for listing; invocation happens through the webhook
+// relay, so no script body or secret ever leaves the host.
+type actionReportPayload struct {
+	Name            string `json:"name"`
+	DisplayName     string `json:"display_name,omitempty"`
+	Enabled         bool   `json:"enabled"`
+	NotifyOnSuccess bool   `json:"notify_on_success"`
+	NotifyOnFailure bool   `json:"notify_on_failure"`
+	Timeout         string `json:"timeout,omitempty"`
+	Cwd             string `json:"cwd,omitempty"`
+	User            string `json:"user,omitempty"`
+}
+
+// PublishActions replaces the cloud's action list for this daemon with the
+// current configuration, so the cloud always lists what the daemon can run.
+func (p *CloudPublisher) PublishActions(ctx context.Context, actions []config.WebhookConfig) {
+	if p == nil {
+		return
+	}
+	payload := make([]actionReportPayload, 0, len(actions))
+	for _, hook := range actions {
+		timeout := ""
+		if hook.Timeout > 0 {
+			timeout = hook.Timeout.String()
+		}
+		payload = append(payload, actionReportPayload{
+			Name:            hook.Name,
+			DisplayName:     hook.DisplayName,
+			Enabled:         hook.Enabled,
+			NotifyOnSuccess: hook.NotifyOnSuccess,
+			NotifyOnFailure: hook.NotifyOnFailure,
+			Timeout:         timeout,
+			Cwd:             hook.Cwd,
+			User:            hook.User,
+		})
+	}
+	p.post(ctx, "/actions", payload)
+}
 func (p *CloudPublisher) PublishNotification(ctx context.Context, payload notificationPayload) {
 	if p != nil {
 		p.post(ctx, "/notifications", payload)

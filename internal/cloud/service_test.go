@@ -196,6 +196,57 @@ func TestMetricIngestAndPushRequestPersistence(t *testing.T) {
 	}
 }
 
+func TestActionSyncAndList(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The daemon reports its actions on every metrics tick.
+	if err := svc.SyncActions(ctx, daemon.ID, daemon.Secret, []ActionInput{
+		{Name: "backup", DisplayName: "Backup data", Enabled: true, NotifyOnFailure: true, Timeout: "2m", User: "root"},
+		{Name: "cleanup", Enabled: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := svc.ListActions(ctx, "account-a", daemon.ID)
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("list actions: %v %#v", err, listed)
+	}
+	backup, cleanup := listed[0], listed[1]
+	if backup.Name != "backup" || backup.DisplayName != "Backup data" ||
+		!backup.Enabled || !backup.NotifyOnFailure || backup.Timeout != "2m" ||
+		backup.User != "root" {
+		t.Fatalf("backup action not stored: %+v", backup)
+	}
+	if cleanup.Name != "cleanup" || cleanup.Enabled {
+		t.Fatalf("cleanup action not stored: %+v", cleanup)
+	}
+	// Re-syncing replaces the list; an empty report clears it.
+	if err := svc.SyncActions(ctx, daemon.ID, daemon.Secret, nil); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = svc.ListActions(ctx, "account-a", daemon.ID)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("cleared actions: %v %#v", err, listed)
+	}
+	// Non-members cannot list; bad secrets cannot sync.
+	if _, err := svc.ListActions(ctx, "account-b", daemon.ID); err != ErrForbidden {
+		t.Fatalf("non-member listing expected forbidden, got %v", err)
+	}
+	if err := svc.SyncActions(ctx, daemon.ID, "wrong-secret", []ActionInput{{Name: "x", Enabled: true}}); err != ErrUnauthorized {
+		t.Fatalf("bad daemon secret expected unauthorized, got %v", err)
+	}
+	if err := svc.SyncActions(ctx, daemon.ID, daemon.Secret, []ActionInput{{Name: "", Enabled: true}}); err == nil {
+		t.Fatalf("empty action name accepted")
+	}
+	if err := svc.SyncActions(ctx, daemon.ID, daemon.Secret, []ActionInput{{Name: "dup", Enabled: true}, {Name: "dup", Enabled: true}}); err == nil {
+		t.Fatalf("duplicate action names accepted")
+	}
+}
+
 func TestWebhookRelayLifecycle(t *testing.T) {
 	svc, db, _, _ := testService(t)
 	defer db.Close()
@@ -219,12 +270,21 @@ func TestWebhookRelayLifecycle(t *testing.T) {
 	if _, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "", body, signature); err == nil {
 		t.Fatalf("empty name accepted")
 	}
+	// Actions carry no secret, so invocation goes through the relay without
+	// a signature; the daemon verifies webhooks at execution.
+	actionRequest, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "cleanup", []byte("{}"), "")
+	if err != nil {
+		t.Fatalf("signature-less action enqueue rejected: %v", err)
+	}
+	if actionRequest.Signature != "" {
+		t.Fatalf("signature stored for action: %#v", actionRequest)
+	}
 
 	pending, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].ID != enqueued.ID || pending[0].Signature != signature {
+	if len(pending) != 2 || pending[0].ID != enqueued.ID || pending[0].Signature != signature {
 		t.Fatalf("pending = %#v", pending)
 	}
 	// Leased requests are not returned again.

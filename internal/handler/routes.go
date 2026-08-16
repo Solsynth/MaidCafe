@@ -36,8 +36,10 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/notifications/:id/read", markRead(svc))
 	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
 	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
+	user.GET("/daemons/:id/actions", listActions(svc))
 	daemon := r.Group("/api/daemons/:id")
 	daemon.POST("/metrics", ingestMetric(svc))
+	daemon.POST("/actions", syncActions(svc))
 	daemon.POST("/notifications", createNotification(svc))
 	daemon.GET("/webhook-requests/pending", listPendingWebhooks(svc))
 	daemon.POST("/webhook-requests/:request_id/result", completeWebhook(svc))
@@ -234,6 +236,38 @@ func ingestMetric(s *cloud.Service) gin.HandlerFunc {
 			return
 		}
 		if err := s.IngestMetric(c, c.Param("id"), secret, in); err != nil {
+			if errors.Is(err, cloud.ErrUnauthorized) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+func listActions(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.ListActions(c, accountID(c), c.Param("id"))
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+func syncActions(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		secret, ok := daemonSecret(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		var in []cloud.ActionInput
+		if !parseJSON(c, &in) {
+			return
+		}
+		if err := s.SyncActions(c, c.Param("id"), secret, in); err != nil {
 			if errors.Is(err, cloud.ErrUnauthorized) {
 				serviceStatus(c, err)
 			} else {

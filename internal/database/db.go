@@ -49,7 +49,7 @@ func (db *DB) AutoMigrate() error {
 	if db == nil || db.DB == nil {
 		return fmt.Errorf("database is nil")
 	}
-	return db.DB.AutoMigrate(&Daemon{}, &DaemonMetric{}, &Notification{}, &WebhookRequest{})
+	return db.DB.AutoMigrate(&Daemon{}, &DaemonMetric{}, &DaemonAction{}, &Notification{}, &WebhookRequest{})
 }
 func (db *DB) Close() error {
 	if db == nil || db.sqlDB == nil {
