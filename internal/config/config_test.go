@@ -46,6 +46,11 @@ command = "/bin/cat"
 		cfg.Daemon.ProcessesInterval != 10*time.Second ||
 		cfg.Daemon.SystemdInterval != 30*time.Second ||
 		cfg.Daemon.RuntimesInterval != 10*time.Second ||
+		len(cfg.Daemon.Runtimes) != 8 ||
+		cfg.Daemon.Runtimes[0] != "java" ||
+		cfg.Daemon.Runtimes[7] != "php" ||
+		len(cfg.Daemon.WatchedProcesses) != 0 ||
+		cfg.Daemon.WatchedProcessesFile != "/var/lib/maidcafe/watched-processes.json" ||
 		cfg.Daemon.ProcessesLimit != 50 {
 		t.Fatalf("unexpected daemon defaults: %#v", cfg.Daemon)
 	}
@@ -60,6 +65,7 @@ func TestHTTPDaemonRequiresMetricsSecret(t *testing.T) {
 		Listen:            "127.0.0.1:8747",
 		MetricsInterval:   time.Minute,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
@@ -82,6 +88,7 @@ func TestDaemonRejectsRetentionOverThirtyDays(t *testing.T) {
 		MetricsRetentionDays: 31,
 		MetricsInterval:      time.Minute,
 		StreamInterval:       time.Second,
+		Runtimes:             []string{"java", "dotnet", "python"},
 		ProcessesLimit:       50,
 		RequestTimeout:       time.Second,
 		ScriptTimeout:        time.Second,
@@ -123,7 +130,7 @@ command = "/bin/cat"
 }
 
 func TestDaemonCloudURLValidation(t *testing.T) {
-	base := DaemonConfig{ID: "host-1", Listen: "127.0.0.1:8747", MetricsSecret: "metrics-secret", MetricsInterval: time.Minute, StreamInterval: time.Second, ProcessesLimit: 50, RequestTimeout: time.Second, ScriptTimeout: time.Second, MaxBodyBytes: 1, MaxConcurrentRuns: 1}
+	base := DaemonConfig{ID: "host-1", Listen: "127.0.0.1:8747", MetricsSecret: "metrics-secret", MetricsInterval: time.Minute, StreamInterval: time.Second, Runtimes: []string{"java", "dotnet", "python"}, ProcessesLimit: 50, RequestTimeout: time.Second, ScriptTimeout: time.Second, MaxBodyBytes: 1, MaxConcurrentRuns: 1}
 	for _, tc := range []struct {
 		name string
 		url  string
@@ -155,6 +162,7 @@ func TestDaemonStreamValidation(t *testing.T) {
 		ImagesInterval:     time.Minute,
 		ProcessesInterval:  10 * time.Second,
 		SystemdInterval:    30 * time.Second,
+		Runtimes:           []string{"java", "dotnet", "python"},
 		ProcessesLimit:     50,
 		RequestTimeout:     time.Second,
 		ScriptTimeout:      time.Second,
@@ -174,6 +182,11 @@ func TestDaemonStreamValidation(t *testing.T) {
 		{name: "negative processes interval", mutate: func(d *DaemonConfig) { d.ProcessesInterval = -time.Second }},
 		{name: "negative systemd interval", mutate: func(d *DaemonConfig) { d.SystemdInterval = -time.Second }},
 		{name: "negative runtimes interval", mutate: func(d *DaemonConfig) { d.RuntimesInterval = -time.Second }},
+		{name: "empty runtimes list", mutate: func(d *DaemonConfig) { d.Runtimes = []string{} }},
+		{name: "bad runtime name", mutate: func(d *DaemonConfig) { d.Runtimes = []string{"Java"} }},
+		{name: "duplicate runtime name", mutate: func(d *DaemonConfig) { d.Runtimes = []string{"java", "java"} }},
+		{name: "bad watched name", mutate: func(d *DaemonConfig) { d.WatchedProcesses = []string{"bad name"} }},
+		{name: "duplicate watched name", mutate: func(d *DaemonConfig) { d.WatchedProcesses = []string{"nginx", "nginx"} }},
 		{name: "zero processes limit", mutate: func(d *DaemonConfig) { d.ProcessesLimit = 0 }},
 		{name: "oversized processes limit", mutate: func(d *DaemonConfig) { d.ProcessesLimit = 501 }},
 	} {
@@ -193,6 +206,7 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 		Transport:         "stdio",
 		MetricsInterval:   time.Minute,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
@@ -421,6 +435,7 @@ func TestDaemonRejectsActionWebhookNameCollision(t *testing.T) {
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Minute,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
@@ -485,6 +500,7 @@ func TestDaemonRejectsPrivilegedListenPort(t *testing.T) {
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Minute,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
@@ -631,6 +647,7 @@ func TestDaemonRejectsInvalidAlarms(t *testing.T) {
 				Alarms:            []AlarmConfig{tc.alarm},
 				MetricsInterval:   time.Minute,
 				StreamInterval:    time.Second,
+				Runtimes:          []string{"java", "dotnet", "python"},
 				ProcessesLimit:    50,
 				RequestTimeout:    10 * time.Second,
 				ScriptTimeout:     30 * time.Second,
@@ -649,6 +666,7 @@ func TestDaemonRejectsInvalidAlarms(t *testing.T) {
 		Alarms:            []AlarmConfig{{Kind: "cpu_percent", Threshold: 80}, {Kind: "cpu_percent", Threshold: 90}},
 		MetricsInterval:   time.Minute,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    10 * time.Second,
 		ScriptTimeout:     30 * time.Second,

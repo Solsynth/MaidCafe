@@ -23,6 +23,14 @@ processesLimit = 50
 systemdInterval = "30s"
 # 0 disables the runtimes collector
 runtimesInterval = "10s"
+# Runtime groups the runtimes collector reports, in wire order. Old clients
+# skip unknown entries.
+runtimes = ["java", "dotnet", "python", "node", "deno", "go", "ruby", "php"]
+# Extra process names (ps comm) to track alongside the runtimes. Can also be
+# managed dynamically via the watched-processes API; the persisted file is
+# authoritative once it exists.
+watchedProcesses = []
+watchedProcessesFile = "/var/lib/maidcafe/watched-processes.json"
 requestTimeout = "10s"
 scriptTimeout = "30s"
 maxBodyBytes = 65536

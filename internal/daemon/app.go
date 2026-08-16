@@ -31,6 +31,7 @@ type App struct {
 	processes  *ProcessesCollector
 	systemd    *SystemdCollector
 	runtimes   *RuntimesCollector
+	watched    *watchedProcessStore
 	server     *http.Server
 	listenerMu sync.RWMutex
 	listener   net.Listener
@@ -55,6 +56,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
 	runtimeProbe := &runtimeProbeState{}
+	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
 	app := &App{
 		cfg:        cfg,
 		executor:   executor,
@@ -66,7 +68,8 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		images:     &ImagesCollector{probe: runtimeProbe},
 		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
 		systemd:    &SystemdCollector{},
-		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit},
+		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore},
+		watched:    watchedStore,
 		logger:     logger,
 	}
 	app.relay = NewWebhookRelay(publisher, executor, logger)
@@ -207,6 +210,49 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			return
 		}
 		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	// Watched-process management: the list is stored daemon-side (seeded from
+	// config, persisted across restarts) and reported in every runtimes
+	// payload under `watched`.
+	router.GET("/api/v1/watched-processes", authorizeMetrics, func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"processes": app.watched.List()})
+	})
+	router.POST("/api/v1/watched-processes", authorizeMetrics, func(c *gin.Context) {
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		if int64(len(body)) > cfg.MaxBodyBytes {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid JSON body"})
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if !config.ValidWatchedProcessName(name) {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "name must match [A-Za-z0-9][A-Za-z0-9._-]*"})
+			return
+		}
+		processes, addErr := app.watched.Add(name)
+		if addErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": addErr.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"processes": processes})
+	})
+	router.DELETE("/api/v1/watched-processes/:name", authorizeMetrics, func(c *gin.Context) {
+		processes, removeErr := app.watched.Remove(c.Param("name"))
+		if removeErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": removeErr.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"processes": processes})
 	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))

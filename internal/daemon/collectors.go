@@ -879,8 +879,18 @@ type runtimeGroup struct {
 	Java      *javaRuntimePayload   `json:"java,omitempty"`
 }
 
+// watchedProcessGroup is one user-defined process watcher: processes whose
+// comm token starts with the watched name.
+type watchedProcessGroup struct {
+	Name      string                `json:"name"`
+	Available bool                  `json:"available"`
+	Error     *string               `json:"error"`
+	Processes []runtimeProcessEntry `json:"processes"`
+}
+
 type runtimePayload struct {
-	Runtimes []runtimeGroup `json:"runtimes"`
+	Runtimes []runtimeGroup        `json:"runtimes"`
+	Watched  []watchedProcessGroup `json:"watched"`
 }
 
 // jdkProbeState resolves the jps/jstat binaries once and re-probes every
@@ -909,13 +919,16 @@ func (j *jdkProbeState) probePathSnapshot(ctx context.Context) (jpsPath, jstatPa
 	return j.jpsPath, j.jstatPath
 }
 
-// RuntimesCollector groups java/dotnet/python processes from ps, capping each
-// runtime at `limit` entries, and attaches JVM/GC detail (jps/jstat) to the
-// java group when a JDK is present. Always reports all three groups in fixed
-// order; a group with no matching process carries available:false.
+// RuntimesCollector groups the configured runtime names (default java/dotnet/
+// python) from ps, capping each at `limit` entries, attaches JVM/GC detail
+// (jps/jstat) to the java group when a JDK is present, and reports the
+// daemon-side watched processes alongside. Groups follow the configured
+// runtime order; a group with no matching process carries available:false.
 type RuntimesCollector struct {
-	limit int
-	jdk   *jdkProbeState
+	limit    int
+	jdk      *jdkProbeState
+	runtimes []string
+	watched  *watchedProcessStore
 }
 
 func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
@@ -931,13 +944,25 @@ func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 		}
 	}
 	entries := parseRuntimeProcesses(string(out), hasThreads)
-	groups := groupRuntimeProcesses(entries, r.limit)
-	// groups[0] is always java (fixed order); the java key is present only
-	// when at least one java process exists.
-	if len(groups[0].Processes) > 0 {
-		groups[0].Java = r.collectJavaDetail(ctx)
+	runtimeNames := r.runtimes
+	if len(runtimeNames) == 0 {
+		runtimeNames = []string{"java", "dotnet", "python"}
 	}
-	return json.Marshal(runtimePayload{Runtimes: groups})
+	groups := groupRuntimeProcesses(entries, r.limit, runtimeNames)
+	// The java key is present only when a java process exists.
+	for i := range groups {
+		if groups[i].Runtime == "java" && len(groups[i].Processes) > 0 {
+			groups[i].Java = r.collectJavaDetail(ctx)
+			break
+		}
+	}
+	var watched []watchedProcessGroup
+	if r.watched != nil {
+		watched = groupWatchedProcesses(entries, r.limit, r.watched.List())
+	} else {
+		watched = []watchedProcessGroup{}
+	}
+	return json.Marshal(runtimePayload{Runtimes: groups, Watched: watched})
 }
 
 // collectJavaDetail runs jps -l and per-pid jstat -gcutil for the first
@@ -988,21 +1013,17 @@ func (r *RuntimesCollector) collectJavaDetail(ctx context.Context) *javaRuntimeP
 	return &javaRuntimePayload{JDK: jdkProbe{Available: true}, JVMs: entries}
 }
 
-// groupRuntimeProcesses partitions runtime processes into the fixed java,
-// dotnet, python groups, capping each at limit in the input (CPU) order. A
+// groupRuntimeProcesses partitions runtime processes into one group per
+// configured runtime name, capping each at limit in the input (CPU) order. A
 // process matches a group when its comm token starts with the runtime name;
 // a group with no match reports available:false.
-func groupRuntimeProcesses(entries []runtimeProcessEntry, limit int) []runtimeGroup {
-	names := []string{"java", "dotnet", "python"}
+func groupRuntimeProcesses(entries []runtimeProcessEntry, limit int, names []string) []runtimeGroup {
 	groups := make([]runtimeGroup, len(names))
 	for i, name := range names {
 		groups[i] = runtimeGroup{Runtime: name, Available: false, Processes: []runtimeProcessEntry{}}
 	}
 	for _, entry := range entries {
-		comm := entry.Command
-		if idx := strings.IndexByte(comm, ' '); idx >= 0 {
-			comm = comm[:idx]
-		}
+		comm := processComm(entry)
 		for i, name := range names {
 			if !strings.HasPrefix(comm, name) {
 				continue
@@ -1022,6 +1043,43 @@ func groupRuntimeProcesses(entries []runtimeProcessEntry, limit int) []runtimeGr
 		}
 	}
 	return groups
+}
+
+// groupWatchedProcesses partitions processes into one group per watched name
+// (comm token prefix match), capping each at limit in CPU order. A group with
+// no match reports available:false. Names are sorted for deterministic order.
+func groupWatchedProcesses(entries []runtimeProcessEntry, limit int, names []string) []watchedProcessGroup {
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	groups := make([]watchedProcessGroup, 0, len(sorted))
+	for _, name := range sorted {
+		group := watchedProcessGroup{Name: name, Available: false, Processes: []runtimeProcessEntry{}}
+		for _, entry := range entries {
+			if len(group.Processes) >= limit {
+				break
+			}
+			if strings.HasPrefix(processComm(entry), name) {
+				group.Available = true
+				group.Processes = append(group.Processes, entry)
+			}
+		}
+		if !group.Available {
+			errMsg := "no " + name + " processes found"
+			group.Error = &errMsg
+		}
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+// processComm returns the comm token of a parsed process row: the first
+// whitespace-delimited token of the joined command.
+func processComm(entry runtimeProcessEntry) string {
+	comm := entry.Command
+	if idx := strings.IndexByte(comm, ' '); idx >= 0 {
+		comm = comm[:idx]
+	}
+	return comm
 }
 
 // parseRuntimeProcesses parses `ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args=`

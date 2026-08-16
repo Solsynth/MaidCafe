@@ -87,7 +87,15 @@ type DaemonConfig struct {
 	ProcessesInterval  time.Duration   `mapstructure:"processesInterval"`
 	SystemdInterval    time.Duration   `mapstructure:"systemdInterval"`
 	RuntimesInterval   time.Duration   `mapstructure:"runtimesInterval"`
-	ProcessesLimit     int             `mapstructure:"processesLimit"`
+	// Runtimes is the ordered list of runtime groups the runtimes collector
+	// reports, in wire order. Unknown entries are skipped by old clients.
+	Runtimes []string `mapstructure:"runtimes"`
+	// WatchedProcesses seeds the daemon-side watched-process list; dynamic
+	// additions and removals via the API are persisted to
+	// WatchedProcessesFile (authoritative once it exists).
+	WatchedProcesses     []string `mapstructure:"watchedProcesses"`
+	WatchedProcessesFile string   `mapstructure:"watchedProcessesFile"`
+	ProcessesLimit       int      `mapstructure:"processesLimit"`
 	RequestTimeout     time.Duration   `mapstructure:"requestTimeout"`
 	ScriptTimeout      time.Duration   `mapstructure:"scriptTimeout"`
 	MaxBodyBytes       int64           `mapstructure:"maxBodyBytes"`
@@ -148,6 +156,19 @@ type WebhookConfig struct {
 }
 
 var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+
+// runtimeNamePattern constrains daemon.runtimes entries: lowercase start so
+// they align with the client's runtime enum wire names.
+var runtimeNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+
+// watchedProcessNamePattern constrains watched-process names (ps comm values).
+var watchedProcessNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// ValidWatchedProcessName reports whether name is a safe watched-process name
+// (ps comm value). Shared by config validation and the daemon API.
+func ValidWatchedProcessName(name string) bool {
+	return watchedProcessNamePattern.MatchString(name)
+}
 
 // Label returns the human-readable name for display in notifications and
 // clients, falling back to the API slug when no display name is configured.
@@ -219,6 +240,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
+	viper.SetDefault("daemon.runtimes", []string{"java", "dotnet", "python", "node", "deno", "go", "ruby", "php"})
+	viper.SetDefault("daemon.watchedProcesses", []string{})
+	viper.SetDefault("daemon.watchedProcessesFile", "/var/lib/maidcafe/watched-processes.json")
 	viper.SetDefault("daemon.processesLimit", 50)
 	viper.SetDefault("daemon.requestTimeout", 10*time.Second)
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
@@ -474,6 +498,29 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.RuntimesInterval < 0 {
 		return fmt.Errorf("daemon.runtimesInterval must not be negative")
+	}
+	if len(c.Daemon.Runtimes) == 0 {
+		return fmt.Errorf("daemon.runtimes must not be empty")
+	}
+	runtimeNames := make(map[string]struct{}, len(c.Daemon.Runtimes))
+	for i, name := range c.Daemon.Runtimes {
+		if !runtimeNamePattern.MatchString(name) {
+			return fmt.Errorf("daemon.runtimes[%d] must match [a-z][a-z0-9_-]*", i)
+		}
+		if _, ok := runtimeNames[name]; ok {
+			return fmt.Errorf("daemon.runtimes[%d] %q is duplicated", i, name)
+		}
+		runtimeNames[name] = struct{}{}
+	}
+	watchedNames := make(map[string]struct{}, len(c.Daemon.WatchedProcesses))
+	for i, name := range c.Daemon.WatchedProcesses {
+		if !watchedProcessNamePattern.MatchString(name) {
+			return fmt.Errorf("daemon.watchedProcesses[%d] must match [A-Za-z0-9][A-Za-z0-9._-]*", i)
+		}
+		if _, ok := watchedNames[name]; ok {
+			return fmt.Errorf("daemon.watchedProcesses[%d] %q is duplicated", i, name)
+		}
+		watchedNames[name] = struct{}{}
 	}
 	if c.Daemon.ProcessesLimit < 1 || c.Daemon.ProcessesLimit > 500 {
 		return fmt.Errorf("daemon.processesLimit must be between 1 and 500")

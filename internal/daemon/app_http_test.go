@@ -34,6 +34,7 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Hour,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    5 * time.Second,
 		ScriptTimeout:     time.Second,
@@ -346,6 +347,7 @@ func TestSSEStreamHelloAndMetricFrames(t *testing.T) {
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Hour,
 		StreamInterval:    50 * time.Millisecond,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    5 * time.Second,
 		ScriptTimeout:     time.Second,
@@ -468,6 +470,7 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 		MetricsSecret:     "metrics-secret",
 		MetricsInterval:   time.Hour,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    5 * time.Second,
 		ScriptTimeout:     time.Second,
@@ -496,7 +499,7 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 		}
 	}
 
-	for _, endpoint := range []string{"/api/v1/containers", "/api/v1/images", "/api/v1/processes", "/api/v1/systemd"} {
+	for _, endpoint := range []string{"/api/v1/containers", "/api/v1/images", "/api/v1/processes", "/api/v1/systemd", "/api/v1/runtimes"} {
 		unauthorized, err := http.Get(baseURL + endpoint)
 		if err != nil {
 			t.Fatalf("%s: %v", endpoint, err)
@@ -545,7 +548,122 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 			if _, ok := payload["available"]; !ok {
 				t.Fatalf("systemd payload missing available: %#v", payload)
 			}
+		case "/api/v1/runtimes":
+			if _, ok := payload["runtimes"]; !ok {
+				t.Fatalf("runtimes payload missing runtimes: %#v", payload)
+			}
+			if _, ok := payload["watched"]; !ok {
+				t.Fatalf("runtimes payload missing watched: %#v", payload)
+			}
 		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("app.Run returned: %v", err)
+	}
+}
+
+func TestWatchedProcessesAPI(t *testing.T) {
+	cfg := config.DaemonConfig{
+		ID:                   "watched-host",
+		Version:              "v9.9.9",
+		Transport:            "http",
+		Listen:               "127.0.0.1:0",
+		MetricsSecret:        "metrics-secret",
+		MetricsInterval:      time.Hour,
+		StreamInterval:       time.Second,
+		Runtimes:             []string{"java", "dotnet", "python"},
+		WatchedProcesses:     []string{"nginx"},
+		WatchedProcessesFile: filepath.Join(t.TempDir(), "watched.json"),
+		ProcessesLimit:       50,
+		RequestTimeout:       5 * time.Second,
+		ScriptTimeout:        time.Second,
+		MaxBodyBytes:         1024,
+		MaxConcurrentRuns:    1,
+	}
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- app.Run(ctx) }()
+	baseURL := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for baseURL == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon did not start listening")
+		}
+		if addr := app.ListenAddr(); addr != "" {
+			baseURL = "http://" + addr
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	request := func(method, path string, body any) (int, map[string]any) {
+		var reader io.Reader
+		if body != nil {
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader = strings.NewReader(string(raw))
+		}
+		req, err := http.NewRequest(method, baseURL+path, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer metrics-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, payload
+	}
+	processes := func(payload map[string]any) []any {
+		list, _ := payload["processes"].([]any)
+		return list
+	}
+
+	// Config-seeded list.
+	status, payload := request(http.MethodGet, "/api/v1/watched-processes", nil)
+	if status != http.StatusOK || len(processes(payload)) != 1 || processes(payload)[0] != "nginx" {
+		t.Fatalf("initial list = %d %#v", status, payload)
+	}
+	// Add + duplicate idempotence.
+	status, payload = request(http.MethodPost, "/api/v1/watched-processes", map[string]any{"name": "redis"})
+	if status != http.StatusOK || len(processes(payload)) != 2 {
+		t.Fatalf("add redis = %d %#v", status, payload)
+	}
+	status, payload = request(http.MethodPost, "/api/v1/watched-processes", map[string]any{"name": "redis"})
+	if status != http.StatusOK || len(processes(payload)) != 2 {
+		t.Fatalf("duplicate add = %d %#v", status, payload)
+	}
+	// Invalid name rejected.
+	status, _ = request(http.MethodPost, "/api/v1/watched-processes", map[string]any{"name": "bad name"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid name status = %d", status)
+	}
+	// Remove + unknown remove no-op.
+	status, payload = request(http.MethodDelete, "/api/v1/watched-processes/nginx", nil)
+	if status != http.StatusOK || len(processes(payload)) != 1 || processes(payload)[0] != "redis" {
+		t.Fatalf("remove nginx = %d %#v", status, payload)
+	}
+	status, payload = request(http.MethodDelete, "/api/v1/watched-processes/unknown", nil)
+	if status != http.StatusOK || len(processes(payload)) != 1 {
+		t.Fatalf("unknown remove = %d %#v", status, payload)
+	}
+	// The persisted file now holds only redis; a fresh app reads it.
+	persisted := newWatchedProcessStore(cfg.WatchedProcessesFile, nil)
+	if got := persisted.List(); len(got) != 1 || got[0] != "redis" {
+		t.Fatalf("persisted list = %#v", got)
 	}
 
 	cancel()

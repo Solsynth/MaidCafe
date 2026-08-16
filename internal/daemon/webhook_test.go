@@ -93,6 +93,7 @@ func TestHealthDoesNotRevealConfiguration(t *testing.T) {
 		RequestTimeout:    time.Second,
 		MetricsInterval:   time.Hour,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		MaxBodyBytes:      100,
 		MaxConcurrentRuns: 1,

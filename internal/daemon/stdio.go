@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
 
 type stdioRequest struct {
@@ -112,6 +114,49 @@ func (a *App) runStdio(ctx context.Context) error {
 					continue
 				}
 				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: json.RawMessage(data)}); err != nil {
+					return err
+				}
+			case "watched-processes":
+				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: map[string]any{"processes": a.watched.List()}}); err != nil {
+					return err
+				}
+			case "watched-process-add", "watched-process-remove":
+				body, err := stdioBody(request.Body)
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				var req struct {
+					Name string `json:"name"`
+				}
+				if err := json.Unmarshal(body, &req); err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "invalid JSON body"}); err != nil {
+						return err
+					}
+					continue
+				}
+				name := strings.TrimSpace(req.Name)
+				if !config.ValidWatchedProcessName(name) {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: "name must match [A-Za-z0-9][A-Za-z0-9._-]*"}); err != nil {
+						return err
+					}
+					continue
+				}
+				var processes []string
+				if strings.HasSuffix(request.Action, "add") {
+					processes, err = a.watched.Add(name)
+				} else {
+					processes, err = a.watched.Remove(name)
+				}
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: map[string]any{"processes": processes}}); err != nil {
 					return err
 				}
 			case "action", "invoke":

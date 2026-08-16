@@ -91,7 +91,7 @@ func TestGroupRuntimeProcessesFixedOrderAndCaps(t *testing.T) {
 		mk(2, "dotnet run"),
 		mk(3, "java -jar app.jar"),
 		mk(4, "python3 worker.py"),
-	}, 1)
+	}, 1, []string{"java", "dotnet", "python"})
 	if len(groups) != 3 {
 		t.Fatalf("got %d groups, want 3", len(groups))
 	}
@@ -109,6 +109,62 @@ func TestGroupRuntimeProcessesFixedOrderAndCaps(t *testing.T) {
 	// python matches 3 rows but the cap is 1; the first (CPU order) wins.
 	if !groups[2].Available || len(groups[2].Processes) != 1 || groups[2].Processes[0].PID != 1 {
 		t.Fatalf("python group = %#v", groups[2])
+	}
+}
+
+func TestGroupRuntimeProcessesHonorsConfiguredOrder(t *testing.T) {
+	mk := func(pid int, cmd string) runtimeProcessEntry {
+		return runtimeProcessEntry{PID: pid, Command: cmd}
+	}
+	groups := groupRuntimeProcesses([]runtimeProcessEntry{
+		mk(1, "node server.js"),
+		mk(2, "java -jar app.jar"),
+	}, 50, []string{"node", "java"})
+	if len(groups) != 2 || groups[0].Runtime != "node" || groups[1].Runtime != "java" {
+		t.Fatalf("configured order not honored: %#v", groups)
+	}
+	if !groups[0].Available || groups[0].Processes[0].PID != 1 {
+		t.Fatalf("node group = %#v", groups[0])
+	}
+	if !groups[1].Available || groups[1].Processes[0].PID != 2 {
+		t.Fatalf("java group = %#v", groups[1])
+	}
+}
+
+func TestGroupWatchedProcessesMatchesCommPrefixSorted(t *testing.T) {
+	mk := func(pid int, cmd string) runtimeProcessEntry {
+		return runtimeProcessEntry{PID: pid, Command: cmd}
+	}
+	groups := groupWatchedProcesses([]runtimeProcessEntry{
+		mk(1, "nginx: master process"),
+		mk(2, "postgres: checkpointer"),
+		mk(3, "nginx: worker process"),
+		mk(4, "java -jar app.jar"),
+	}, 50, []string{"nginx", "postgres"})
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2: %#v", len(groups), groups)
+	}
+	nginx, postgres := groups[0], groups[1]
+	if nginx.Name != "nginx" || !nginx.Available || len(nginx.Processes) != 2 {
+		t.Fatalf("nginx group = %#v", nginx)
+	}
+	if postgres.Name != "postgres" || !postgres.Available || len(postgres.Processes) != 1 {
+		t.Fatalf("postgres group = %#v", postgres)
+	}
+}
+
+func TestGroupWatchedProcessesAbsentAndEmptyList(t *testing.T) {
+	mk := func(pid int, cmd string) runtimeProcessEntry {
+		return runtimeProcessEntry{PID: pid, Command: cmd}
+	}
+	groups := groupWatchedProcesses([]runtimeProcessEntry{
+		mk(1, "nginx: master process"),
+	}, 50, []string{"redis"})
+	if len(groups) != 1 || groups[0].Available || groups[0].Error == nil {
+		t.Fatalf("absent watcher = %#v", groups)
+	}
+	if groups := groupWatchedProcesses(nil, 50, nil); len(groups) != 0 {
+		t.Fatalf("empty watcher list = %#v", groups)
 	}
 }
 

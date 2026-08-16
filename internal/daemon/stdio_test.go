@@ -20,6 +20,7 @@ func TestStdioActionProtocol(t *testing.T) {
 		Transport:         "stdio",
 		MetricsInterval:   time.Hour,
 		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
 		ProcessesLimit:    50,
 		RequestTimeout:    time.Second,
 		ScriptTimeout:     time.Second,
