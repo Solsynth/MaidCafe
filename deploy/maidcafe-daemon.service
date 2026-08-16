@@ -19,7 +19,7 @@ PrivateTmp=true
 PrivateDevices=true
 # User-switching actions ([[daemon.actions]] user = "...") are executed
 # through sudo and render their substituted scripts under
-# /etc/maidcafe/actions/.run. When any configured action uses a run-as user,
+# /etc/maidcafe/actions/run. When any configured action uses a run-as user,
 # drop NoNewPrivileges (sudo needs its setuid bit) and allow the daemon to
 # write the runtime scripts:
 #   NoNewPrivileges=false

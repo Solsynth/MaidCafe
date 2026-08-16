@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,29 +55,34 @@ type EventbusConfig struct {
 	SubjectPrefix string `mapstructure:"subjectPrefix"`
 }
 type DaemonConfig struct {
-	ID                   string          `mapstructure:"id"`
-	Version              string          `mapstructure:"version"`
-	Transport            string          `mapstructure:"transport"`
-	Listen               string          `mapstructure:"listen"`
-	MetricsSecret        string          `mapstructure:"metricsSecret"`
-	MetricsHistoryPath   string          `mapstructure:"metricsHistoryPath"`
-	MetricsRetentionDays int             `mapstructure:"metricsRetentionDays"`
-	AuditPath            string          `mapstructure:"auditPath"`
-	CloudURL             string          `mapstructure:"cloudUrl"`
-	CloudSecret          string          `mapstructure:"cloudSecret"`
-	MetricsInterval      time.Duration   `mapstructure:"metricsInterval"`
-	StreamInterval       time.Duration   `mapstructure:"streamInterval"`
-	ContainersInterval   time.Duration   `mapstructure:"containersInterval"`
-	ImagesInterval       time.Duration   `mapstructure:"imagesInterval"`
-	ProcessesInterval    time.Duration   `mapstructure:"processesInterval"`
-	SystemdInterval      time.Duration   `mapstructure:"systemdInterval"`
-	ProcessesLimit       int             `mapstructure:"processesLimit"`
-	RequestTimeout       time.Duration   `mapstructure:"requestTimeout"`
-	ScriptTimeout        time.Duration   `mapstructure:"scriptTimeout"`
-	MaxBodyBytes         int64           `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns    int             `mapstructure:"maxConcurrentRuns"`
-	Webhooks             []WebhookConfig `mapstructure:"webhooks"`
-	Actions              []WebhookConfig `mapstructure:"actions"`
+	ID                   string `mapstructure:"id"`
+	Version              string `mapstructure:"version"`
+	Transport            string `mapstructure:"transport"`
+	Listen               string `mapstructure:"listen"`
+	MetricsSecret        string `mapstructure:"metricsSecret"`
+	MetricsHistoryPath   string `mapstructure:"metricsHistoryPath"`
+	MetricsRetentionDays int    `mapstructure:"metricsRetentionDays"`
+	AuditPath            string `mapstructure:"auditPath"`
+	// ActionsDir holds one `<slug>.toml` fragment per configured action
+	// (plus the deployed script bodies and the run runtime directory). The
+	// fragments are merged into Actions at load, so action changes never
+	// touch the main config file.
+	ActionsDir         string          `mapstructure:"actionsDir"`
+	CloudURL           string          `mapstructure:"cloudUrl"`
+	CloudSecret        string          `mapstructure:"cloudSecret"`
+	MetricsInterval    time.Duration   `mapstructure:"metricsInterval"`
+	StreamInterval     time.Duration   `mapstructure:"streamInterval"`
+	ContainersInterval time.Duration   `mapstructure:"containersInterval"`
+	ImagesInterval     time.Duration   `mapstructure:"imagesInterval"`
+	ProcessesInterval  time.Duration   `mapstructure:"processesInterval"`
+	SystemdInterval    time.Duration   `mapstructure:"systemdInterval"`
+	ProcessesLimit     int             `mapstructure:"processesLimit"`
+	RequestTimeout     time.Duration   `mapstructure:"requestTimeout"`
+	ScriptTimeout      time.Duration   `mapstructure:"scriptTimeout"`
+	MaxBodyBytes       int64           `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns  int             `mapstructure:"maxConcurrentRuns"`
+	Webhooks           []WebhookConfig `mapstructure:"webhooks"`
+	Actions            []WebhookConfig `mapstructure:"actions"`
 }
 type WebhookConfig struct {
 	Name            string   `mapstructure:"name"`
@@ -107,6 +113,9 @@ type WebhookConfig struct {
 	// environment; with one they are passed to sudo as command-line
 	// assignments, which sudo applies on top of its reset environment.
 	Env []string `mapstructure:"env"`
+	// Timeout overrides the daemon-wide scriptTimeout for this hook (e.g.
+	// "2m"); zero or absent uses the daemon-wide value.
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
@@ -133,6 +142,9 @@ func validateHookExecution(hook WebhookConfig, kind string, index int) error {
 		if !envAssignmentPattern.MatchString(kv) {
 			return fmt.Errorf("daemon.%s[%d].env[%d] must be KEY=VALUE with an identifier key", kind, index, i)
 		}
+	}
+	if hook.Timeout < 0 {
+		return fmt.Errorf("daemon.%s[%d].timeout must not be negative", kind, index)
 	}
 	return nil
 }
@@ -167,6 +179,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.metricsHistoryPath", "/var/lib/maidcafe/metrics")
 	viper.SetDefault("daemon.metricsRetentionDays", 7)
 	viper.SetDefault("daemon.auditPath", "/var/lib/maidcafe/audit.jsonl")
+	viper.SetDefault("daemon.actionsDir", "/etc/maidcafe/actions")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -191,7 +204,63 @@ func Load(configPath string) (*Config, error) {
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
+	if err := cfg.loadActionFragments(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// loadActionFragments merges every `<slug>.toml` under daemon.actionsDir into
+// Daemon.Actions, sorted by file name for deterministic ordering. A missing
+// or unreadable directory is not an error (a fresh host has no actions yet);
+// a fragment that fails to parse or validate is. Each fragment is a flat
+// TOML file holding one action's fields — the same shape as an entry of
+// [[daemon.actions]] — so action changes are isolated from the main config
+// file and never rewrite it.
+func (c *Config) loadActionFragments() error {
+	dir := strings.TrimSpace(c.Daemon.ActionsDir)
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read actions dir %s: %w", dir, err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".toml") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		hook, err := loadActionFragment(path)
+		if err != nil {
+			return err
+		}
+		c.Daemon.Actions = append(c.Daemon.Actions, hook)
+	}
+	return nil
+}
+
+func loadActionFragment(path string) (WebhookConfig, error) {
+	v := viper.New()
+	v.SetConfigType("toml")
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return WebhookConfig{}, fmt.Errorf("read action fragment %s: %w", path, err)
+	}
+	var hook WebhookConfig
+	if err := v.Unmarshal(&hook); err != nil {
+		return WebhookConfig{}, fmt.Errorf("parse action fragment %s: %w", path, err)
+	}
+	if strings.TrimSpace(hook.Name) == "" {
+		return WebhookConfig{}, fmt.Errorf("action fragment %s has no name", path)
+	}
+	return hook, nil
 }
 
 func applyEnvAliases() {
@@ -204,6 +273,7 @@ func applyEnvAliases() {
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
 		"DAEMON_AUDIT_PATH":             "daemon.auditPath",
+		"DAEMON_ACTIONS_DIR":            "daemon.actionsDir",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",

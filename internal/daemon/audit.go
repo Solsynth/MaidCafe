@@ -90,6 +90,22 @@ func (a *AuditLogger) Record(entry auditEntry) {
 	}
 }
 
+// Clear wipes every audit record, active and rotated file alike. A disabled
+// logger is a no-op.
+func (a *AuditLogger) Clear() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, path := range []string{a.path, a.path + ".1"} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // Recent returns up to [limit] (bounded to 500) of the newest entries,
 // newest first. The rotated file is read before the active one so entries
 // stay in order across the rotation boundary; unreadable or malformed lines

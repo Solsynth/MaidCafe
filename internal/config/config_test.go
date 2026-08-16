@@ -269,6 +269,15 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 			},
 		},
 		{
+			name: "negative timeout rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Actions = []WebhookConfig{{
+					Name: "a", Command: "/bin/true", Enabled: true,
+					Timeout: -time.Second,
+				}}
+			},
+		},
+		{
 			name: "webhooks validated the same way",
 			mutate: func(d *DaemonConfig) {
 				d.Webhooks = []WebhookConfig{{
@@ -304,6 +313,94 @@ func TestWebhookLabelFallsBackToName(t *testing.T) {
 	blank := WebhookConfig{Name: "deploy", DisplayName: "   "}
 	if blank.Label() != "deploy" {
 		t.Fatalf("Label() blank display = %q", blank.Label())
+	}
+}
+
+func TestLoadMergesActionFragments(t *testing.T) {
+	dir := t.TempDir()
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+actionsDir = "`+filepath.ToSlash(dir)+`"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "deploy.toml"), []byte(`
+name = "deploy"
+command = "/etc/maidcafe/actions/deploy.sh"
+script = true
+cwd = "/srv/myapp"
+user = "`+current.Username+`"
+env = ["CI_BUILD=42"]
+timeout = "2m"
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cleanup.toml"), []byte(`
+name = "cleanup"
+command = "/etc/maidcafe/actions/cleanup.sh"
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Non-TOML files in the dir are ignored.
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("nope"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Actions) != 2 {
+		t.Fatalf("merged actions = %d, want 2 (%+v)", len(cfg.Daemon.Actions), cfg.Daemon.Actions)
+	}
+	// Sorted by file name: cleanup before deploy.
+	cleanup, deploy := cfg.Daemon.Actions[0], cfg.Daemon.Actions[1]
+	if cleanup.Name != "cleanup" || deploy.Name != "deploy" {
+		t.Fatalf("unexpected order: %q, %q", cleanup.Name, deploy.Name)
+	}
+	if deploy.Cwd != "/srv/myapp" || deploy.User != current.Username ||
+		len(deploy.Env) != 1 || deploy.Env[0] != "CI_BUILD=42" ||
+		deploy.Timeout != 2*time.Minute {
+		t.Fatalf("fragment fields not merged: %+v", deploy)
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadIgnoresMissingActionsDir(t *testing.T) {
+	path := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "s"
+actionsDir = "`+filepath.ToSlash(filepath.Join(t.TempDir(), "missing"))+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Actions) != 0 {
+		t.Fatalf("actions = %+v", cfg.Daemon.Actions)
+	}
+}
+
+func TestLoadRejectsBrokenFragment(t *testing.T) {
+	dir := t.TempDir()
+	base := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "s"
+actionsDir = "`+filepath.ToSlash(dir)+`"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "bad.toml"), []byte("name = [not-a-string"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(base); err == nil {
+		t.Fatal("expected broken fragment to fail the load")
 	}
 }
 

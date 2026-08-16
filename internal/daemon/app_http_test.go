@@ -254,6 +254,40 @@ func TestHTTPControlAPIReportsVersionMetricsAndActions(t *testing.T) {
 	if webhookEntry.Name != "hook" || webhookEntry.Source != "http" {
 		t.Fatalf("unexpected webhook audit entry: %+v", webhookEntry)
 	}
+
+	// The log can be cleared, after which the endpoint reports empty.
+	clearRequest, err := http.NewRequest(http.MethodDelete, baseURL+"/api/v1/audit", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	clearResponse, err := http.DefaultClient.Do(clearRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearResponse.Body.Close()
+	if clearResponse.StatusCode != http.StatusOK {
+		t.Fatalf("clear audit status = %d", clearResponse.StatusCode)
+	}
+	cleared, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/audit", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleared.Header.Set("Authorization", "Bearer metrics-secret")
+	clearedResponse, err := http.DefaultClient.Do(cleared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearedResponse.Body.Close()
+	var clearedBody struct {
+		Entries []auditEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(clearedResponse.Body).Decode(&clearedBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(clearedBody.Entries) != 0 {
+		t.Fatalf("audit entries after clear = %d", len(clearedBody.Entries))
+	}
 }
 
 // readSSEFrame reads one SSE frame (event line, data line, blank line) from

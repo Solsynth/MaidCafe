@@ -289,15 +289,15 @@ func prependWorkingDirectory(cwd string, script []byte) []byte {
 // Without a run-as user the file lives in the system temp directory (private
 // under systemd PrivateTmp) with 0700. With a run-as user the target account
 // must read and execute it, so it is rendered next to the deployed script
-// under a hidden .run directory with 0755 — the sudoers whitelist generated
-// by MaidKit covers `.run/*` (plus the actions dir; sudoers wildcards do not
-// cross "/"). The returned cleanup removes the file; the .run directory
+// under a run directory with 0755 — the sudoers whitelist generated
+// by MaidKit covers `run/*` (plus the actions dir; sudoers wildcards do not
+// cross "/"). The returned cleanup removes the file; the run directory
 // itself is left in place.
 func renderScriptTemp(hook config.WebhookConfig, script []byte) (string, func(), error) {
 	dir := ""
 	mode := os.FileMode(0o700)
 	if hook.User != "" {
-		dir = filepath.Join(filepath.Dir(hook.Command), ".run")
+		dir = filepath.Join(filepath.Dir(hook.Command), "run")
 		if err := os.MkdirAll(dir, 0o770); err != nil {
 			return "", nil, fmt.Errorf(
 				"create runtime script directory %s: %w (is it writable by the daemon user?)",
@@ -378,7 +378,12 @@ func (e *WebhookExecutor) execute(
 			Error:       auditErrorTail(response),
 		})
 	}()
-	runCtx, cancel := context.WithTimeout(ctx, e.scriptTimeout)
+	timeout := e.scriptTimeout
+	if hook.Timeout > 0 {
+		// Per-hook override; the daemon-wide scriptTimeout stays the default.
+		timeout = hook.Timeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	command, args := hook.Command, hook.Args
 	if hook.Script {

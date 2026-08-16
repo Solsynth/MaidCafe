@@ -227,7 +227,7 @@ func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
 	}
 	cmd := buildRunCommand(context.Background(), hook, hook.Command, []string{"--force"})
 	// The command stays the absolute script path (never a shell wrapper) so
-	// the sudoers rule `/etc/maidcafe/actions/.run/*` matches it. No -D:
+	// the sudoers rule `/etc/maidcafe/actions/run/*` matches it. No -D:
 	// default sudoers rules reject it. A non-script command inherits the
 	// daemon-set cwd through sudo instead.
 	want := []string{
@@ -345,7 +345,7 @@ func TestRenderScriptTempLocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	if filepath.Dir(userRun) != filepath.Join(filepath.Dir(deployed), ".run") {
+	if filepath.Dir(userRun) != filepath.Join(filepath.Dir(deployed), "run") {
 		t.Fatalf("user temp = %q", userRun)
 	}
 	info, err = os.Stat(userRun)
@@ -362,7 +362,7 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 		t.Skip("requires root to switch users through sudo")
 	}
 	// The whole chain must be traversable by the target user: the rendered
-	// script lives in <script dir>/.run (0755) and the cwd needs world
+	// script lives in <script dir>/run (0755) and the cwd needs world
 	// traverse, since the injected `cd` runs as the target user.
 	workDir := t.TempDir()
 	if err := os.Chmod(workDir, 0o755); err != nil {
@@ -437,6 +437,40 @@ func TestPrependWorkingDirectory(t *testing.T) {
 	got = prependWorkingDirectory("/srv/app", []byte("#!/bin/sh"))
 	if string(got) != "#!/bin/sh\ncd -- '/srv/app'\n" {
 		t.Fatalf("bare shebang = %q", got)
+	}
+}
+
+func TestExecuteUsesPerHookTimeout(t *testing.T) {
+	sleep := executable(t, "#!/bin/sh\nsleep 1\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name:    "slow-but-allowed",
+			Command: sleep,
+			Enabled: true,
+			Timeout: 2 * time.Second,
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+	result, requestErr := executor.RunAction(context.Background(), "slow-but-allowed", nil, "test")
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if !result.OK {
+		t.Fatalf("per-hook timeout should have allowed the run: %+v", result)
+	}
+
+	// Without the override the daemon-wide timeout still applies.
+	cfg.Actions[0].Timeout = 0
+	executor = NewWebhookExecutor(cfg)
+	result, requestErr = executor.RunAction(context.Background(), "slow-but-allowed", nil, "test")
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if result.OK {
+		t.Fatalf("daemon-wide timeout should have killed the run: %+v", result)
 	}
 }
 

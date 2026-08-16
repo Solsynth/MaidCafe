@@ -239,6 +239,13 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		}
 		c.JSON(http.StatusOK, gin.H{"entries": executor.audit.Recent(limit)})
 	})
+	router.DELETE("/api/v1/audit", authorizeMetrics, func(c *gin.Context) {
+		if err := executor.audit.Clear(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 	router.POST("/api/v1/webhooks/:name", executor.GinHandler())
 	app.server = &http.Server{
 		Addr:              cfg.Listen,

@@ -365,18 +365,18 @@ hardening. Webhook commands must be readable and executable by that account.
 
 Actions that run as another account (`user = "..."` in `[[daemon.actions]]`
 or `[[daemon.webhooks]]`) are executed through sudo and render their
-substituted scripts under `/etc/maidcafe/actions/.run`. For those, the unit
+substituted scripts under `/etc/maidcafe/actions/run`. For those, the unit
 needs `NoNewPrivileges=false` (sudo's setuid bit) and `ReadWritePaths=/etc/maidcafe/actions`,
 and the daemon account needs a sudoers rule such as:
 
 ```sh
 sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidcafe-actions <<'EOF'
-maidcafe ALL=(deploy) NOPASSWD: /etc/maidcafe/actions/.run/*, /etc/maidcafe/actions/*
+maidcafe ALL=(deploy) NOPASSWD: /etc/maidcafe/actions/run/*, /etc/maidcafe/actions/*
 EOF
 ```
 
 The two specs matter: user-mode script actions render their substituted body
-under `/etc/maidcafe/actions/.run/`, and sudoers wildcards do not cross `/`.
+under `/etc/maidcafe/actions/run/`, and sudoers wildcards do not cross `/`.
 
 The same rule must exist for the SSH user that runs the daemon in `stdio`
 transport mode. MaidKit deploys all of this automatically when an action

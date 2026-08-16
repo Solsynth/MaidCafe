@@ -95,6 +95,35 @@ func TestAuditLoggerDisabledWhenUnwritable(t *testing.T) {
 	}
 }
 
+func TestAuditLoggerClearWipesRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger := NewAuditLogger(path, slog.Default())
+	logger.Record(auditEntry{Name: "a", Source: "http", OK: true})
+	logger.Record(auditEntry{Name: "b", Source: "relay", OK: false, ExitCode: 1})
+	if len(logger.Recent(10)) != 2 {
+		t.Fatalf("expected 2 entries before clear")
+	}
+	if err := logger.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if got := logger.Recent(10); len(got) != 0 {
+		t.Fatalf("entries after clear = %v", got)
+	}
+	// Clearing an already-empty logger is fine, and the log keeps working.
+	if err := logger.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	logger.Record(auditEntry{Name: "c", Source: "stdio", OK: true})
+	if got := logger.Recent(10); len(got) != 1 || got[0].Name != "c" {
+		t.Fatalf("after clear+record = %v", got)
+	}
+	// A disabled logger is a no-op.
+	var nilLogger *AuditLogger
+	if err := nilLogger.Clear(); err != nil {
+		t.Fatalf("nil clear: %v", err)
+	}
+}
+
 func TestExecuteRecordsAuditEntries(t *testing.T) {
 	script := executable(t, "#!/bin/sh\nprintf 'ok'\n")
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
