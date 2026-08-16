@@ -30,6 +30,7 @@ type App struct {
 	images     *ImagesCollector
 	processes  *ProcessesCollector
 	systemd    *SystemdCollector
+	runtimes   *RuntimesCollector
 	server     *http.Server
 	listenerMu sync.RWMutex
 	listener   net.Listener
@@ -65,6 +66,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		images:     &ImagesCollector{probe: runtimeProbe},
 		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
 		systemd:    &SystemdCollector{},
+		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit},
 		logger:     logger,
 	}
 	app.relay = NewWebhookRelay(publisher, executor, logger)
@@ -192,6 +194,14 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	})
 	router.GET("/api/v1/systemd", authorizeMetrics, func(c *gin.Context) {
 		data, err := app.systemd.snapshot(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	router.GET("/api/v1/runtimes", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.runtimes.collect(c.Request.Context())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
 			return
@@ -357,6 +367,7 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	a.runStreamCollector(ctx, "images", a.cfg.ImagesInterval, a.images.collect)
 	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, a.processes.collect)
 	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
+	a.runStreamCollector(ctx, "runtimes", a.cfg.RuntimesInterval, a.runtimes.collect)
 }
 
 func (a *App) runStreamCollector(ctx context.Context, event string, interval time.Duration, collect func(context.Context) ([]byte, error)) {

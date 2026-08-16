@@ -819,3 +819,303 @@ func systemdUnitRank(unit systemdUnit) int {
 		return 2
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Runtimes
+// ---------------------------------------------------------------------------
+
+// maxJvmProbePids caps the per-collection jstat probes: jstat runs once per
+// JVM and shares the same host, so a Java-heavy box must not stall the frame.
+const maxJvmProbePids = 8
+
+// jdkReProbeInterval is the re-probe cadence while jps/jstat are unavailable.
+const jdkReProbeInterval = 60 * time.Second
+
+// runtimeProcessTableLimit caps the head of the ps pipe read per collection.
+const runtimeProcessTableLimit = 300
+
+type runtimeProcessEntry struct {
+	PID           int     `json:"pid"`
+	User          string  `json:"user"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	MemoryPercent float64 `json:"memory_percent"`
+	RSSKb         int64   `json:"rss_kb"`
+	Threads       *int64  `json:"threads"`
+	Command       string  `json:"command"`
+}
+
+// jvmProcessEntry is one `jps -l` line; MainClass is empty when jps could not
+// resolve it.
+type jvmProcessEntry struct {
+	PID       int
+	MainClass string
+}
+
+type javaJvmEntry struct {
+	PID        int      `json:"pid"`
+	MainClass  *string  `json:"main_class"`
+	OldPercent *float64 `json:"old_percent"`
+	YGC        *int64   `json:"ygc"`
+	FGC        *int64   `json:"fgc"`
+	GCTSeconds *float64 `json:"gct_seconds"`
+	Error      *string  `json:"error"`
+}
+
+type jdkProbe struct {
+	Available bool    `json:"available"`
+	Error     *string `json:"error"`
+}
+
+type javaRuntimePayload struct {
+	JDK  jdkProbe        `json:"jdk"`
+	JVMs []javaJvmEntry  `json:"jvms"`
+}
+
+type runtimeGroup struct {
+	Runtime   string                `json:"runtime"`
+	Available bool                  `json:"available"`
+	Error     *string               `json:"error"`
+	Processes []runtimeProcessEntry `json:"processes"`
+	Java      *javaRuntimePayload   `json:"java,omitempty"`
+}
+
+type runtimePayload struct {
+	Runtimes []runtimeGroup `json:"runtimes"`
+}
+
+// jdkProbeState resolves the jps/jstat binaries once and re-probes every
+// jdkReProbeInterval while either is missing. Probed only when at least one
+// java process exists, so hosts without Java never pay for the probe.
+type jdkProbeState struct {
+	mu        sync.Mutex
+	jpsPath   string
+	jstatPath string
+	probed    bool
+	lastProbe time.Time
+}
+
+// probePathSnapshot ensures the probe has run and returns the resolved
+// jps/jstat absolute paths ("" when missing), mirroring runtimeProbeState.
+func (j *jdkProbeState) probePathSnapshot(ctx context.Context) (jpsPath, jstatPath string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	now := time.Now()
+	if !j.probed || ((j.jpsPath == "" || j.jstatPath == "") && now.Sub(j.lastProbe) >= jdkReProbeInterval) {
+		j.jpsPath = resolveRuntimeBinary(ctx, "jps")
+		j.jstatPath = resolveRuntimeBinary(ctx, "jstat")
+		j.probed = true
+		j.lastProbe = now
+	}
+	return j.jpsPath, j.jstatPath
+}
+
+// RuntimesCollector groups java/dotnet/python processes from ps, capping each
+// runtime at `limit` entries, and attaches JVM/GC detail (jps/jstat) to the
+// java group when a JDK is present. Always reports all three groups in fixed
+// order; a group with no matching process carries available:false.
+type RuntimesCollector struct {
+	limit int
+	jdk   *jdkProbeState
+}
+
+func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
+	// GNU ps carries the nlwp thread count; fall back to the BSD form (no
+	// nlwp) when the GNU-sort form fails, e.g. on macOS.
+	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args= --sort=-%cpu | head -n "+strconv.Itoa(runtimeProcessTableLimit))
+	hasThreads := true
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm=,args= -r | head -n "+strconv.Itoa(runtimeProcessTableLimit))
+		hasThreads = false
+		if err != nil {
+			return nil, err
+		}
+	}
+	entries := parseRuntimeProcesses(string(out), hasThreads)
+	groups := groupRuntimeProcesses(entries, r.limit)
+	// groups[0] is always java (fixed order); the java key is present only
+	// when at least one java process exists.
+	if len(groups[0].Processes) > 0 {
+		groups[0].Java = r.collectJavaDetail(ctx)
+	}
+	return json.Marshal(runtimePayload{Runtimes: groups})
+}
+
+// collectJavaDetail runs jps -l and per-pid jstat -gcutil for the first
+// maxJvmProbePids JVMs. Per-pid failures become entry errors and never abort
+// the frame; missing tools flip the jdk probe to unavailable.
+func (r *RuntimesCollector) collectJavaDetail(ctx context.Context) *javaRuntimePayload {
+	if r.jdk == nil {
+		r.jdk = &jdkProbeState{}
+	}
+	jpsPath, jstatPath := r.jdk.probePathSnapshot(ctx)
+	if jpsPath == "" || jstatPath == "" {
+		errMsg := "jps/jstat were not found on this host (no JDK)"
+		return &javaRuntimePayload{JDK: jdkProbe{Available: false, Error: &errMsg}, JVMs: []javaJvmEntry{}}
+	}
+	jpsOut, err := runCommand(ctx, jpsPath, "-l")
+	if err != nil {
+		errMsg := "jps -l: " + err.Error()
+		return &javaRuntimePayload{JDK: jdkProbe{Available: false, Error: &errMsg}, JVMs: []javaJvmEntry{}}
+	}
+	jvms := parseJpsOutput(string(jpsOut))
+	if len(jvms) > maxJvmProbePids {
+		jvms = jvms[:maxJvmProbePids]
+	}
+	entries := make([]javaJvmEntry, 0, len(jvms))
+	for _, jvm := range jvms {
+		mainClass := jvm.MainClass
+		entry := javaJvmEntry{PID: jvm.PID, MainClass: &mainClass}
+		out, jerr := runCommand(ctx, jstatPath, "-gcutil", strconv.Itoa(jvm.PID))
+		if jerr != nil {
+			errMsg := "jstat -gcutil: " + jerr.Error()
+			entry.Error = &errMsg
+			entries = append(entries, entry)
+			continue
+		}
+		oldPct, ygc, fgc, gct, perr := parseJstatGcutilOutput(string(out))
+		if perr != nil {
+			errMsg := "parse jstat output: " + perr.Error()
+			entry.Error = &errMsg
+			entries = append(entries, entry)
+			continue
+		}
+		entry.OldPercent = &oldPct
+		entry.YGC = &ygc
+		entry.FGC = &fgc
+		entry.GCTSeconds = &gct
+		entries = append(entries, entry)
+	}
+	return &javaRuntimePayload{JDK: jdkProbe{Available: true}, JVMs: entries}
+}
+
+// groupRuntimeProcesses partitions runtime processes into the fixed java,
+// dotnet, python groups, capping each at limit in the input (CPU) order. A
+// process matches a group when its comm token starts with the runtime name;
+// a group with no match reports available:false.
+func groupRuntimeProcesses(entries []runtimeProcessEntry, limit int) []runtimeGroup {
+	names := []string{"java", "dotnet", "python"}
+	groups := make([]runtimeGroup, len(names))
+	for i, name := range names {
+		groups[i] = runtimeGroup{Runtime: name, Available: false, Processes: []runtimeProcessEntry{}}
+	}
+	for _, entry := range entries {
+		comm := entry.Command
+		if idx := strings.IndexByte(comm, ' '); idx >= 0 {
+			comm = comm[:idx]
+		}
+		for i, name := range names {
+			if !strings.HasPrefix(comm, name) {
+				continue
+			}
+			if len(groups[i].Processes) >= limit {
+				break
+			}
+			groups[i].Available = true
+			groups[i].Processes = append(groups[i].Processes, entry)
+			break
+		}
+	}
+	for i, group := range groups {
+		if !group.Available {
+			errMsg := "no " + group.Runtime + " processes found"
+			groups[i].Error = &errMsg
+		}
+	}
+	return groups
+}
+
+// parseRuntimeProcesses parses `ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args=`
+// (hasThreads) or the BSD `ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm=,args= -r`
+// form (no nlwp). Fixed columns are pid user cpu mem rss [nlwp] comm; the
+// command is the rest of the line joined with single spaces. Malformed rows
+// are skipped.
+func parseRuntimeProcesses(output string, hasThreads bool) []runtimeProcessEntry {
+	minFields := 6
+	if hasThreads {
+		minFields = 7
+	}
+	entries := make([]runtimeProcessEntry, 0)
+	for _, rawLine := range strings.Split(output, "\n") {
+		fields := strings.Fields(rawLine)
+		if len(fields) < minFields {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		cpu, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil {
+			continue
+		}
+		mem, err := strconv.ParseFloat(fields[3], 64)
+		if err != nil {
+			continue
+		}
+		rss, err := strconv.ParseInt(fields[4], 10, 64)
+		if err != nil {
+			continue
+		}
+		entry := runtimeProcessEntry{
+			PID:           pid,
+			User:          fields[1],
+			CPUPercent:    cpu,
+			MemoryPercent: mem,
+			RSSKb:         rss,
+		}
+		if hasThreads {
+			threads, terr := strconv.ParseInt(fields[5], 10, 64)
+			if terr != nil {
+				continue
+			}
+			entry.Threads = &threads
+			entry.Command = strings.Join(fields[6:], " ")
+		} else {
+			entry.Command = strings.Join(fields[5:], " ")
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+// parseJpsOutput parses `jps -l` output: `<pid> [<main-class>]`.
+func parseJpsOutput(output string) []jvmProcessEntry {
+	jvms := make([]jvmProcessEntry, 0)
+	for _, rawLine := range strings.Split(output, "\n") {
+		fields := strings.Fields(rawLine)
+		if len(fields) == 0 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		mainClass := ""
+		if len(fields) > 1 {
+			mainClass = strings.Join(fields[1:], " ")
+		}
+		jvms = append(jvms, jvmProcessEntry{PID: pid, MainClass: mainClass})
+	}
+	return jvms
+}
+
+// parseJstatGcutilOutput parses one `jstat -gcutil <pid>` line (header
+// S0 S1 E O M CCS YGC YGCT FGC FGCT GCT): O = fields[3], YGC = fields[6],
+// FGC = fields[8], GCT = fields[10].
+func parseJstatGcutilOutput(output string) (oldPercent float64, ygc, fgc int64, gctSeconds float64, err error) {
+	for _, rawLine := range strings.Split(output, "\n") {
+		fields := strings.Fields(rawLine)
+		if len(fields) < 11 {
+			continue
+		}
+		old, oerr := strconv.ParseFloat(fields[3], 64)
+		y, yerr := strconv.ParseInt(fields[6], 10, 64)
+		f, ferr := strconv.ParseInt(fields[8], 10, 64)
+		gct, gerr := strconv.ParseFloat(fields[10], 64)
+		if oerr != nil || yerr != nil || ferr != nil || gerr != nil {
+			continue
+		}
+		return old, y, f, gct, nil
+	}
+	return 0, 0, 0, 0, fmt.Errorf("no valid jstat -gcutil data line found")
+}

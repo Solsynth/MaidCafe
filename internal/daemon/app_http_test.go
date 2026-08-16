@@ -435,6 +435,9 @@ func TestSSEStreamHelloAndMetricFrames(t *testing.T) {
 	if _, ok := hello.Intervals["metric"]; !ok {
 		t.Fatalf("hello intervals = %#v", hello.Intervals)
 	}
+	if _, ok := hello.Intervals["runtimes"]; !ok {
+		t.Fatalf("hello intervals missing runtimes: %#v", hello.Intervals)
+	}
 
 	event, data = readSSEFrame(t, reader, 2*time.Second)
 	if event != "metric" {

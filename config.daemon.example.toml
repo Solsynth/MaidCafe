@@ -21,6 +21,8 @@ imagesInterval = "60s"
 processesInterval = "10s"
 processesLimit = 50
 systemdInterval = "30s"
+# 0 disables the runtimes collector
+runtimesInterval = "10s"
 requestTimeout = "10s"
 scriptTimeout = "30s"
 maxBodyBytes = 65536

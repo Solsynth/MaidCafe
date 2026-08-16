@@ -140,6 +140,9 @@ func TestParseEventsParam(t *testing.T) {
 	if _, err := parseEventsParam("metric,bogus"); err == nil {
 		t.Fatal("unknown event type accepted")
 	}
+	if types, err := parseEventsParam("runtimes"); err != nil || len(types) != 1 || types[0] != "runtimes" {
+		t.Fatalf("runtimes event = %#v, %v; want [runtimes], nil", types, err)
+	}
 	if types, err := parseEventsParam("metric,metric"); err != nil || len(types) != 1 {
 		t.Fatalf("duplicate events = %#v, %v; want [metric], nil", types, err)
 	}

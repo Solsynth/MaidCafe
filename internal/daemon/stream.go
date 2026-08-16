@@ -23,7 +23,7 @@ const sseHeartbeatInterval = 15 * time.Second
 
 // streamEventTypes is the whitelist of subscribable event names for
 // GET /api/v1/stream. hello is not subscribable: it is always sent first.
-var streamEventTypes = []string{"metric", "containers", "images", "processes", "systemd"}
+var streamEventTypes = []string{"metric", "containers", "images", "processes", "systemd", "runtimes"}
 
 // Subscriber is one SSE client's handle on a StreamHub. C delivers complete
 // SSE frames (event/data/blank line) for the requested types.
@@ -219,6 +219,7 @@ func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
 			"images":     int(cfg.ImagesInterval.Seconds()),
 			"processes":  int(cfg.ProcessesInterval.Seconds()),
 			"systemd":    int(cfg.SystemdInterval.Seconds()),
+			"runtimes":   int(cfg.RuntimesInterval.Seconds()),
 		},
 	}
 	helloData, err := json.Marshal(hello)

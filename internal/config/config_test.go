@@ -45,6 +45,7 @@ command = "/bin/cat"
 		cfg.Daemon.ImagesInterval != time.Minute ||
 		cfg.Daemon.ProcessesInterval != 10*time.Second ||
 		cfg.Daemon.SystemdInterval != 30*time.Second ||
+		cfg.Daemon.RuntimesInterval != 10*time.Second ||
 		cfg.Daemon.ProcessesLimit != 50 {
 		t.Fatalf("unexpected daemon defaults: %#v", cfg.Daemon)
 	}
@@ -172,6 +173,7 @@ func TestDaemonStreamValidation(t *testing.T) {
 		{name: "negative images interval", mutate: func(d *DaemonConfig) { d.ImagesInterval = -time.Second }},
 		{name: "negative processes interval", mutate: func(d *DaemonConfig) { d.ProcessesInterval = -time.Second }},
 		{name: "negative systemd interval", mutate: func(d *DaemonConfig) { d.SystemdInterval = -time.Second }},
+		{name: "negative runtimes interval", mutate: func(d *DaemonConfig) { d.RuntimesInterval = -time.Second }},
 		{name: "zero processes limit", mutate: func(d *DaemonConfig) { d.ProcessesLimit = 0 }},
 		{name: "oversized processes limit", mutate: func(d *DaemonConfig) { d.ProcessesLimit = 501 }},
 	} {

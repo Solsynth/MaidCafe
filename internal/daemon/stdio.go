@@ -103,6 +103,17 @@ func (a *App) runStdio(ctx context.Context) error {
 				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: a.metrics.Collect()}); err != nil {
 					return err
 				}
+			case "runtimes":
+				data, err := a.runtimes.collect(ctx)
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: json.RawMessage(data)}); err != nil {
+					return err
+				}
 			case "action", "invoke":
 				body, err := stdioBody(request.Body)
 				if err != nil {

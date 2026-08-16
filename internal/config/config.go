@@ -86,6 +86,7 @@ type DaemonConfig struct {
 	ImagesInterval     time.Duration   `mapstructure:"imagesInterval"`
 	ProcessesInterval  time.Duration   `mapstructure:"processesInterval"`
 	SystemdInterval    time.Duration   `mapstructure:"systemdInterval"`
+	RuntimesInterval   time.Duration   `mapstructure:"runtimesInterval"`
 	ProcessesLimit     int             `mapstructure:"processesLimit"`
 	RequestTimeout     time.Duration   `mapstructure:"requestTimeout"`
 	ScriptTimeout      time.Duration   `mapstructure:"scriptTimeout"`
@@ -217,6 +218,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.imagesInterval", time.Minute)
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
+	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
 	viper.SetDefault("daemon.processesLimit", 50)
 	viper.SetDefault("daemon.requestTimeout", 10*time.Second)
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
@@ -469,6 +471,9 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.SystemdInterval < 0 {
 		return fmt.Errorf("daemon.systemdInterval must not be negative")
+	}
+	if c.Daemon.RuntimesInterval < 0 {
+		return fmt.Errorf("daemon.runtimesInterval must not be negative")
 	}
 	if c.Daemon.ProcessesLimit < 1 || c.Daemon.ProcessesLimit > 500 {
 		return fmt.Errorf("daemon.processesLimit must be between 1 and 500")

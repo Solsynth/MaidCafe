@@ -32,6 +32,121 @@ func TestParseProcessesHandlesFloatFieldsAndMultiWordCommand(t *testing.T) {
 	}
 }
 
+func TestParseRuntimeProcessesGnuWithThreads(t *testing.T) {
+	input := "  123 root      1.5   0.3  67890   45 java -Xmx2g -jar app.jar\n" +
+		" 4567 jane     12.25  1.75 1048576   12 /usr/bin/python3 server.py --port 8080\n" +
+		"garbage\n"
+	procs := parseRuntimeProcesses(input, true)
+	if len(procs) != 2 {
+		t.Fatalf("parsed %d processes, want 2: %#v", len(procs), procs)
+	}
+	if procs[0].PID != 123 || procs[0].User != "root" ||
+		procs[0].CPUPercent != 1.5 || procs[0].MemoryPercent != 0.3 ||
+		procs[0].RSSKb != 67890 || procs[0].Threads == nil || *procs[0].Threads != 45 ||
+		procs[0].Command != "java -Xmx2g -jar app.jar" {
+		t.Fatalf("first process parsed as %#v", procs[0])
+	}
+	if procs[1].PID != 4567 || procs[1].Threads == nil || *procs[1].Threads != 12 ||
+		procs[1].Command != "/usr/bin/python3 server.py --port 8080" {
+		t.Fatalf("second process parsed as %#v", procs[1])
+	}
+}
+
+func TestParseRuntimeProcessesBsdNoThreads(t *testing.T) {
+	input := "  123 root      1.5   0.3  67890 java -Xmx2g -jar app.jar\n" +
+		" 4567 jane     12.25  1.75 1048576 dotnet run --project app.csproj\n"
+	procs := parseRuntimeProcesses(input, false)
+	if len(procs) != 2 {
+		t.Fatalf("parsed %d processes, want 2: %#v", len(procs), procs)
+	}
+	if procs[0].PID != 123 || procs[0].Threads != nil ||
+		procs[0].Command != "java -Xmx2g -jar app.jar" {
+		t.Fatalf("first process parsed as %#v", procs[0])
+	}
+	if procs[1].PID != 4567 || procs[1].Command != "dotnet run --project app.csproj" {
+		t.Fatalf("second process parsed as %#v", procs[1])
+	}
+}
+
+func TestParseRuntimeProcessesSkipsMalformed(t *testing.T) {
+	input := "short\n" +
+		"  123 root      1.5   0.3  67890   45 java -jar app.jar\n" +
+		"  456 bad cpu 1.5 0.3 1000 5 nope\n" +
+		"  789 root   abc   0.3  1000   5 java -version\n"
+	procs := parseRuntimeProcesses(input, true)
+	if len(procs) != 1 {
+		t.Fatalf("parsed %d processes, want 1: %#v", len(procs), procs)
+	}
+	if procs[0].PID != 123 {
+		t.Fatalf("process parsed as %#v", procs[0])
+	}
+}
+
+func TestGroupRuntimeProcessesFixedOrderAndCaps(t *testing.T) {
+	mk := func(pid int, cmd string) runtimeProcessEntry {
+		return runtimeProcessEntry{PID: pid, Command: cmd}
+	}
+	groups := groupRuntimeProcesses([]runtimeProcessEntry{
+		mk(1, "python3 server.py"),
+		mk(2, "dotnet run"),
+		mk(3, "java -jar app.jar"),
+		mk(4, "python3 worker.py"),
+	}, 1)
+	if len(groups) != 3 {
+		t.Fatalf("got %d groups, want 3", len(groups))
+	}
+	for i, want := range []string{"java", "dotnet", "python"} {
+		if groups[i].Runtime != want {
+			t.Fatalf("group[%d].Runtime = %q, want %q", i, groups[i].Runtime, want)
+		}
+	}
+	if !groups[0].Available || len(groups[0].Processes) != 1 || groups[0].Processes[0].PID != 3 {
+		t.Fatalf("java group = %#v", groups[0])
+	}
+	if !groups[1].Available || len(groups[1].Processes) != 1 || groups[1].Processes[0].PID != 2 {
+		t.Fatalf("dotnet group = %#v", groups[1])
+	}
+	// python matches 3 rows but the cap is 1; the first (CPU order) wins.
+	if !groups[2].Available || len(groups[2].Processes) != 1 || groups[2].Processes[0].PID != 1 {
+		t.Fatalf("python group = %#v", groups[2])
+	}
+}
+
+func TestParseJpsOutput(t *testing.T) {
+	input := "12345 app.Main\n" +
+		"67890\n" +
+		"notapid garbage\n" +
+		"99999 sun.tools.jps.Jps\n"
+	jvms := parseJpsOutput(input)
+	if len(jvms) != 3 {
+		t.Fatalf("parsed %d jvms, want 3: %#v", len(jvms), jvms)
+	}
+	if jvms[0].PID != 12345 || jvms[0].MainClass != "app.Main" {
+		t.Fatalf("first jvm parsed as %#v", jvms[0])
+	}
+	if jvms[1].PID != 67890 || jvms[1].MainClass != "" {
+		t.Fatalf("second jvm parsed as %#v", jvms[1])
+	}
+	if jvms[2].PID != 99999 || jvms[2].MainClass != "sun.tools.jps.Jps" {
+		t.Fatalf("third jvm parsed as %#v", jvms[2])
+	}
+}
+
+func TestParseJstatGcutilOutput(t *testing.T) {
+	output := "  S0     S1     E      O      M     CCS    YGC     YGCT    FGC    FGCT     GCT   \n" +
+		"  0.00  57.14  45.00  23.40  95.20  90.00  12      0.400   0      0.000    0.400\n"
+	oldPct, ygc, fgc, gct, err := parseJstatGcutilOutput(output)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if oldPct != 23.40 || ygc != 12 || fgc != 0 || gct != 0.400 {
+		t.Fatalf("parsed (%v, %d, %d, %v)", oldPct, ygc, fgc, gct)
+	}
+	if _, _, _, _, err := parseJstatGcutilOutput("garbage\n"); err == nil {
+		t.Fatal("garbage accepted")
+	}
+}
+
 func TestParseContainerLinesExtractsComposeProject(t *testing.T) {
 	input := `{"Id":"abc123","Names":["web"],"Image":"nginx:1.25","State":"running","Status":"Up 2 hours","Labels":"com.docker.compose.project=myapp,maintainer=me"}` + "\n" +
 		`{"ID":"def456","Names":["db"],"Image":"postgres:16","State":"exited","Status":"Exited (0) 3 hours ago","Labels":{"io.podman.compose.project":"stack","version":"1"}}` + "\n" +
