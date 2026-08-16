@@ -54,8 +54,14 @@ type EventbusConfig struct {
 	URL           string `mapstructure:"url"`
 	SubjectPrefix string `mapstructure:"subjectPrefix"`
 }
+// hostIDPath persists the stable machine identity the install flow writes
+// once. It survives binary updates and config rewrites (no sync script
+// touches it), so the cloud can link the host across daemon reinstalls.
+const hostIDPath = "/etc/maidcafe/host-id"
+
 type DaemonConfig struct {
 	ID                   string `mapstructure:"id"`
+	HostID               string `mapstructure:"hostId"`
 	Version              string `mapstructure:"version"`
 	Transport            string `mapstructure:"transport"`
 	Listen               string `mapstructure:"listen"`
@@ -232,6 +238,12 @@ func Load(configPath string) (*Config, error) {
 	}
 	if err := cfg.loadAlarmFragments(); err != nil {
 		return nil, err
+	}
+	// The stable host identity is written by the install flow, not derived
+	// from the config file; a missing file (hand-rolled installs) simply
+	// leaves the daemon unlinked in the cloud.
+	if raw, err := os.ReadFile(hostIDPath); err == nil {
+		cfg.Daemon.HostID = strings.TrimSpace(string(raw))
 	}
 	return &cfg, nil
 }

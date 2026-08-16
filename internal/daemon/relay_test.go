@@ -65,7 +65,7 @@ func TestWebhookRelayExecutesAndReportsThroughCloud(t *testing.T) {
 	}
 	body := []byte(`{"job":"incremental"}`)
 	enqueued, err := svc.EnqueueWebhook(
-		ctx, "account-a", daemon.ID, "backup", body, signedHeader("secret", body),
+		ctx, "account-a", daemon.ID, "backup", body, signedHeader("secret", body), "@alice", nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestWebhookRelayRejectsBadSignatureWithoutExecuting(t *testing.T) {
 	}
 	body := []byte("payload")
 	enqueued, err := svc.EnqueueWebhook(
-		ctx, "account-a", daemon.ID, "backup", body, signedHeader("wrong-secret", body),
+		ctx, "account-a", daemon.ID, "backup", body, signedHeader("wrong-secret", body), "@alice", nil,
 	)
 	if err != nil {
 		t.Fatal(err)

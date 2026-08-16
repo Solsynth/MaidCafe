@@ -12,10 +12,13 @@ type Daemon struct {
 	WorkspaceID string `gorm:"size:191;index;not null"`
 	Name        string `gorm:"size:191;not null"`
 	SecretHash  string `gorm:"size:255;not null" json:"-"`
-	Enabled     bool   `gorm:"not null;index"`
-	LastSeenAt  *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// HostID is the stable machine identity the daemon reports with its
+	// metrics; credential scopes can link to it instead of daemon ids.
+	HostID     string `gorm:"size:191;index"`
+	Enabled    bool   `gorm:"not null;index"`
+	LastSeenAt *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 type DaemonMetric struct {
@@ -78,6 +81,8 @@ type WebhookRequest struct {
 	Name        string `gorm:"size:128;not null"`
 	Body        []byte `gorm:"type:bytea;not null"`
 	Signature   string `gorm:"size:128;not null"`
+	// InvokedBy names the caller: a Solarpass handle or a credential label.
+	InvokedBy   string `gorm:"size:191"`
 	Status      string `gorm:"size:16;not null;index"`
 	LeasedAt    *time.Time
 	ResultCode  int
@@ -85,4 +90,19 @@ type WebhookRequest struct {
 	ResultError string `gorm:"size:512"`
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+// Credential is a user-level API credential for CI/CD: a labeled token
+// scoped to a subset of daemons, hosts and action names. The plain token is
+// shown once at creation; only its hash is stored.
+type Credential struct {
+	ID          string `gorm:"type:char(36);primaryKey"`
+	AccountID   string `gorm:"size:191;index;not null"`
+	Label       string `gorm:"size:128;not null"`
+	TokenHash   string `gorm:"size:255;not null;uniqueIndex" json:"-"`
+	DaemonIDs   string `gorm:"size:4096"` // comma-separated, empty = all
+	HostIDs     string `gorm:"size:4096"` // comma-separated, empty = all
+	ActionNames string `gorm:"size:4096"` // comma-separated, empty = all
+	CreatedAt   time.Time
+	LastUsedAt  *time.Time
 }

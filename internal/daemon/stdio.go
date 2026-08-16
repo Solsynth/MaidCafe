@@ -112,7 +112,7 @@ func (a *App) runStdio(ctx context.Context) error {
 					continue
 				}
 				go func(request stdioRequest, body []byte) {
-					result, requestErr := a.executor.RunAction(ctx, request.Name, body, "stdio")
+					result, requestErr := a.executor.RunAction(ctx, request.Name, body, "stdio", "stdio")
 					results <- stdioActionResult{request: request, result: result, err: requestErr}
 				}(request, body)
 			case "shutdown":

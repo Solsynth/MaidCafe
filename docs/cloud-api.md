@@ -46,12 +46,18 @@ error, never a grant.
   "id": "d0f2f0c2-...",
   "workspace_id": "5f1c...",
   "name": "managed-host-01",
+  "host_id": "9e4b...",
   "enabled": true,
   "last_seen_at": "2026-08-15T12:00:00Z",
   "created_at": "2026-08-15T10:00:00Z",
   "updated_at": "2026-08-15T12:00:00Z"
 }
 ```
+
+`host_id` is the stable machine identity the daemon install wrote once to
+`/etc/maidcafe/host-id`; it survives binary updates and config rewrites, so
+credential scopes and cross-reinstall accounting can key on the host rather
+than the daemon row. It is linked from the daemon's metric reports.
 
 Daemon registration additionally returns the one-time `secret`:
 
@@ -60,6 +66,7 @@ Daemon registration additionally returns the one-time `secret`:
   "id": "d0f2f0c2-...",
   "workspace_id": "5f1c...",
   "name": "managed-host-01",
+  "host_id": "",
   "enabled": true,
   "last_seen_at": null,
   "created_at": "2026-08-15T10:00:00Z",
@@ -139,6 +146,7 @@ alarm configuration or reaches back into the daemon.
   "name": "backup",
   "body": "eyJqb2IiOiJpbmNyZW1lbnRhbCJ9",
   "signature": "7f9a...",
+  "invoked_by": "@alice",
   "status": "pending",
   "result_code": 0,
   "result_body": "",
@@ -151,6 +159,29 @@ alarm configuration or reaches back into the daemon.
 `body` and `result_body` are base64-encoded. `status` is one of
 `pending` (queued), `leased` (a daemon polled it), or `done` (result
 stored). `result_*` fields are omitted until the request is `done`.
+`invoked_by` names the caller for the daemon's audit log: a Solarpass handle
+(`@alice`) or a credential label (CI/CD).
+
+### Credential
+
+```json
+{
+  "id": "77e1...",
+  "label": "ci-backup",
+  "daemon_ids": [],
+  "host_ids": ["9e4b..."],
+  "action_names": ["backup"],
+  "created_at": "2026-08-15T10:00:00Z",
+  "last_used_at": null
+}
+```
+
+User-level API credentials for CI/CD. Each credential restricts itself to a
+subset of daemons, hosts and action names — an empty list means unrestricted
+for that dimension; `host_ids` match the daemon's stable `host_id`, so a
+credential survives daemon re-registrations on the same machine. The plain
+token (`mk_...`) is returned once at creation and authenticates any user
+route in place of a Solarpass token; only its hash is stored.
 
 ## Endpoints
 
@@ -547,3 +578,46 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests/3f9
 4. Workspace members list daemons, metrics, and notifications, and invoke
    webhooks through the relay. Everything is scoped to the workspace
    the daemon belongs to.
+
+### Credentials (user routes)
+
+#### `POST /api/credentials`
+
+Create a labeled credential with optional scope lists. The plain token is
+returned once.
+
+```sh
+curl -X POST http://localhost:8080/api/credentials \
+  -H 'Authorization: Bearer <solar-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"label":"ci-backup","host_ids":["9e4b..."],"action_names":["backup"]}'
+```
+
+`201` returns the credential plus `token` (`mk_...`), which is never
+returned again. Store it in the CI/CD secret store.
+
+#### `GET /api/credentials`
+
+List the caller's credentials (tokens never included).
+
+#### `DELETE /api/credentials/:id`
+
+Revoke a credential. `204` on success; `404` for unknown ids. A revoked
+token stops authenticating immediately.
+
+#### Using a credential
+
+Any user route accepts the credential token as the Bearer: the token is
+resolved by hash and the credential's account is used, so scopes apply
+instead of a live workspace-membership check on invocation paths
+(`POST /api/daemons/:id/webhook-requests`).
+
+```sh
+curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests \
+  -H 'Authorization: Bearer mk_...' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"backup","body":"e30=","signature":""}'
+```
+
+Requests made with a credential record its label as `invoked_by`; Solarpass
+users record their `@handle`.

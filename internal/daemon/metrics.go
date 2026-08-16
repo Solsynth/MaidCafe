@@ -22,6 +22,7 @@ import (
 
 type MetricsPayload struct {
 	SentAt             time.Time `json:"sent_at"`
+	HostID             string    `json:"host_id,omitempty"`
 	UptimeSeconds      int64     `json:"uptime_seconds"`
 	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
 	CPUPercent         float64   `json:"cpu_percent"`
@@ -57,6 +58,7 @@ type MetricsHistoryQuery struct {
 
 type MetricsCollector struct {
 	executor   *WebhookExecutor
+	hostID     string
 	mu         sync.RWMutex
 	history    []MetricsPayload
 	storageDir string
@@ -77,6 +79,7 @@ func NewMetricsCollector(cfg config.DaemonConfig, executor *WebhookExecutor) (*M
 	}
 	collector := &MetricsCollector{
 		executor:   executor,
+		hostID:     strings.TrimSpace(cfg.HostID),
 		history:    make([]MetricsPayload, 0),
 		storageDir: storageDir,
 		retention:  time.Duration(retentionDays) * 24 * time.Hour,
@@ -291,6 +294,7 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 	}
 	return MetricsPayload{
 		SentAt:             time.Now().UTC(),
+		HostID:             m.hostID,
 		UptimeSeconds:      uptimeSeconds,
 		ProcessMemoryBytes: int64(stats.Alloc),
 		CPUPercent:         cpuPercent,

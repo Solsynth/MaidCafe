@@ -219,6 +219,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			c.Param("name"),
 			body,
 			"http",
+			c.GetHeader("X-MaidCafe-Invoked-By"),
 		)
 		if requestErr != nil {
 			c.JSON(

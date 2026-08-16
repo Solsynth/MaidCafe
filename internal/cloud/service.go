@@ -3,11 +3,14 @@ package cloud
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -165,6 +168,7 @@ type DaemonView struct {
 	ID          string     `json:"id"`
 	WorkspaceID string     `json:"workspace_id"`
 	Name        string     `json:"name"`
+	HostID      string     `json:"host_id"`
 	Enabled     bool       `json:"enabled"`
 	LastSeenAt  *time.Time `json:"last_seen_at"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -188,6 +192,7 @@ type NotificationView struct {
 }
 type MetricInput struct {
 	SentAt             time.Time `json:"sent_at"`
+	HostID             string    `json:"host_id,omitempty"`
 	UptimeSeconds      int64     `json:"uptime_seconds"`
 	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
 	CPUPercent         float64   `json:"cpu_percent"`
@@ -272,7 +277,7 @@ func generateSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 func viewDaemon(d database.Daemon) DaemonView {
-	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
+	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, HostID: d.HostID, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
 }
 func (s *Service) CreateDaemon(ctx context.Context, accountID, workspaceID, name string) (Credential, error) {
 	workspaceID = strings.TrimSpace(workspaceID)
@@ -501,7 +506,11 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	// Alarms are evaluated daemon-side: the daemon reports `daemon.alarm.*`
 	// notifications through CreateNotification when a threshold is exceeded,
 	// so the cloud only stores and forwards them.
-	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(map[string]any{"last_seen_at": now, "updated_at": now}).Error
+	updates := map[string]any{"last_seen_at": now, "updated_at": now}
+	if hostID := strings.TrimSpace(input.HostID); hostID != "" && hostID != d.HostID {
+		updates["host_id"] = hostID
+	}
+	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(updates).Error
 }
 func (s *Service) publishNotification(ctx context.Context, notification database.Notification) {
 	if s.publisher == nil {
@@ -676,9 +685,11 @@ const (
 
 type WebhookRequestView struct {
 	ID          string    `json:"id"`
+	DaemonID    string    `json:"daemon_id"`
 	Name        string    `json:"name"`
 	Body        string    `json:"body"`
 	Signature   string    `json:"signature"`
+	InvokedBy   string    `json:"invoked_by"`
 	Status      string    `json:"status"`
 	ResultCode  int       `json:"result_code,omitempty"`
 	ResultBody  string    `json:"result_body,omitempty"`
@@ -690,9 +701,11 @@ type WebhookRequestView struct {
 func viewWebhookRequest(row database.WebhookRequest) WebhookRequestView {
 	return WebhookRequestView{
 		ID:          row.ID,
+		DaemonID:    row.DaemonID,
 		Name:        row.Name,
 		Body:        base64.StdEncoding.EncodeToString(row.Body),
 		Signature:   row.Signature,
+		InvokedBy:   row.InvokedBy,
 		Status:      row.Status,
 		ResultCode:  row.ResultCode,
 		ResultBody:  base64.StdEncoding.EncodeToString(row.ResultBody),
@@ -706,9 +719,19 @@ func viewWebhookRequest(row database.WebhookRequest) WebhookRequestView {
 // signature is optional: webhooks carry their own secret that the daemon
 // verifies at execution, while actions have no secret (the daemon runs them
 // because the request arrived through its own cloud-authenticated poll), so
-// the cloud only stores what it is given.
-func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name string, body []byte, signature string) (WebhookRequestView, error) {
-	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+// the cloud only stores what it is given. [invokedBy] names the caller for
+// the daemon's audit log; [credential] (nil for Solarpass users) restricts
+// the invocation to the credential's scopes.
+func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name string, body []byte, signature string, invokedBy string, credential *database.Credential) (WebhookRequestView, error) {
+	if credential != nil {
+		if err := s.authorizeCredential(ctx, credential, daemonID, name); err != nil {
+			return WebhookRequestView{}, err
+		}
+		if err := s.db.WithContext(ctx).Model(&database.Credential{}).
+			Where("id = ?", credential.ID).Update("last_used_at", time.Now().UTC()).Error; err != nil {
+			return WebhookRequestView{}, err
+		}
+	} else if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
 		return WebhookRequestView{}, err
 	}
 	if strings.TrimSpace(name) == "" || len(body) == 0 || len(body) > webhookBodyLimit {
@@ -725,6 +748,7 @@ func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name 
 		Name:      strings.TrimSpace(name),
 		Body:      body,
 		Signature: strings.TrimSpace(signature),
+		InvokedBy: invokedBy,
 		Status:    webhookStatusPending,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -733,6 +757,159 @@ func (s *Service) EnqueueWebhook(ctx context.Context, accountID, daemonID, name 
 		return WebhookRequestView{}, err
 	}
 	return viewWebhookRequest(row), nil
+}
+
+// authorizeCredential enforces a credential's scopes: each non-empty scope
+// list (daemon ids, host ids, action names) is a constraint the request must
+// satisfy. An empty list means unrestricted for that dimension.
+func (s *Service) authorizeCredential(ctx context.Context, credential *database.Credential, daemonID, actionName string) error {
+	if scopes := splitCredentialScopes(credential.DaemonIDs); len(scopes) > 0 && !slices.Contains(scopes, daemonID) {
+		return ErrForbidden
+	}
+	if scopes := splitCredentialScopes(credential.HostIDs); len(scopes) > 0 {
+		var daemon database.Daemon
+		if err := s.db.WithContext(ctx).Where("id = ?", daemonID).First(&daemon).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !slices.Contains(scopes, daemon.HostID) {
+			return ErrForbidden
+		}
+	}
+	if scopes := splitCredentialScopes(credential.ActionNames); len(scopes) > 0 && !slices.Contains(scopes, actionName) {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// CredentialTokenPrefix marks user-level API credential tokens so the auth
+// middleware can route them before the Solarpass exchange.
+const CredentialTokenPrefix = "mk_"
+
+type CredentialView struct {
+	ID          string     `json:"id"`
+	Label       string     `json:"label"`
+	DaemonIDs   []string   `json:"daemon_ids"`
+	HostIDs     []string   `json:"host_ids"`
+	ActionNames []string   `json:"action_names"`
+	CreatedAt   time.Time  `json:"created_at"`
+	LastUsedAt  *time.Time `json:"last_used_at"`
+}
+
+// CredentialToken is a created credential plus the one-time plain token.
+type CredentialToken struct {
+	CredentialView
+	Token string `json:"token"`
+}
+
+func splitCredentialScopes(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func joinCredentialScopes(parts []string) string {
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" || len(value) > 191 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return strings.Join(out, ",")
+}
+
+func hashCredentialToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func viewCredential(row database.Credential) CredentialView {
+	return CredentialView{
+		ID:          row.ID,
+		Label:       row.Label,
+		DaemonIDs:   splitCredentialScopes(row.DaemonIDs),
+		HostIDs:     splitCredentialScopes(row.HostIDs),
+		ActionNames: splitCredentialScopes(row.ActionNames),
+		CreatedAt:   row.CreatedAt,
+		LastUsedAt:  row.LastUsedAt,
+	}
+}
+
+func (s *Service) CreateCredential(ctx context.Context, accountID, label string, daemonIDs, hostIDs, actionNames []string) (CredentialToken, error) {
+	label = strings.TrimSpace(label)
+	if label == "" || len(label) > 128 || !utf8.ValidString(label) {
+		return CredentialToken{}, fmt.Errorf("label is required and must be at most 128 bytes")
+	}
+	token, err := generateSecret()
+	if err != nil {
+		return CredentialToken{}, err
+	}
+	token = CredentialTokenPrefix + token
+	row := database.Credential{
+		ID:          uuid.NewString(),
+		AccountID:   accountID,
+		Label:       label,
+		TokenHash:   hashCredentialToken(token),
+		DaemonIDs:   joinCredentialScopes(daemonIDs),
+		HostIDs:     joinCredentialScopes(hostIDs),
+		ActionNames: joinCredentialScopes(actionNames),
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
+		return CredentialToken{}, err
+	}
+	return CredentialToken{CredentialView: viewCredential(row), Token: token}, nil
+}
+
+func (s *Service) ListCredentials(ctx context.Context, accountID string) ([]CredentialView, error) {
+	var rows []database.Credential
+	if err := s.db.WithContext(ctx).Where("account_id = ?", accountID).Order("created_at desc").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]CredentialView, len(rows))
+	for i, row := range rows {
+		out[i] = viewCredential(row)
+	}
+	return out, nil
+}
+
+func (s *Service) DeleteCredential(ctx context.Context, accountID, id string) error {
+	result := s.db.WithContext(ctx).Where("id = ? AND account_id = ?", id, accountID).Delete(&database.Credential{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CredentialByToken resolves a credential token (caller already checked the
+// prefix) by its hash. Missing or revoked credentials surface as
+// ErrUnauthorized.
+func (s *Service) CredentialByToken(ctx context.Context, token string) (*database.Credential, error) {
+	var row database.Credential
+	if err := s.db.WithContext(ctx).Where("token_hash = ?", hashCredentialToken(token)).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUnauthorized
+		}
+		return nil, err
+	}
+	return &row, nil
 }
 
 // ListPendingWebhooks leases and returns up to [limit] pending webhook

@@ -198,7 +198,7 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 	if !signatureValid(hook.Secret, body, r.Header.Get("X-MaidCafe-Signature")) {
 		return executionResponse{}, 0, &requestError{status: http.StatusUnauthorized, message: "unauthorized"}
 	}
-	response, status := e.execute(ctx, hook, body, "http")
+	response, status := e.execute(ctx, hook, body, "http", r.Header.Get("X-MaidCafe-Invoked-By"))
 	if status == http.StatusTooManyRequests {
 		return executionResponse{}, 0, &requestError{status: status, message: "too many concurrent runs"}
 	}
@@ -207,14 +207,15 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 
 // ExecuteWebhook verifies the HMAC signature over [body] and runs the named
 // webhook. Used by the MaidKit cloud relay, where the request is delivered by
-// polling instead of an HTTP handler. [source] is recorded in the audit log.
+// polling instead of an HTTP handler. [source] is recorded in the audit log
+// and [invokedBy] names the cloud caller (user handle or credential label).
 //
 // Hooks without a secret (actions, which carry none by design) skip the
 // signature check: the relay only delivers requests the daemon itself pulled
 // with its cloud secret, so the cloud's workspace-member authorization is the
 // credential. The local HTTP endpoint keeps requiring a signature for every
 // hook.
-func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string, source string) (executionResponse, int) {
+func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string, source string, invokedBy string) (executionResponse, int) {
 	hook, exists := e.hooks[name]
 	if !exists || !hook.Enabled {
 		return executionResponse{}, http.StatusNotFound
@@ -222,7 +223,7 @@ func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature str
 	if hook.Secret != "" && !signatureValid(hook.Secret, body, signature) {
 		return executionResponse{}, http.StatusUnauthorized
 	}
-	return e.execute(context.Background(), hook, body, source)
+	return e.execute(context.Background(), hook, body, source, invokedBy)
 }
 
 // buildRunCommand returns the exec.Cmd for a configured hook, honoring the
@@ -355,12 +356,14 @@ func auditErrorTail(response executionResponse) string {
 // execute runs a hook's command with [body] on stdin under the concurrency
 // slot and script timeout, updating counters, completion notifications and
 // the audit log. [source] records how the run was triggered (http, stdio or
-// relay); concurrency rejections are not logged — they are not executions.
+// relay) and [invokedBy] who asked for it; concurrency rejections are not
+// logged — they are not executions.
 func (e *WebhookExecutor) execute(
 	ctx context.Context,
 	hook config.WebhookConfig,
 	body []byte,
 	source string,
+	invokedBy string,
 ) (response executionResponse, status int) {
 	select {
 	case e.slots <- struct{}{}:
@@ -378,9 +381,12 @@ func (e *WebhookExecutor) execute(
 			Name:        hook.Name,
 			DisplayName: strings.TrimSpace(hook.DisplayName),
 			Source:      source,
+			InvokedBy:   invokedBy,
 			OK:          response.OK,
 			ExitCode:    response.ExitCode,
 			DurationMS:  time.Since(started).Milliseconds(),
+			Stdout:      response.Stdout,
+			Stderr:      response.Stderr,
 			Error:       auditErrorTail(response),
 		})
 	}()
@@ -466,6 +472,7 @@ func (e *WebhookExecutor) RunAction(
 	name string,
 	body []byte,
 	source string,
+	invokedBy string,
 ) (executionResponse, *requestError) {
 	if int64(len(body)) > e.maxBodyBytes {
 		return executionResponse{}, &requestError{
@@ -480,7 +487,7 @@ func (e *WebhookExecutor) RunAction(
 			message: "not found",
 		}
 	}
-	response, status := e.execute(ctx, hook, body, source)
+	response, status := e.execute(ctx, hook, body, source, invokedBy)
 	if status == http.StatusTooManyRequests {
 		return executionResponse{}, &requestError{
 			status:  http.StatusTooManyRequests,

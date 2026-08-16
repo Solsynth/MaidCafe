@@ -19,6 +19,8 @@ type relayWebhookRequest struct {
 	Name      string `json:"name"`
 	Body      string `json:"body"` // base64
 	Signature string `json:"signature"`
+	// InvokedBy names the cloud caller (user handle or credential label).
+	InvokedBy string `json:"invoked_by"`
 }
 
 type relayPendingResponse struct {
@@ -83,7 +85,7 @@ func (r *WebhookRelay) process(ctx context.Context, request relayWebhookRequest)
 		r.report(ctx, request.ID, relayResultPayload{Error: "invalid request body encoding"})
 		return
 	}
-	response, status := r.executor.ExecuteWebhook(request.Name, body, request.Signature, "relay")
+	response, status := r.executor.ExecuteWebhook(request.Name, body, request.Signature, "relay", request.InvokedBy)
 	result := relayResultPayload{Code: status}
 	if response.OK {
 		result.Body = base64.StdEncoding.EncodeToString([]byte(response.Stdout))

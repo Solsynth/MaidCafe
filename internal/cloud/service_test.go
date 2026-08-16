@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"strings"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -257,27 +258,27 @@ func TestWebhookRelayLifecycle(t *testing.T) {
 	}
 	body := []byte("backup now")
 	signature := "abc123"
-	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", body, signature)
+	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", body, signature, "@alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if enqueued.Status != "pending" || enqueued.Name != "backup" || enqueued.Body != base64.StdEncoding.EncodeToString(body) {
 		t.Fatalf("enqueued view = %#v", enqueued)
 	}
-	if _, err := svc.EnqueueWebhook(ctx, "account-b", created.ID, "backup", body, signature); err != ErrForbidden {
+	if _, err := svc.EnqueueWebhook(ctx, "account-b", created.ID, "backup", body, signature, "@bob", nil); err != ErrForbidden {
 		t.Fatalf("account isolation failed: %v", err)
 	}
-	if _, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "", body, signature); err == nil {
+	if _, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "", body, signature, "@alice", nil); err == nil {
 		t.Fatalf("empty name accepted")
 	}
 	// Actions carry no secret, so invocation goes through the relay without
 	// a signature; the daemon verifies webhooks at execution.
-	actionRequest, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "cleanup", []byte("{}"), "")
+	actionRequest, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "cleanup", []byte("{}"), "", "cleanup-bot", nil)
 	if err != nil {
 		t.Fatalf("signature-less action enqueue rejected: %v", err)
 	}
-	if actionRequest.Signature != "" {
-		t.Fatalf("signature stored for action: %#v", actionRequest)
+	if actionRequest.Signature != "" || actionRequest.InvokedBy != "cleanup-bot" {
+		t.Fatalf("action request metadata: %#v", actionRequest)
 	}
 
 	pending, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
@@ -322,7 +323,7 @@ func TestWebhookRelayReclaimsExpiredLeases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", []byte("x"), "sig")
+	enqueued, err := svc.EnqueueWebhook(ctx, "account-a", created.ID, "backup", []byte("x"), "sig", "@alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,5 +407,72 @@ func TestCreateDaemonRequiresWorkspace(t *testing.T) {
 	ctx := context.Background()
 	if _, err := svc.CreateDaemon(ctx, "account-a", "", "host"); err == nil {
 		t.Fatal("daemon created without workspace_id")
+	}
+}
+
+func TestCredentialLifecycleAndScopes(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A host-linked credential for CI/CD: only the backup action on this
+	// host's daemons.
+	created, err := svc.CreateCredential(ctx, "account-a", "ci-backup", nil, []string{"host-42"}, []string{"backup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Token == "" || !strings.HasPrefix(created.Token, CredentialTokenPrefix) {
+		t.Fatalf("credential token missing or unprefixed: %#v", created)
+	}
+	resolved, err := svc.CredentialByToken(ctx, created.Token)
+	if err != nil {
+		t.Fatalf("credential lookup: %v", err)
+	}
+	if resolved.ID != created.ID || resolved.Label != "ci-backup" {
+		t.Fatalf("resolved credential mismatch: %+v", resolved)
+	}
+	if len(created.DaemonIDs) != 0 || len(created.HostIDs) != 1 || created.HostIDs[0] != "host-42" ||
+		len(created.ActionNames) != 1 || created.ActionNames[0] != "backup" {
+		t.Fatalf("credential scopes not stored: %#v", created)
+	}
+
+	// The daemon must carry the host id for the host scope to match.
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{SentAt: time.Now(), HostID: "host-42"}); err != nil {
+		t.Fatal(err)
+	}
+	// Allowed: backup on a host-42 daemon.
+	if _, err := svc.EnqueueWebhook(ctx, "account-a", daemon.ID, "backup", []byte("{}"), "", "ci-backup", resolved); err != nil {
+		t.Fatalf("in-scope action rejected: %v", err)
+	}
+	// Blocked: different action.
+	if _, err := svc.EnqueueWebhook(ctx, "account-a", daemon.ID, "cleanup", []byte("{}"), "", "ci-backup", resolved); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("out-of-scope action expected forbidden, got %v", err)
+	}
+	// Blocked: daemon on a different host.
+	other, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.EnqueueWebhook(ctx, "account-a", other.ID, "backup", []byte("{}"), "", "ci-backup", resolved); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("out-of-scope daemon expected forbidden, got %v", err)
+	}
+
+	// Listing hides the token; deletion revokes it.
+	list, err := svc.ListCredentials(ctx, "account-a")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("credential list: %v %#v", err, list)
+	}
+	if err := svc.DeleteCredential(ctx, "account-a", created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CredentialByToken(ctx, created.Token); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("revoked credential expected unauthorized, got %v", err)
+	}
+	// Other accounts cannot delete it.
+	if err := svc.DeleteCredential(ctx, "account-b", created.ID); err == nil {
+		t.Fatalf("cross-account credential delete accepted")
 	}
 }

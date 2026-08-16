@@ -140,7 +140,7 @@ func TestExecuteRecordsAuditEntries(t *testing.T) {
 	}
 	executor := NewWebhookExecutor(cfg)
 	executor.SetAuditLogger(NewAuditLogger(path, slog.Default()))
-	result, requestErr := executor.RunAction(t.Context(), "deploy", []byte(`{}`), "stdio")
+	result, requestErr := executor.RunAction(t.Context(), "deploy", []byte(`{}`), "stdio", "stdio")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}

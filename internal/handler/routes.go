@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
+	"src.solsynth.dev/solsynth/maidcafe/internal/database"
 	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
 )
 
@@ -37,6 +38,9 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
 	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
 	user.GET("/daemons/:id/actions", listActions(svc))
+	user.POST("/credentials", createCredential(svc))
+	user.GET("/credentials", listCredentials(svc))
+	user.DELETE("/credentials/:id", deleteCredential(svc))
 	daemon := r.Group("/api/daemons/:id")
 	daemon.POST("/metrics", ingestMetric(svc))
 	daemon.POST("/actions", syncActions(svc))
@@ -57,6 +61,78 @@ func requireUser() gin.HandlerFunc {
 func accountID(c *gin.Context) string {
 	result, _, _ := dyauth.GetAuth(c)
 	return result.Account.GetId()
+}
+
+func userHandle(c *gin.Context) string {
+	result, _, _ := dyauth.GetAuth(c)
+	if result == nil || result.Account == nil {
+		return ""
+	}
+	if nick := result.Account.GetNick(); nick != "" {
+		return nick
+	}
+	if name := result.Account.GetName(); name != "" {
+		return name
+	}
+	return result.Account.GetId()
+}
+
+// credentialContext stores the authenticated API credential on the request
+// so handlers can enforce its scopes; absent means a Solarpass user.
+const credentialContextKey = "maidcafe_credential"
+
+func WithCredential(c *gin.Context, credential *database.Credential) {
+	c.Set(credentialContextKey, credential)
+}
+
+func credentialFrom(c *gin.Context) *database.Credential {
+	if raw, ok := c.Get(credentialContextKey); ok {
+		if credential, ok := raw.(*database.Credential); ok {
+			return credential
+		}
+	}
+	return nil
+}
+
+func createCredential(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var in struct {
+			Label       string   `json:"label"`
+			DaemonIDs   []string `json:"daemon_ids"`
+			HostIDs     []string `json:"host_ids"`
+			ActionNames []string `json:"action_names"`
+		}
+		if !parseJSON(c, &in) {
+			return
+		}
+		out, err := s.CreateCredential(c, accountID(c), in.Label, in.DaemonIDs, in.HostIDs, in.ActionNames)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, out)
+	}
+}
+
+func listCredentials(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.ListCredentials(c, accountID(c))
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+
+func deleteCredential(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.DeleteCredential(c, accountID(c), c.Param("id")); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
 }
 func parseJSON(c *gin.Context, dst any) bool {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
@@ -361,7 +437,12 @@ func enqueueWebhook(s *cloud.Service) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 			return
 		}
-		out, err := s.EnqueueWebhook(c, accountID(c), c.Param("id"), in.Name, body, in.Signature)
+		credential := credentialFrom(c)
+		invokedBy := "@" + userHandle(c)
+		if credential != nil {
+			invokedBy = credential.Label
+		}
+		out, err := s.EnqueueWebhook(c, accountID(c), c.Param("id"), in.Name, body, in.Signature, invokedBy, credential)
 		if err != nil {
 			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
 				serviceStatus(c, err)

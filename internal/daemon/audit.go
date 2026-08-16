@@ -23,10 +23,17 @@ type auditEntry struct {
 	Name        string    `json:"name"`
 	DisplayName string    `json:"display_name,omitempty"`
 	Source      string    `json:"source"`
-	OK          bool      `json:"ok"`
-	ExitCode    int       `json:"exit_code"`
-	DurationMS  int64     `json:"duration_ms"`
-	Error       string    `json:"error,omitempty"`
+	// InvokedBy names the caller: a Solarpass handle, a labeled cloud
+	// credential, or the transport ("stdio") when no identity is attached.
+	InvokedBy  string `json:"invoked_by,omitempty"`
+	OK         bool   `json:"ok"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMS int64  `json:"duration_ms"`
+	// Stdout and Stderr carry the captured run output (bounded by the
+	// executor's per-run buffer), so a run's full log is inspectable later.
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // AuditLogger durably records every hook execution as JSONL. Logging is

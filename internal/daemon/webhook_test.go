@@ -287,7 +287,7 @@ func TestExecuteHonorsCwdAndEnv(t *testing.T) {
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
-	result, requestErr := executor.RunAction(context.Background(), "where", nil, "test")
+	result, requestErr := executor.RunAction(context.Background(), "where", nil, "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -388,7 +388,7 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
-	result, requestErr := executor.RunAction(context.Background(), "as-user", nil, "test")
+	result, requestErr := executor.RunAction(context.Background(), "as-user", nil, "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -454,7 +454,7 @@ func TestExecuteUsesPerHookTimeout(t *testing.T) {
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
-	result, requestErr := executor.RunAction(context.Background(), "slow-but-allowed", nil, "test")
+	result, requestErr := executor.RunAction(context.Background(), "slow-but-allowed", nil, "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -465,7 +465,7 @@ func TestExecuteUsesPerHookTimeout(t *testing.T) {
 	// Without the override the daemon-wide timeout still applies.
 	cfg.Actions[0].Timeout = 0
 	executor = NewWebhookExecutor(cfg)
-	result, requestErr = executor.RunAction(context.Background(), "slow-but-allowed", nil, "test")
+	result, requestErr = executor.RunAction(context.Background(), "slow-but-allowed", nil, "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -494,6 +494,7 @@ func TestScriptActionSubstitutesTemplate(t *testing.T) {
 		"greet",
 		[]byte(`{"NAME":"world"}`),
 		"test",
+		"test",
 	)
 	if requestErr != nil {
 		t.Fatal(requestErr)
@@ -503,7 +504,7 @@ func TestScriptActionSubstitutesTemplate(t *testing.T) {
 	}
 
 	// Missing values fail with a clear message and no script exit code.
-	result, requestErr = executor.RunAction(context.Background(), "greet", []byte(`{}`), "test")
+	result, requestErr = executor.RunAction(context.Background(), "greet", []byte(`{}`), "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
 	}
@@ -525,21 +526,21 @@ func TestRelayExecutesSecretlessActions(t *testing.T) {
 	// Actions carry no secret by design: the relay runs them without a
 	// signature because the request came through the daemon's own
 	// cloud-authenticated poll.
-	resp, status := executor.ExecuteWebhook("cleanup", []byte("{}"), "", "relay")
+	resp, status := executor.ExecuteWebhook("cleanup", []byte("{}"), "", "relay", "ci-bot")
 	if status != http.StatusOK || !resp.OK {
 		t.Fatalf("secretless action rejected: status %d ok %v err %q", status, resp.OK, resp.Stderr)
 	}
 	// Webhooks still require their signature on the relay path.
-	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), "", "relay")
+	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), "", "relay", "@alice")
 	if status != http.StatusUnauthorized {
 		t.Fatalf("webhook without signature expected unauthorized, got %d", status)
 	}
-	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), signedHeader("secret", []byte("{}")), "relay")
+	resp, status = executor.ExecuteWebhook("hook", []byte("{}"), signedHeader("secret", []byte("{}")), "relay", "@alice")
 	if status != http.StatusOK {
 		t.Fatalf("signed webhook relay rejected: %d", status)
 	}
 	// Unknown names stay 404.
-	resp, status = executor.ExecuteWebhook("missing", []byte("{}"), "", "relay")
+	resp, status = executor.ExecuteWebhook("missing", []byte("{}"), "", "relay", "")
 	if status != http.StatusNotFound {
 		t.Fatalf("unknown action expected 404, got %d", status)
 	}
