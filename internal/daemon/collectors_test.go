@@ -177,6 +177,55 @@ func TestParseImageLinesEmptyReturnsEmptySlice(t *testing.T) {
 	}
 }
 
+// TestIsPodmanDockerShim pins the docker-alias detection: distro
+// podman-docker shims answer `docker --version` with podman's version
+// string, while a real docker reports its own.
+func TestIsPodmanDockerShim(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	ctx := context.Background()
+
+	shim := mk("docker", `printf '%s\n' 'podman version 4.9.0'`)
+	if !isPodmanDockerShim(ctx, shim) {
+		t.Fatal("podman shim not recognized")
+	}
+	real := mk("docker", `printf '%s\n' 'Docker version 26.1.3'`)
+	if isPodmanDockerShim(ctx, real) {
+		t.Fatal("real docker misdetected as podman shim")
+	}
+}
+
+// TestProbeContainerRuntimesSkipsPodmanDockerShim pins the double-count
+// guard: with real podman present, a podman `docker` shim is dropped from
+// the probed runtime set so containers/images are listed once.
+func TestProbeContainerRuntimesSkipsPodmanDockerShim(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	mk("podman", `exit 0`)
+	mk("docker", `printf '%s\n' 'podman version 4.9.0'`)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	paths := probeContainerRuntimes(context.Background())
+	if _, ok := paths["podman"]; !ok {
+		t.Fatal("podman not probed")
+	}
+	if _, ok := paths["docker"]; ok {
+		t.Fatal("podman docker shim reported as a separate docker runtime")
+	}
+}
+
 // TestRunRuntimeListElevatedFallback pins the root-visibility retry: an
 // empty direct listing is retried through `sudo -n` so containers/images
 // owned by root stay visible to a non-root daemon with passwordless sudo,

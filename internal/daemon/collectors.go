@@ -238,16 +238,30 @@ func (c *ContainersCollector) marshal() ([]byte, error) {
 	return json.Marshal(containersPayload{Runtimes: []containersRuntimePayload{}})
 }
 
+// isPodmanDockerShim reports whether the docker binary at path is really
+// podman: distro podman-docker shims answer `--version` with podman's own
+// version string, while a real docker reports "Docker version ...".
+func isPodmanDockerShim(ctx context.Context, path string) bool {
+	out, err := runCommand(ctx, path, "--version")
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "podman")
+}
+
 // probeContainerRuntimes resolves the available container runtimes, podman
 // preferred. `command -v` can miss binaries outside the systemd service PATH
 // (e.g. /opt/homebrew/bin), so known install locations are checked as well;
-// the resolved absolute path is what the collector execs.
+// the resolved absolute path is what the collector execs. A docker binary
+// that is really podman is dropped while the real podman is present, so the
+// same rootful containers and images are never reported twice.
 func probeContainerRuntimes(ctx context.Context) map[string]string {
 	paths := make(map[string]string)
 	for _, candidate := range []string{"podman", "docker"} {
 		if resolved := resolveRuntimeBinary(ctx, candidate); resolved != "" {
 			paths[candidate] = resolved
 		}
+	}
+	if dockerPath, podmanPath := paths["docker"], paths["podman"]; dockerPath != "" &&
+		podmanPath != "" && isPodmanDockerShim(ctx, dockerPath) {
+		delete(paths, "docker")
 	}
 	return paths
 }
