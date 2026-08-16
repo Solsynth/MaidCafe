@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +31,20 @@ var streamEventTypes = []string{"metric", "containers", "images", "processes", "
 type Subscriber struct {
 	hub   *StreamHub
 	Types []string
-	C     <-chan []byte
-	ch    chan []byte
+	// ProcessesLimit caps how many processes this subscriber receives on
+	// `processes` frames. 0 means the complete table (no cap).
+	ProcessesLimit int
+	C              <-chan []byte
+	ch             chan []byte
+}
+
+// SubscribeOption tweaks a new subscriber.
+type SubscribeOption func(*Subscriber)
+
+// WithProcessesLimit caps the subscriber's `processes` frames at limit rows.
+// 0 (the default) delivers the complete process table.
+func WithProcessesLimit(limit int) SubscribeOption {
+	return func(s *Subscriber) { s.ProcessesLimit = limit }
 }
 
 // StreamHub fans pre-marshaled event payloads out to per-type subscribers.
@@ -54,7 +67,7 @@ func NewStreamHub() *StreamHub {
 // Subscribe registers a subscriber for the given event types. An empty slice
 // subscribes to nothing; callers that want "all events" pass the full list.
 // The returned handle owns a buffered channel closed by Unsubscribe.
-func (h *StreamHub) Subscribe(types []string) *Subscriber {
+func (h *StreamHub) Subscribe(types []string, opts ...SubscribeOption) *Subscriber {
 	unique := make([]string, 0, len(types))
 	seen := make(map[string]struct{}, len(types))
 	for _, raw := range types {
@@ -72,6 +85,9 @@ func (h *StreamHub) Subscribe(types []string) *Subscriber {
 		hub:   h,
 		Types: unique,
 		ch:    make(chan []byte, subscriberBufferSize),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	s.C = s.ch
 	h.mu.Lock()
@@ -117,22 +133,81 @@ func (h *StreamHub) Unsubscribe(s *Subscriber) {
 // subscribers (marshal once, fan out). A full subscriber buffer drops its
 // oldest frame; the broadcaster never blocks.
 func (h *StreamHub) Broadcast(event string, data []byte) {
-	frame := []byte("event: " + event + "\ndata: " + string(data) + "\n\n")
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.broadcastLocked(event, data)
+}
+
+// BroadcastProcesses fans a process snapshot out to `processes` subscribers,
+// trimming each to its own limit (0 = all). The full table is collected once;
+// a capped subscriber only pays for the rows it receives. Frames are shared
+// when every subscriber wants the same slice, and re-marshaled per subscriber
+// otherwise, so per-subscriber limits never block the broadcaster.
+func (h *StreamHub) BroadcastProcesses(entries []processEntry) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	bucket := h.subs["processes"]
+	if len(bucket) == 0 {
+		return
+	}
+	// Common cap? Slice once and share one frame (0 = all).
+	common := -1
+	shared := true
+	for s := range bucket {
+		if common == -1 {
+			common = s.ProcessesLimit
+			continue
+		}
+		if s.ProcessesLimit != common {
+			shared = false
+			break
+		}
+	}
+	if shared {
+		limited := entries
+		if common > 0 && len(entries) > common {
+			limited = entries[:common]
+		}
+		data, err := json.Marshal(processesPayload{Processes: limited})
+		if err != nil {
+			return
+		}
+		h.broadcastLocked("processes", data)
+		return
+	}
+	for s := range bucket {
+		limited := entries
+		if s.ProcessesLimit > 0 && len(entries) > s.ProcessesLimit {
+			limited = entries[:s.ProcessesLimit]
+		}
+		data, err := json.Marshal(processesPayload{Processes: limited})
+		if err != nil {
+			continue
+		}
+		h.pushLocked(s, []byte("event: processes\ndata: "+string(data)+"\n\n"))
+	}
+}
+
+func (h *StreamHub) broadcastLocked(event string, data []byte) {
+	frame := []byte("event: " + event + "\ndata: " + string(data) + "\n\n")
 	for s := range h.subs[event] {
+		h.pushLocked(s, frame)
+	}
+}
+
+// pushLocked queues a frame on a subscriber, dropping the oldest queued frame
+// when the buffer is full so a slow client never blocks the broadcaster.
+func (h *StreamHub) pushLocked(s *Subscriber, frame []byte) {
+	select {
+	case s.ch <- frame:
+	default:
+		select {
+		case <-s.ch:
+		default:
+		}
 		select {
 		case s.ch <- frame:
 		default:
-			// Slow client: drop the oldest queued frame, then push the new one.
-			select {
-			case <-s.ch:
-			default:
-			}
-			select {
-			case s.ch <- frame:
-			default:
-			}
 		}
 	}
 }
@@ -181,6 +256,27 @@ func parseEventsParam(raw string) ([]string, error) {
 	return types, nil
 }
 
+// maxProcessesLimit is the largest per-request process cap accepted on
+// GET /api/v1/processes and the stream's processesLimit override.
+const maxProcessesLimit = 10000
+
+// parseProcessesLimit parses a `limit`/`processesLimit` query value. An empty
+// value falls back to defaultLimit; 0 requests the complete process table;
+// anything else must be within 1..maxProcessesLimit.
+func parseProcessesLimit(raw string, defaultLimit int) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return defaultLimit, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("limit must be an integer")
+	}
+	if n < 0 || n > maxProcessesLimit {
+		return 0, fmt.Errorf("limit must be 0 (all) or between 1 and %d", maxProcessesLimit)
+	}
+	return n, nil
+}
+
 // handleStream serves GET /api/v1/stream. It clears the server-level write
 // deadline (the 10s WriteTimeout would otherwise kill the stream), sends the
 // hello frame first, then fans subscribed frames out with a 15s heartbeat.
@@ -192,6 +288,11 @@ func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
 	}
 	if len(types) == 0 {
 		types = append([]string(nil), streamEventTypes...)
+	}
+	processesLimit, err := parseProcessesLimit(c.Query("processesLimit"), cfg.ProcessesLimit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+		return
 	}
 	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -207,7 +308,7 @@ func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
 	w.WriteHeader(http.StatusOK)
 	w.Flush()
 
-	sub := hub.Subscribe(types)
+	sub := hub.Subscribe(types, WithProcessesLimit(processesLimit))
 	defer hub.Unsubscribe(sub)
 
 	hello := gin.H{

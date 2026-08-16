@@ -401,6 +401,38 @@ func TestSSEStreamHelloAndMetricFrames(t *testing.T) {
 		t.Fatalf("stream with unknown event status = %d", badResponse.StatusCode)
 	}
 
+	// Invalid processesLimit values are rejected with 400.
+	badLimit, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/stream?processesLimit=10001", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badLimit.Header.Set("Authorization", "Bearer metrics-secret")
+	badLimitResponse, err := http.DefaultClient.Do(badLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badLimitResponse.Body.Close()
+	if badLimitResponse.StatusCode != http.StatusBadRequest {
+		t.Fatalf("stream with oversized processesLimit status = %d", badLimitResponse.StatusCode)
+	}
+	// A valid processesLimit is accepted (the stream stays open until closed,
+	// so close it right away to keep the test from holding a live connection
+	// when Shutdown runs).
+	limited, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/stream?processesLimit=0&events=metric", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limited.Header.Set("Authorization", "Bearer metrics-secret")
+	limitedResponse, err := http.DefaultClient.Do(limited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limitedResponse.StatusCode != http.StatusOK {
+		limitedResponse.Body.Close()
+		t.Fatalf("stream with processesLimit=0 status = %d", limitedResponse.StatusCode)
+	}
+	limitedResponse.Body.Close()
+
 	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/stream?events=metric", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -555,6 +587,114 @@ func TestSnapshotEndpointsReturnPayloadsAndRequireAuth(t *testing.T) {
 			if _, ok := payload["watched"]; !ok {
 				t.Fatalf("runtimes payload missing watched: %#v", payload)
 			}
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("app.Run returned: %v", err)
+	}
+}
+
+func TestProcessesEndpointLimitParam(t *testing.T) {
+	cfg := config.DaemonConfig{
+		ID:                "processes-limit-host",
+		Version:           "v9.9.9",
+		Transport:         "http",
+		Listen:            "127.0.0.1:0",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Second,
+		Runtimes:          []string{"java"},
+		ProcessesLimit:    50,
+		RequestTimeout:    5 * time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+	}
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- app.Run(ctx) }()
+
+	baseURL := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for baseURL == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon did not start listening")
+		}
+		if addr := app.ListenAddr(); addr != "" {
+			baseURL = "http://" + addr
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Processes is a real ps on the host, so the host may have fewer than the
+	// cap; assertions are upper/lower bounds, never exact counts.
+	authorized := func(query string) []any {
+		t.Helper()
+		url := baseURL + "/api/v1/processes"
+		if query != "" {
+			url += "?" + query
+		}
+		request, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer metrics-secret")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", url, response.StatusCode, body)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("%s body %q: %v", url, body, err)
+		}
+		list, _ := payload["processes"].([]any)
+		return list
+	}
+
+	// No param: bounded by the daemon's configured cap.
+	defaultList := authorized("")
+	if len(defaultList) > 50 {
+		t.Fatalf("default processes list has %d rows, want at most 50", len(defaultList))
+	}
+	// limit=0: the complete table, at least as many rows as the default.
+	allList := authorized("limit=0")
+	if len(allList) < len(defaultList) {
+		t.Fatalf("limit=0 returned %d rows, fewer than the default %d", len(allList), len(defaultList))
+	}
+	// Positive limit: never exceeds the requested cap.
+	if cappedList := authorized("limit=3"); len(cappedList) > 3 {
+		t.Fatalf("limit=3 returned %d rows, want at most 3", len(cappedList))
+	}
+	// Invalid values are rejected with 400.
+	for _, bad := range []string{"limit=abc", "limit=-1", "limit=10001"} {
+		request, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/processes?"+bad, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer metrics-secret")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", bad, response.StatusCode)
 		}
 	}
 

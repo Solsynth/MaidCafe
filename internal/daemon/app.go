@@ -194,7 +194,20 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
 	})
 	router.GET("/api/v1/processes", authorizeMetrics, func(c *gin.Context) {
-		data, err := app.processes.collect(c.Request.Context())
+		// Per-request cap: absent keeps the daemon's configured
+		// processesLimit; 0 requests the complete process table; a positive
+		// value keeps the top N CPU consumers.
+		limit, err := parseProcessesLimit(c.Query("limit"), cfg.ProcessesLimit)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		entries, err := app.processes.collectEntries(c.Request.Context(), limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		data, err := json.Marshal(processesPayload{Processes: entries})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
 			return
@@ -458,7 +471,7 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	})
 	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, a.containers.collect)
 	a.runStreamCollector(ctx, "images", a.cfg.ImagesInterval, a.images.collect)
-	a.runStreamCollector(ctx, "processes", a.cfg.ProcessesInterval, a.processes.collect)
+	a.runProcessesStreamCollector(ctx, a.cfg.ProcessesInterval)
 	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
 	a.runStreamCollector(ctx, "runtimes", a.cfg.RuntimesInterval, a.runtimes.collect)
 	// Process history accumulates regardless of SSE subscribers so charts
@@ -510,6 +523,37 @@ func (a *App) runStreamCollector(ctx context.Context, event string, interval tim
 				if len(data) > 0 {
 					a.hub.Broadcast(event, data)
 				}
+			}
+		}
+	}()
+}
+
+// runProcessesStreamCollector ticks the processes collector on the stream
+// cadence while at least one SSE subscriber wants `processes`. The complete
+// process table is collected once and sliced per subscriber inside
+// StreamHub.BroadcastProcesses, so subscribers with different caps share a
+// single ps run.
+func (a *App) runProcessesStreamCollector(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if a.hub.Subscribers("processes") == 0 {
+					continue
+				}
+				entries, err := a.processes.collectEntries(ctx, 0)
+				if err != nil {
+					a.logger.Debug("stream collector failed", "event", "processes", "error", err)
+					continue
+				}
+				a.hub.BroadcastProcesses(entries)
 			}
 		}
 	}()

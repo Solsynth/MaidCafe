@@ -557,21 +557,28 @@ type processesPayload struct {
 }
 
 // ProcessesCollector lists the top CPU consumers via ps, falling back to the
-// BSD-style invocation when the GNU-sort form fails (e.g. on macOS).
+// BSD-style invocation when the GNU-sort form fails (e.g. on macOS). limit is
+// the daemon's default cap; per-request values override it (0 = all).
 type ProcessesCollector struct {
 	limit int
 }
 
-func (p *ProcessesCollector) collect(ctx context.Context) ([]byte, error) {
-	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,comm= --sort=-%cpu | head -n "+strconv.Itoa(p.limit))
+// collectEntries runs ps once and returns the parsed rows. A limit <= 0 keeps
+// the complete process table; a positive limit keeps the top `limit` CPU
+// consumers (ps already sorts by CPU, so head preserves that order).
+func (p *ProcessesCollector) collectEntries(ctx context.Context, limit int) ([]processEntry, error) {
+	head := ""
+	if limit > 0 {
+		head = " | head -n " + strconv.Itoa(limit)
+	}
+	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,comm= --sort=-%cpu"+head)
 	if err != nil || strings.TrimSpace(string(out)) == "" {
-		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm= -r | head -n "+strconv.Itoa(p.limit))
+		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm= -r"+head)
 		if err != nil {
 			return nil, err
 		}
 	}
-	payload := processesPayload{Processes: parseProcesses(string(out))}
-	return json.Marshal(payload)
+	return parseProcesses(string(out)), nil
 }
 
 // parseProcesses parses `ps -o pid=,user=,%cpu=,%mem=,rss=,comm=` output.

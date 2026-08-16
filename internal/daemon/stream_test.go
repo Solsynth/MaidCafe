@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -145,5 +147,117 @@ func TestParseEventsParam(t *testing.T) {
 	}
 	if types, err := parseEventsParam("metric,metric"); err != nil || len(types) != 1 {
 		t.Fatalf("duplicate events = %#v, %v; want [metric], nil", types, err)
+	}
+}
+
+func TestParseProcessesLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		def     int
+		want    int
+		wantErr bool
+	}{
+		{name: "empty uses default", raw: "", def: 50, want: 50},
+		{name: "zero means all", raw: "0", def: 50, want: 0},
+		{name: "bounded value", raw: "123", def: 50, want: 123},
+		{name: "whitespace trimmed", raw: " 7 ", def: 50, want: 7},
+		{name: "not an integer", raw: "abc", def: 50, wantErr: true},
+		{name: "negative rejected", raw: "-1", def: 50, wantErr: true},
+		{name: "too large rejected", raw: "10001", def: 50, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseProcessesLimit(tc.raw, tc.def)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseProcessesLimit(%q) = %d, want error", tc.raw, got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("parseProcessesLimit(%q, %d) = %d, %v; want %d, nil", tc.raw, tc.def, got, err, tc.want)
+			}
+		})
+	}
+}
+
+// countProcessesFrame decodes a `processes` SSE frame and counts the rows.
+func countProcessesFrame(t *testing.T, frame []byte) int {
+	t.Helper()
+	const prefix = "event: processes\ndata: "
+	if !bytes.HasPrefix(frame, []byte(prefix)) {
+		t.Fatalf("unexpected frame: %q", frame)
+	}
+	var payload processesPayload
+	if err := json.Unmarshal(frame[len(prefix):], &payload); err != nil {
+		t.Fatalf("malformed processes frame: %v (%q)", err, frame)
+	}
+	return len(payload.Processes)
+}
+
+func TestStreamHubProcessesLimitSlicing(t *testing.T) {
+	hub := NewStreamHub()
+	// No option: defaults to 0 = complete table.
+	unlimited := hub.Subscribe([]string{"processes"})
+	// Capped subscriber: only the top rows.
+	capped := hub.Subscribe([]string{"processes"}, WithProcessesLimit(2))
+	// Explicit 0 = complete table, sharing the frame with `unlimited`.
+	all := hub.Subscribe([]string{"processes"}, WithProcessesLimit(0))
+	defer hub.Unsubscribe(unlimited)
+	defer hub.Unsubscribe(capped)
+	defer hub.Unsubscribe(all)
+
+	if unlimited.ProcessesLimit != 0 || all.ProcessesLimit != 0 || capped.ProcessesLimit != 2 {
+		t.Fatalf("subscriber limits = %d/%d/%d, want 0/0/2",
+			unlimited.ProcessesLimit, all.ProcessesLimit, capped.ProcessesLimit)
+	}
+
+	entries := make([]processEntry, 5)
+	for i := range entries {
+		entries[i] = processEntry{
+			PID:           i + 1,
+			User:          "root",
+			CPUPercent:    float64(5 - i),
+			MemoryPercent: 1,
+			RSSKb:         100,
+			Command:       "proc",
+		}
+	}
+	hub.BroadcastProcesses(entries)
+
+	read := func(s *Subscriber) []byte {
+		t.Helper()
+		select {
+		case frame := <-s.C:
+			return frame
+		case <-time.After(time.Second):
+			t.Fatal("subscriber missed its processes broadcast")
+			return nil
+		}
+	}
+	if got := countProcessesFrame(t, read(unlimited)); got != 5 {
+		t.Fatalf("unlimited subscriber got %d processes, want 5", got)
+	}
+	if got := countProcessesFrame(t, read(all)); got != 5 {
+		t.Fatalf("explicit-all subscriber got %d processes, want 5", got)
+	}
+	cappedFrame := read(capped)
+	if got := countProcessesFrame(t, cappedFrame); got != 2 {
+		t.Fatalf("capped subscriber got %d processes, want 2", got)
+	}
+	// The cap keeps the top rows in ps order (pid 1, 2).
+	const prefix = "event: processes\ndata: "
+	var payload processesPayload
+	if err := json.Unmarshal(cappedFrame[len(prefix):], &payload); err != nil {
+		t.Fatalf("malformed capped frame: %v", err)
+	}
+	if payload.Processes[0].PID != 1 || payload.Processes[1].PID != 2 {
+		t.Fatalf("capped rows = %d,%d; want 1,2", payload.Processes[0].PID, payload.Processes[1].PID)
+	}
+	// A table smaller than the cap is passed through untouched.
+	hub.BroadcastProcesses(entries[:1])
+	if got := countProcessesFrame(t, read(capped)); got != 1 {
+		t.Fatalf("capped subscriber got %d processes for a 1-row table, want 1", got)
 	}
 }

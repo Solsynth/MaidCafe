@@ -163,19 +163,27 @@ and an RFC3339 `before` cursor.
 
 ## Daemon API
 
-Webhook requests use:
+Full walkthrough for configuring and invoking actions and webhooks, including
+the cloud relay, lives in [`docs/webhooks.md`](docs/webhooks.md).
+
+Webhook requests carry an HMAC signature over the body, keyed by the webhook's
+own secret:
 
 ```text
 POST /api/v1/webhooks/:name
-Authorization: Bearer <webhook-secret>
+X-MaidCafe-Signature: <hex HMAC-SHA256 of the raw body keyed by the webhook secret>
 ```
 
 Example:
 
 ```sh
+SECRET='replace-with-local-webhook-secret'
+BODY='{"job":"incremental"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
+
 curl -X POST http://127.0.0.1:8747/api/v1/webhooks/backup \
-  -H 'Authorization: Bearer replace-with-local-webhook-secret' \
-  --data-binary '{"job":"incremental"}'
+  -H "X-MaidCafe-Signature: $SIG" \
+  --data-binary "$BODY"
 ```
 
 Successful execution returns `200`; non-zero exit returns `502`; timeout returns
@@ -212,6 +220,12 @@ Authorization: Bearer <metrics-secret>
 
 - `events` is a comma-separated whitelist of event types; omitted means all.
   Unknown names return `400`.
+- `processesLimit` overrides how many processes `processes` frames carry for
+  this subscriber: `0` requests the complete process table (the default for
+  this parameter is the daemon's configured `processesLimit`). Valid values
+  are `0` or `1..10000`; anything else returns `400`. Each subscriber is
+  capped independently, so one client can ask for everything while another
+  keeps the default slice.
 - Every frame is standard SSE (`event:`/`data:` lines terminated by a blank
   line); a `: ping` comment is emitted every 15s while idle.
 - The first frame is always `hello`, carrying the stream version, daemon
@@ -256,7 +270,10 @@ reuse the stream collectors' probe cache and rate limits:
   each with `runtime`, `available`, `error` and `containers`.
 - `GET /api/v1/images` — same payload as the `images` event: a `runtimes`
   list, each with `runtime`, `available`, `error` and `images`.
-- `GET /api/v1/processes` — same payload as the `processes` event.
+- `GET /api/v1/processes` — same payload as the `processes` event. `?limit=N`
+  overrides the daemon's configured `processesLimit`: `0` returns the complete
+  process table (no cap), a positive value keeps the top N CPU consumers.
+  Valid values are `0` or `1..10000`; anything else returns `400`.
 - `GET /api/v1/systemd` — same payload as the `systemd` event.
 
 All four are authenticated with the same metrics secret and cost one
