@@ -20,23 +20,24 @@ import (
 )
 
 type App struct {
-	cfg        config.DaemonConfig
-	executor   *WebhookExecutor
-	metrics    *MetricsCollector
-	publisher  *CloudPublisher
-	relay      *WebhookRelay
-	hub        *StreamHub
-	alarms     *alarmEvaluator
-	containers *ContainersCollector
-	images     *ImagesCollector
-	processes  *ProcessesCollector
-	systemd    *SystemdCollector
-	runtimes   *RuntimesCollector
-	watched    *watchedProcessStore
-	server     *http.Server
-	listenerMu sync.RWMutex
-	listener   net.Listener
-	logger     *slog.Logger
+	cfg             config.DaemonConfig
+	executor        *WebhookExecutor
+	metrics         *MetricsCollector
+	publisher       *CloudPublisher
+	relay           *WebhookRelay
+	hub             *StreamHub
+	alarms          *alarmEvaluator
+	containers      *ContainersCollector
+	images          *ImagesCollector
+	processes       *ProcessesCollector
+	systemd         *SystemdCollector
+	runtimes        *RuntimesCollector
+	databaseMetrics *DatabaseMetricsCollector
+	watched         *watchedProcessStore
+	server          *http.Server
+	listenerMu      sync.RWMutex
+	listener        net.Listener
+	logger          *slog.Logger
 }
 
 func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
@@ -64,19 +65,20 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	historyStore := newProcessHistoryStore(historyDir, cfg.MetricsRetentionDays)
 	app := &App{
-		cfg:        cfg,
-		executor:   executor,
-		metrics:    metrics,
-		publisher:  publisher,
-		hub:        NewStreamHub(),
-		alarms:     newAlarmEvaluator(),
-		containers: &ContainersCollector{probe: runtimeProbe},
-		images:     &ImagesCollector{probe: runtimeProbe},
-		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
-		systemd:    &SystemdCollector{},
-		runtimes:   &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
-		watched:    watchedStore,
-		logger:     logger,
+		cfg:             cfg,
+		executor:        executor,
+		metrics:         metrics,
+		publisher:       publisher,
+		hub:             NewStreamHub(),
+		alarms:          newAlarmEvaluator(),
+		containers:      &ContainersCollector{probe: runtimeProbe},
+		images:          &ImagesCollector{probe: runtimeProbe},
+		processes:       &ProcessesCollector{limit: cfg.ProcessesLimit},
+		systemd:         &SystemdCollector{},
+		runtimes:        &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
+		databaseMetrics: &DatabaseMetricsCollector{},
+		watched:         watchedStore,
+		logger:          logger,
 	}
 	app.relay = NewWebhookRelay(publisher, executor, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
@@ -224,6 +226,16 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	})
 	router.GET("/api/v1/runtimes", authorizeMetrics, func(c *gin.Context) {
 		data, err := app.runtimes.collect(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	})
+	// One-shot database health snapshot (same payload as the
+	// `databaseMetrics` SSE event).
+	router.GET("/api/v1/database-metrics", authorizeMetrics, func(c *gin.Context) {
+		data, err := app.databaseMetrics.collect(c.Request.Context())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": err.Error()})
 			return
@@ -474,6 +486,7 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	a.runProcessesStreamCollector(ctx, a.cfg.ProcessesInterval)
 	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
 	a.runStreamCollector(ctx, "runtimes", a.cfg.RuntimesInterval, a.runtimes.collect)
+	a.runStreamCollector(ctx, "databaseMetrics", a.cfg.DatabaseMetricsInterval, a.databaseMetrics.collect)
 	// Process history accumulates regardless of SSE subscribers so charts
 	// show usage even while no client is connected.
 	a.runHistoryCollector(ctx, a.cfg.RuntimesInterval, a.runtimes.recordHistory)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -457,5 +458,166 @@ func TestRunRuntimeListElevatedFallback(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("masked output = %q", out)
+	}
+}
+
+func TestParsePostgresDatabaseMetricsOutput(t *testing.T) {
+	output := `--DB-PG-ROWS--
+app|3|100|1|50|9950|0|4096
+template1|0|5|0|2|8|0|0
+--DB-PG-MAXCONN--
+100
+--DB-PG-SHARED--
+128MB
+--DB-PG-VERSION--
+postgres (PostgreSQL) 15.4 (Ubuntu 15.4-2.pgdg22.04+1)
+`
+	entry := parsePostgresDatabaseMetricsOutput(output)
+	if entry == nil || !entry.Available {
+		t.Fatalf("expected available entry, got %+v", entry)
+	}
+	if entry.Error != nil {
+		t.Fatalf("expected no error, got %v", *entry.Error)
+	}
+	if entry.Engine != "postgres" {
+		t.Fatalf("engine = %q", entry.Engine)
+	}
+	if entry.Connections == nil || *entry.Connections != 3 {
+		t.Fatalf("connections = %v", entry.Connections)
+	}
+	if entry.MaxConnections == nil || *entry.MaxConnections != 100 {
+		t.Fatalf("max_connections = %v", entry.MaxConnections)
+	}
+	if entry.MemoryBytes == nil || *entry.MemoryBytes != 128<<20 {
+		t.Fatalf("memory_bytes = %v", entry.MemoryBytes)
+	}
+	if entry.CacheHitRatio == nil {
+		t.Fatal("expected cache hit ratio")
+	}
+	expected := float64(9958) / float64(10010)
+	if *entry.CacheHitRatio != expected {
+		t.Fatalf("cache hit ratio = %v, want %v", *entry.CacheHitRatio, expected)
+	}
+	if entry.Commits == nil || *entry.Commits != 105 {
+		t.Fatalf("commits = %v", entry.Commits)
+	}
+	if entry.TempBytes == nil || *entry.TempBytes != 4096 {
+		t.Fatalf("temp_bytes = %v", entry.TempBytes)
+	}
+	if len(entry.Databases) != 2 {
+		t.Fatalf("databases = %d", len(entry.Databases))
+	}
+	app := entry.Databases[0]
+	if app.Name != "app" || app.Connections == nil || *app.Connections != 3 {
+		t.Fatalf("first db = %+v", app)
+	}
+	if entry.Version == nil || !strings.Contains(*entry.Version, "15.4") {
+		t.Fatalf("version = %v", entry.Version)
+	}
+}
+
+func TestParsePostgresDatabaseMetricsOutputUnavailable(t *testing.T) {
+	entry := parsePostgresDatabaseMetricsOutput("--DB-PG-ROWS--\n")
+	if entry == nil || entry.Available {
+		t.Fatalf("expected unavailable entry, got %+v", entry)
+	}
+	if entry.Error == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestParseMySQLDatabaseMetricsOutput(t *testing.T) {
+	output := `--DB-MY-STATUS--
+Threads_connected	5
+Max_used_connections	12
+Threads_running	1
+Innodb_buffer_pool_pages_total	8192
+Innodb_buffer_pool_pages_data	4096
+Innodb_buffer_pool_pages_dirty	64
+Innodb_buffer_pool_read_requests	100000
+Innodb_buffer_pool_reads	200
+Queries	123456
+Slow_queries	3
+Uptime	99999
+Innodb_page_size	16384
+Bytes_received	1000
+Bytes_sent	2000
+--DB-MY-VARS--
+innodb_buffer_pool_size	134217728
+max_connections	151
+--DB-MY-VERSION--
+8.0.35
+`
+	entry := parseMySQLDatabaseMetricsOutput(output)
+	if entry == nil || !entry.Available {
+		t.Fatalf("expected available entry, got %+v", entry)
+	}
+	if entry.Engine != "mysql" {
+		t.Fatalf("engine = %q", entry.Engine)
+	}
+	if entry.Connections == nil || *entry.Connections != 5 {
+		t.Fatalf("connections = %v", entry.Connections)
+	}
+	if entry.MaxConnections == nil || *entry.MaxConnections != 151 {
+		t.Fatalf("max_connections = %v", entry.MaxConnections)
+	}
+	if entry.MemoryBytes == nil || *entry.MemoryBytes != 134217728 {
+		t.Fatalf("memory_bytes = %v", entry.MemoryBytes)
+	}
+	if entry.MemoryUsedBytes == nil || *entry.MemoryUsedBytes != 4096*16384 {
+		t.Fatalf("memory_used_bytes = %v", entry.MemoryUsedBytes)
+	}
+	if entry.MemoryDirtyBytes == nil || *entry.MemoryDirtyBytes != 64*16384 {
+		t.Fatalf("memory_dirty_bytes = %v", entry.MemoryDirtyBytes)
+	}
+	expected := float64(100000) / float64(100200)
+	if entry.CacheHitRatio == nil || *entry.CacheHitRatio != expected {
+		t.Fatalf("cache hit ratio = %v, want %v", entry.CacheHitRatio, expected)
+	}
+	if entry.Queries == nil || *entry.Queries != 123456 {
+		t.Fatalf("queries = %v", entry.Queries)
+	}
+	if entry.SlowQueries == nil || *entry.SlowQueries != 3 {
+		t.Fatalf("slow_queries = %v", entry.SlowQueries)
+	}
+	if entry.UptimeSeconds == nil || *entry.UptimeSeconds != 99999 {
+		t.Fatalf("uptime = %v", entry.UptimeSeconds)
+	}
+}
+
+func TestParseMySQLDatabaseMetricsTagsMariaDB(t *testing.T) {
+	output := `--DB-MY-STATUS--
+Threads_connected	1
+--DB-MY-VARS--
+--DB-MY-VERSION--
+10.11.6-MariaDB-0+deb12u1
+`
+	entry := parseMySQLDatabaseMetricsOutput(output)
+	if entry == nil || !entry.Available {
+		t.Fatalf("expected available entry, got %+v", entry)
+	}
+	if entry.Engine != "mariadb" {
+		t.Fatalf("engine = %q", entry.Engine)
+	}
+	if entry.Version == nil || !strings.Contains(*entry.Version, "10.11.6") {
+		t.Fatalf("version = %v", entry.Version)
+	}
+}
+
+func TestParseSizeToBytes(t *testing.T) {
+	cases := map[string]int64{
+		"128MB": 128 << 20,
+		"1GB":   1 << 30,
+		"64KB":  64 << 10,
+		"8192":  8192,
+		"2gb":   2 << 30,
+	}
+	for raw, want := range cases {
+		if got := parseSizeToBytes(raw); got == nil || *got != want {
+			t.Errorf("parseSizeToBytes(%q) = %v, want %d", raw, got, want)
+		}
+	}
+	if parseSizeToBytes("nope") != nil {
+		t.Error("expected nil for invalid size")
 	}
 }

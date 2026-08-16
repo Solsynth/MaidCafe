@@ -54,6 +54,7 @@ type EventbusConfig struct {
 	URL           string `mapstructure:"url"`
 	SubjectPrefix string `mapstructure:"subjectPrefix"`
 }
+
 // hostIDPath persists the stable machine identity the install flow writes
 // once. It survives binary updates and config rewrites (no sync script
 // touches it), so the cloud can link the host across daemon reinstalls.
@@ -77,32 +78,33 @@ type DaemonConfig struct {
 	// AlarmsDir holds one `<kind>.toml` fragment per configured alarm. The
 	// fragments are merged into Alarms at load, so alarm changes never touch
 	// the main config file either.
-	AlarmsDir          string          `mapstructure:"alarmsDir"`
-	CloudURL           string          `mapstructure:"cloudUrl"`
-	CloudSecret        string          `mapstructure:"cloudSecret"`
-	MetricsInterval    time.Duration   `mapstructure:"metricsInterval"`
-	StreamInterval     time.Duration   `mapstructure:"streamInterval"`
-	ContainersInterval time.Duration   `mapstructure:"containersInterval"`
-	ImagesInterval     time.Duration   `mapstructure:"imagesInterval"`
-	ProcessesInterval  time.Duration   `mapstructure:"processesInterval"`
-	SystemdInterval    time.Duration   `mapstructure:"systemdInterval"`
-	RuntimesInterval   time.Duration   `mapstructure:"runtimesInterval"`
+	AlarmsDir               string        `mapstructure:"alarmsDir"`
+	CloudURL                string        `mapstructure:"cloudUrl"`
+	CloudSecret             string        `mapstructure:"cloudSecret"`
+	MetricsInterval         time.Duration `mapstructure:"metricsInterval"`
+	StreamInterval          time.Duration `mapstructure:"streamInterval"`
+	ContainersInterval      time.Duration `mapstructure:"containersInterval"`
+	ImagesInterval          time.Duration `mapstructure:"imagesInterval"`
+	ProcessesInterval       time.Duration `mapstructure:"processesInterval"`
+	SystemdInterval         time.Duration `mapstructure:"systemdInterval"`
+	RuntimesInterval        time.Duration `mapstructure:"runtimesInterval"`
+	DatabaseMetricsInterval time.Duration `mapstructure:"databaseMetricsInterval"`
 	// Runtimes is the ordered list of runtime groups the runtimes collector
 	// reports, in wire order. Unknown entries are skipped by old clients.
 	Runtimes []string `mapstructure:"runtimes"`
 	// WatchedProcesses seeds the daemon-side watched-process list; dynamic
 	// additions and removals via the API are persisted to
 	// WatchedProcessesFile (authoritative once it exists).
-	WatchedProcesses     []string `mapstructure:"watchedProcesses"`
-	WatchedProcessesFile string   `mapstructure:"watchedProcessesFile"`
-	ProcessesLimit       int      `mapstructure:"processesLimit"`
-	RequestTimeout     time.Duration   `mapstructure:"requestTimeout"`
-	ScriptTimeout      time.Duration   `mapstructure:"scriptTimeout"`
-	MaxBodyBytes       int64           `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns  int             `mapstructure:"maxConcurrentRuns"`
-	Webhooks           []WebhookConfig `mapstructure:"webhooks"`
-	Actions            []WebhookConfig `mapstructure:"actions"`
-	Alarms             []AlarmConfig   `mapstructure:"alarms"`
+	WatchedProcesses     []string        `mapstructure:"watchedProcesses"`
+	WatchedProcessesFile string          `mapstructure:"watchedProcessesFile"`
+	ProcessesLimit       int             `mapstructure:"processesLimit"`
+	RequestTimeout       time.Duration   `mapstructure:"requestTimeout"`
+	ScriptTimeout        time.Duration   `mapstructure:"scriptTimeout"`
+	MaxBodyBytes         int64           `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns    int             `mapstructure:"maxConcurrentRuns"`
+	Webhooks             []WebhookConfig `mapstructure:"webhooks"`
+	Actions              []WebhookConfig `mapstructure:"actions"`
+	Alarms               []AlarmConfig   `mapstructure:"alarms"`
 }
 
 // AlarmConfig declares one metric threshold the daemon evaluates against its
@@ -240,6 +242,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
+	viper.SetDefault("daemon.databaseMetricsInterval", 10*time.Second)
 	viper.SetDefault("daemon.runtimes", []string{"java", "dotnet", "python", "node", "deno", "go", "ruby", "php"})
 	viper.SetDefault("daemon.watchedProcesses", []string{})
 	viper.SetDefault("daemon.watchedProcessesFile", "/var/lib/maidcafe/watched-processes.json")
@@ -431,7 +434,7 @@ func applyEnvAliases() {
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
-		"DAEMON_SYSTEMD_INTERVAL": "daemon.systemdInterval", "DAEMON_PROCESSES_LIMIT": "daemon.processesLimit",
+		"DAEMON_SYSTEMD_INTERVAL": "daemon.systemdInterval", "DAEMON_DATABASE_METRICS_INTERVAL": "daemon.databaseMetricsInterval", "DAEMON_PROCESSES_LIMIT": "daemon.processesLimit",
 		"DAEMON_REQUEST_TIMEOUT": "daemon.requestTimeout",
 		"DAEMON_SCRIPT_TIMEOUT":  "daemon.scriptTimeout", "DAEMON_MAX_BODY_BYTES": "daemon.maxBodyBytes",
 		"DAEMON_MAX_CONCURRENT_RUNS": "daemon.maxConcurrentRuns",

@@ -874,8 +874,8 @@ type jdkProbe struct {
 }
 
 type javaRuntimePayload struct {
-	JDK  jdkProbe        `json:"jdk"`
-	JVMs []javaJvmEntry  `json:"jvms"`
+	JDK  jdkProbe       `json:"jdk"`
+	JVMs []javaJvmEntry `json:"jvms"`
 }
 
 type runtimeGroup struct {
@@ -1232,3 +1232,361 @@ func parseJstatGcutilOutput(output string) (oldPercent float64, ygc, fgc int64, 
 	}
 	return 0, 0, 0, 0, fmt.Errorf("no valid jstat -gcutil data line found")
 }
+
+// ---------------------------------------------------------------------------
+// Database metrics
+// ---------------------------------------------------------------------------
+
+// databaseMetricDB is one PostgreSQL database's pg_stat_database counters.
+type databaseMetricDB struct {
+	Name        string `json:"name"`
+	Connections *int64 `json:"connections"`
+	Commits     *int64 `json:"commits"`
+	Rollbacks   *int64 `json:"rollbacks"`
+	BlksHit     *int64 `json:"blks_hit"`
+	BlksRead    *int64 `json:"blks_read"`
+	Deadlocks   *int64 `json:"deadlocks"`
+}
+
+// databaseMetricsEntry is one engine's health snapshot. PostgreSQL fills the
+// commit/rollback/cache counters plus per-database rows; MySQL-like engines
+// fill the query/thread/buffer-pool counters. memory_bytes is shared_buffers
+// for PostgreSQL and innodb_buffer_pool_size for MySQL-like engines.
+type databaseMetricsEntry struct {
+	Engine             string             `json:"engine"`
+	Available          bool               `json:"available"`
+	Error              *string            `json:"error"`
+	Version            *string            `json:"version"`
+	Connections        *int64             `json:"connections"`
+	MaxConnections     *int64             `json:"max_connections"`
+	MemoryBytes        *int64             `json:"memory_bytes"`
+	MemoryUsedBytes    *int64             `json:"memory_used_bytes"`
+	MemoryDirtyBytes   *int64             `json:"memory_dirty_bytes"`
+	CacheHitRatio      *float64           `json:"cache_hit_ratio"`
+	Commits            *int64             `json:"commits"`
+	Rollbacks          *int64             `json:"rollbacks"`
+	BlksHit            *int64             `json:"blks_hit"`
+	BlksRead           *int64             `json:"blks_read"`
+	Deadlocks          *int64             `json:"deadlocks"`
+	TempBytes          *int64             `json:"temp_bytes"`
+	Queries            *int64             `json:"queries"`
+	SlowQueries        *int64             `json:"slow_queries"`
+	ThreadsRunning     *int64             `json:"threads_running"`
+	MaxUsedConnections *int64             `json:"max_used_connections"`
+	UptimeSeconds      *int64             `json:"uptime_seconds"`
+	BytesReceived      *int64             `json:"bytes_received"`
+	BytesSent          *int64             `json:"bytes_sent"`
+	Databases          []databaseMetricDB `json:"databases"`
+}
+
+type databaseMetricsPayload struct {
+	Engines []databaseMetricsEntry `json:"engines"`
+}
+
+// DatabaseMetricsCollector samples PostgreSQL / MySQL / MariaDB health
+// counters over the local client tools (peer auth for postgres, socket /
+// debian.cnf for MySQL). It mirrors the SSH fallback in the MaidKit client,
+// so both channels report the same shape. Each engine is probed
+// independently: a failure marks that engine unavailable and never aborts
+// the payload.
+type DatabaseMetricsCollector struct{}
+
+// collect probes every engine and returns the marshaled payload. It never
+// returns an error for a failed engine; only a failed marshal does.
+func (c *DatabaseMetricsCollector) collect(ctx context.Context) ([]byte, error) {
+	entries := make([]databaseMetricsEntry, 0, 2)
+	if entry := c.collectPostgres(ctx); entry != nil {
+		entries = append(entries, *entry)
+	}
+	if entry := c.collectMySQL(ctx); entry != nil {
+		entries = append(entries, *entry)
+	}
+	return json.Marshal(databaseMetricsPayload{Engines: entries})
+}
+
+const postgresMetricsScript = `PGBIN=$(for d in /usr/pgsql-*/bin /usr/lib/postgresql/*/bin /usr/local/pgsql/bin; do [ -d "$d" ] && echo "$d"; done | sort -V | tail -n 1)
+if [ -z "$PGBIN" ]; then exit 1; fi
+echo '--DB-PG-ROWS--'
+su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -F '|' -c 'SELECT d.datname, s.numbackends, s.xact_commit, s.xact_rollback, s.blks_read, s.blks_hit, s.deadlocks, s.temp_bytes FROM pg_catalog.pg_stat_database s JOIN pg_catalog.pg_database d ON d.oid = s.datid WHERE d.datallowconn ORDER BY d.datname'"
+echo '--DB-PG-MAXCONN--'
+su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -c 'SHOW max_connections'"
+echo '--DB-PG-SHARED--'
+su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -c 'SHOW shared_buffers'"
+echo '--DB-PG-VERSION--'
+"$PGBIN/postgres" --version`
+
+const mysqlMetricsScript = `MYSQL=$(command -v mysql 2>/dev/null || command -v mariadb 2>/dev/null || true)
+if [ -z "$MYSQL" ]; then exit 1; fi
+AUTH=""
+if "$MYSQL" -N -e 'SELECT 1' >/dev/null 2>&1; then AUTH=""
+elif [ -f /etc/mysql/debian.cnf ]; then AUTH="--defaults-file=/etc/mysql/debian.cnf"
+else exit 1; fi
+echo '--DB-MY-STATUS--'
+"$MYSQL" $AUTH -N -e "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME IN ('Threads_connected','Max_used_connections','Threads_running','Innodb_buffer_pool_pages_total','Innodb_buffer_pool_pages_data','Innodb_buffer_pool_pages_dirty','Innodb_buffer_pool_read_requests','Innodb_buffer_pool_reads','Queries','Slow_queries','Uptime','Innodb_page_size','Bytes_received','Bytes_sent')"
+echo '--DB-MY-VARS--'
+"$MYSQL" $AUTH -N -e "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_VARIABLES WHERE VARIABLE_NAME IN ('innodb_buffer_pool_size','max_connections')"
+echo '--DB-MY-VERSION--'
+"$MYSQL" $AUTH -N -e "SELECT VERSION()"`
+
+func (c *DatabaseMetricsCollector) collectPostgres(ctx context.Context) *databaseMetricsEntry {
+	out, err := runShell(ctx, postgresMetricsScript)
+	if err != nil {
+		return unavailableEntry("postgres", "psql probe failed")
+	}
+	return parsePostgresDatabaseMetricsOutput(string(out))
+}
+
+func (c *DatabaseMetricsCollector) collectMySQL(ctx context.Context) *databaseMetricsEntry {
+	out, err := runShell(ctx, mysqlMetricsScript)
+	if err != nil {
+		return unavailableEntry("mysql", "mysql probe failed")
+	}
+	return parseMySQLDatabaseMetricsOutput(string(out))
+}
+
+func unavailableEntry(engine, message string) *databaseMetricsEntry {
+	return &databaseMetricsEntry{
+		Engine:    engine,
+		Available: false,
+		Error:     strPtr(message),
+		Databases: []databaseMetricDB{},
+	}
+}
+
+// sectionBetween returns the text between startMarker and endMarker (or the
+// end of output), or "" when startMarker is missing.
+func sectionBetween(output, startMarker, endMarker string) string {
+	start := strings.Index(output, startMarker)
+	if start < 0 {
+		return ""
+	}
+	start += len(startMarker)
+	end := len(output)
+	if endMarker != "" {
+		if idx := strings.Index(output[start:], endMarker); idx >= 0 {
+			end = start + idx
+		}
+	}
+	return strings.TrimSpace(output[start:end])
+}
+
+// parsePostgresDatabaseMetricsOutput parses the postgres probe into an
+// entry. Engine totals are the sum of the per-database counters.
+func parsePostgresDatabaseMetricsOutput(output string) *databaseMetricsEntry {
+	entry := &databaseMetricsEntry{
+		Engine:    "postgres",
+		Available: false,
+		Error:     strPtr("psql returned no data"),
+		Databases: []databaseMetricDB{},
+	}
+	rows := sectionBetween(output, "--DB-PG-ROWS--", "--DB-PG-MAXCONN--")
+	if rows == "" {
+		return entry
+	}
+	var connections, commits, rollbacks, blksRead, blksHit, deadlocks, tempBytes int64
+	for _, rawLine := range strings.Split(rows, "\n") {
+		fields := strings.Split(strings.TrimSpace(rawLine), "|")
+		if len(fields) < 8 || fields[0] == "" {
+			continue
+		}
+		vals := make([]int64, 7)
+		ok := true
+		for i, field := range fields[1:8] {
+			v, err := strconv.ParseInt(strings.TrimSpace(field), 10, 64)
+			if err != nil {
+				ok = false
+				break
+			}
+			vals[i] = v
+		}
+		if !ok {
+			continue
+		}
+		connections += vals[0]
+		commits += vals[1]
+		rollbacks += vals[2]
+		blksRead += vals[3]
+		blksHit += vals[4]
+		deadlocks += vals[5]
+		tempBytes += vals[6]
+		entry.Databases = append(entry.Databases, databaseMetricDB{
+			Name:        fields[0],
+			Connections: int64Ptr(vals[0]),
+			Commits:     int64Ptr(vals[1]),
+			Rollbacks:   int64Ptr(vals[2]),
+			BlksRead:    int64Ptr(vals[3]),
+			BlksHit:     int64Ptr(vals[4]),
+			Deadlocks:   int64Ptr(vals[5]),
+		})
+	}
+	if len(entry.Databases) == 0 {
+		return entry
+	}
+	entry.Available = true
+	entry.Error = nil
+	entry.Connections = int64Ptr(connections)
+	entry.Commits = int64Ptr(commits)
+	entry.Rollbacks = int64Ptr(rollbacks)
+	entry.BlksRead = int64Ptr(blksRead)
+	entry.BlksHit = int64Ptr(blksHit)
+	entry.Deadlocks = int64Ptr(deadlocks)
+	entry.TempBytes = int64Ptr(tempBytes)
+	if hit := ratio(blksHit, blksRead); hit != nil {
+		entry.CacheHitRatio = hit
+	}
+	if maxConn := parseSectionInt(output, "--DB-PG-MAXCONN--", "--DB-PG-SHARED--"); maxConn != nil {
+		entry.MaxConnections = maxConn
+	}
+	if shared := sectionBetween(output, "--DB-PG-SHARED--", "--DB-PG-VERSION--"); shared != "" {
+		if bytes := parseSizeToBytes(shared); bytes != nil {
+			entry.MemoryBytes = bytes
+		}
+	}
+	if version := sectionBetween(output, "--DB-PG-VERSION--", ""); version != "" {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(version, "postgres (PostgreSQL) "))
+		if trimmed != "" {
+			entry.Version = strPtr(trimmed)
+		}
+	}
+	return entry
+}
+
+// parseMySQLDatabaseMetricsOutput parses the mysql/mariadb probe into an
+// entry, tagging the engine by the server version.
+func parseMySQLDatabaseMetricsOutput(output string) *databaseMetricsEntry {
+	entry := &databaseMetricsEntry{
+		Engine:    "mysql",
+		Available: false,
+		Error:     strPtr("mysql returned no data"),
+		Databases: []databaseMetricDB{},
+	}
+	status := sectionBetween(output, "--DB-MY-STATUS--", "--DB-MY-VARS--")
+	if status == "" {
+		return entry
+	}
+	values := parseNameValueLines(status)
+	get := func(name string) *int64 {
+		if raw, ok := values[name]; ok {
+			if v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+				return int64Ptr(v)
+			}
+		}
+		return nil
+	}
+	entry.Available = true
+	entry.Error = nil
+	entry.Connections = get("Threads_connected")
+	entry.MaxUsedConnections = get("Max_used_connections")
+	entry.ThreadsRunning = get("Threads_running")
+	entry.Queries = get("Queries")
+	entry.SlowQueries = get("Slow_queries")
+	entry.UptimeSeconds = get("Uptime")
+	entry.BytesReceived = get("Bytes_received")
+	entry.BytesSent = get("Bytes_sent")
+
+	pageSize := get("Innodb_page_size")
+	pagesTotal := get("Innodb_buffer_pool_pages_total")
+	pagesData := get("Innodb_buffer_pool_pages_data")
+	pagesDirty := get("Innodb_buffer_pool_pages_dirty")
+	if pageSize != nil {
+		if pagesData != nil {
+			entry.MemoryUsedBytes = int64Ptr(*pagesData * *pageSize)
+		}
+		if pagesDirty != nil {
+			entry.MemoryDirtyBytes = int64Ptr(*pagesDirty * *pageSize)
+		}
+	}
+	_ = pagesTotal
+	if requests := get("Innodb_buffer_pool_read_requests"); requests != nil {
+		if reads := get("Innodb_buffer_pool_reads"); reads != nil {
+			if hit := ratio(*requests, *reads); hit != nil {
+				entry.CacheHitRatio = hit
+			}
+		}
+	}
+
+	vars := parseNameValueLines(sectionBetween(output, "--DB-MY-VARS--", "--DB-MY-VERSION--"))
+	if raw, ok := vars["innodb_buffer_pool_size"]; ok {
+		if bytes := parseSizeToBytes(raw); bytes != nil {
+			entry.MemoryBytes = bytes
+		}
+	}
+	if raw, ok := vars["max_connections"]; ok {
+		if v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+			entry.MaxConnections = int64Ptr(v)
+		}
+	}
+	version := strings.TrimSpace(sectionBetween(output, "--DB-MY-VERSION--", ""))
+	if version != "" {
+		entry.Version = strPtr(version)
+		if strings.Contains(strings.ToLower(version), "mariadb") {
+			entry.Engine = "mariadb"
+		}
+	}
+	return entry
+}
+
+// parseNameValueLines parses `<name>\t<value>` lines (mysql -N output).
+func parseNameValueLines(output string) map[string]string {
+	result := make(map[string]string)
+	for _, rawLine := range strings.Split(output, "\n") {
+		fields := strings.SplitN(rawLine, "\t", 2)
+		if len(fields) != 2 || strings.TrimSpace(fields[0]) == "" {
+			continue
+		}
+		result[strings.TrimSpace(fields[0])] = strings.TrimSpace(fields[1])
+	}
+	return result
+}
+
+func parseSectionInt(output, startMarker, endMarker string) *int64 {
+	raw := strings.TrimSpace(sectionBetween(output, startMarker, endMarker))
+	if raw == "" {
+		return nil
+	}
+	if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return int64Ptr(v)
+	}
+	return nil
+}
+
+// parseSizeToBytes converts PostgreSQL/MySQL size strings ("128MB", "1GB",
+// "8192") into bytes.
+func parseSizeToBytes(raw string) *int64 {
+	trimmed := strings.TrimSpace(strings.ToLower(raw))
+	if trimmed == "" {
+		return nil
+	}
+	multiplier := int64(1)
+	for _, unit := range []struct {
+		suffix string
+		factor int64
+	}{
+		{"gb", 1 << 30}, {"g", 1 << 30},
+		{"mb", 1 << 20}, {"m", 1 << 20},
+		{"kb", 1 << 10}, {"k", 1 << 10},
+		{"b", 1},
+	} {
+		if strings.HasSuffix(trimmed, unit.suffix) {
+			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, unit.suffix))
+			multiplier = unit.factor
+			break
+		}
+	}
+	v, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return int64Ptr(v * multiplier)
+}
+
+func ratio(numerator, denominator int64) *float64 {
+	total := numerator + denominator
+	if total <= 0 {
+		return nil
+	}
+	r := float64(numerator) / float64(total)
+	return &r
+}
+
+func int64Ptr(v int64) *int64 { return &v }

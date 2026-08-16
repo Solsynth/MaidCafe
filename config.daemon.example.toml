@@ -23,6 +23,9 @@ processesLimit = 50
 systemdInterval = "30s"
 # 0 disables the runtimes collector
 runtimesInterval = "10s"
+# Database health snapshot cadence for the `databaseMetrics` stream event and
+# /api/v1/database-metrics. 0 disables the collector.
+databaseMetricsInterval = "10s"
 # Runtime groups the runtimes collector reports, in wire order. Old clients
 # skip unknown entries.
 runtimes = ["java", "dotnet", "python", "node", "deno", "go", "ruby", "php"]
