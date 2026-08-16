@@ -236,13 +236,33 @@ func (c *Config) loadActionFragments() error {
 		}
 	}
 	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	fragments := make([]WebhookConfig, 0, len(paths))
+	names := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
 		hook, err := loadActionFragment(path)
 		if err != nil {
 			return err
 		}
+		names[hook.Name] = struct{}{}
+		fragments = append(fragments, hook)
+	}
+	// MaidKit migrates actions out of the main config into per-file
+	// fragments: a leftover inline [[daemon.actions]] entry and a fragment
+	// with the same name describe the same action, so the fragment wins
+	// (mirroring MaidKit's own read-back) instead of failing duplicate
+	// validation and taking the daemon down.
+	inline := c.Daemon.Actions
+	c.Daemon.Actions = make([]WebhookConfig, 0, len(inline)+len(fragments))
+	for _, hook := range inline {
+		if _, covered := names[hook.Name]; covered {
+			continue
+		}
 		c.Daemon.Actions = append(c.Daemon.Actions, hook)
 	}
+	c.Daemon.Actions = append(c.Daemon.Actions, fragments...)
 	return nil
 }
 
@@ -360,15 +380,15 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.MaxConcurrentRuns <= 0 {
 		return fmt.Errorf("daemon.maxConcurrentRuns must be positive")
 	}
-	seen := make(map[string]struct{}, len(c.Daemon.Webhooks)+len(c.Daemon.Actions))
+	hookNames := make(map[string]struct{}, len(c.Daemon.Webhooks))
 	for i, hook := range c.Daemon.Webhooks {
 		if strings.TrimSpace(hook.Name) == "" || !webhookNamePattern.MatchString(hook.Name) {
 			return fmt.Errorf("daemon.webhooks[%d].name must match [A-Za-z0-9._-]+", i)
 		}
-		if _, ok := seen[hook.Name]; ok {
+		if _, ok := hookNames[hook.Name]; ok {
 			return fmt.Errorf("daemon.webhooks[%d].name %q is duplicated", i, hook.Name)
 		}
-		seen[hook.Name] = struct{}{}
+		hookNames[hook.Name] = struct{}{}
 		if strings.TrimSpace(hook.Secret) == "" {
 			return fmt.Errorf("daemon.webhooks[%d].secret is required", i)
 		}
@@ -379,14 +399,22 @@ func (c *Config) ValidateDaemon() error {
 			return err
 		}
 	}
+	// Webhooks and actions share the runtime namespace (the executor
+	// registers both in one hook table), so a cross-kind name collision is
+	// rejected just like a duplicate — with a message that names the other
+	// kind, since a config showing one entry of each is easy to misread.
+	actionNames := make(map[string]struct{}, len(c.Daemon.Actions))
 	for i, action := range c.Daemon.Actions {
 		if strings.TrimSpace(action.Name) == "" || !webhookNamePattern.MatchString(action.Name) {
 			return fmt.Errorf("daemon.actions[%d].name must match [A-Za-z0-9._-]+", i)
 		}
-		if _, ok := seen[action.Name]; ok {
+		if _, ok := hookNames[action.Name]; ok {
+			return fmt.Errorf("daemon.actions[%d].name %q collides with a webhook of the same name", i, action.Name)
+		}
+		if _, ok := actionNames[action.Name]; ok {
 			return fmt.Errorf("daemon.actions[%d].name %q is duplicated", i, action.Name)
 		}
-		seen[action.Name] = struct{}{}
+		actionNames[action.Name] = struct{}{}
 		if !filepath.IsAbs(action.Command) {
 			return fmt.Errorf("daemon.actions[%d].command must be an absolute path", i)
 		}

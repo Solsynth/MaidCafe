@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -369,6 +370,76 @@ command = "/etc/maidcafe/actions/cleanup.sh"
 	}
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadFragmentOverridesLegacyInlineAction(t *testing.T) {
+	dir := t.TempDir()
+	base := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+actionsDir = "`+filepath.ToSlash(dir)+`"
+
+[[daemon.actions]]
+name = "deploy"
+command = "/etc/maidcafe/actions/legacy.sh"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "deploy.toml"), []byte(`
+name = "deploy"
+command = "/etc/maidcafe/actions/deploy.sh"
+script = true
+cwd = "/srv/myapp"
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Actions) != 1 {
+		t.Fatalf("merged actions = %d, want 1 (%+v)", len(cfg.Daemon.Actions), cfg.Daemon.Actions)
+	}
+	if cfg.Daemon.Actions[0].Command != "/etc/maidcafe/actions/deploy.sh" ||
+		cfg.Daemon.Actions[0].Cwd != "/srv/myapp" {
+		t.Fatalf("fragment did not win over the inline entry: %+v", cfg.Daemon.Actions[0])
+	}
+	// The merged single action must validate: the duplicate-name crash a
+	// legacy leftover used to cause is gone.
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatalf("merged config rejected: %v", err)
+	}
+}
+
+func TestDaemonRejectsActionWebhookNameCollision(t *testing.T) {
+	cfg := Config{Daemon: DaemonConfig{
+		ID:                "host-1",
+		Transport:         "http",
+		Listen:            "127.0.0.1:8747",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Minute,
+		StreamInterval:    time.Second,
+		ProcessesLimit:    50,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+		Webhooks: []WebhookConfig{{
+			Name:    "deploy",
+			Secret:  "s",
+			Command: "/bin/true",
+		}},
+		Actions: []WebhookConfig{{
+			Name:    "deploy",
+			Command: "/etc/maidcafe/actions/deploy.sh",
+		}},
+	}}
+	err := cfg.ValidateDaemon()
+	if err == nil {
+		t.Fatal("expected webhook/action name collision to be rejected")
+	}
+	if !strings.Contains(err.Error(), "collides with a webhook of the same name") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
