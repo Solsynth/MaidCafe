@@ -33,18 +33,6 @@ type DaemonMetric struct {
 	WebhookFailures    uint64
 }
 
-type DaemonAlarm struct {
-	ID              string  `gorm:"type:char(36);primaryKey"`
-	DaemonID        string  `gorm:"size:191;index;not null"`
-	Kind            string  `gorm:"size:64;not null"`
-	Threshold       float64 `gorm:"not null"`
-	Enabled         bool    `gorm:"not null;index"`
-	CooldownSeconds int     `gorm:"not null"`
-	LastTriggeredAt *time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-}
-
 type Notification struct {
 	ID          string         `gorm:"type:char(36);primaryKey"`
 	AccountID   string         `gorm:"size:191;index;not null"`

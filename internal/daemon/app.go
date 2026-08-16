@@ -25,6 +25,7 @@ type App struct {
 	publisher  *CloudPublisher
 	relay      *WebhookRelay
 	hub        *StreamHub
+	alarms     *alarmEvaluator
 	containers *ContainersCollector
 	images     *ImagesCollector
 	processes  *ProcessesCollector
@@ -59,6 +60,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		metrics:    metrics,
 		publisher:  publisher,
 		hub:        NewStreamHub(),
+		alarms:     newAlarmEvaluator(),
 		containers: &ContainersCollector{probe: runtimeProbe},
 		images:     &ImagesCollector{probe: runtimeProbe},
 		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit},
@@ -310,6 +312,10 @@ func (a *App) Run(ctx context.Context) error {
 			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
+				now := time.Now()
+				for _, notification := range a.alarms.evaluate(a.cfg.Alarms, metrics, now) {
+					a.publisher.PublishNotification(context.Background(), notification)
+				}
 			}
 		}
 	}

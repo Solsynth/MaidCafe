@@ -67,7 +67,11 @@ type DaemonConfig struct {
 	// (plus the deployed script bodies and the run runtime directory). The
 	// fragments are merged into Actions at load, so action changes never
 	// touch the main config file.
-	ActionsDir         string          `mapstructure:"actionsDir"`
+	ActionsDir string `mapstructure:"actionsDir"`
+	// AlarmsDir holds one `<kind>.toml` fragment per configured alarm. The
+	// fragments are merged into Alarms at load, so alarm changes never touch
+	// the main config file either.
+	AlarmsDir          string          `mapstructure:"alarmsDir"`
 	CloudURL           string          `mapstructure:"cloudUrl"`
 	CloudSecret        string          `mapstructure:"cloudSecret"`
 	MetricsInterval    time.Duration   `mapstructure:"metricsInterval"`
@@ -83,6 +87,24 @@ type DaemonConfig struct {
 	MaxConcurrentRuns  int             `mapstructure:"maxConcurrentRuns"`
 	Webhooks           []WebhookConfig `mapstructure:"webhooks"`
 	Actions            []WebhookConfig `mapstructure:"actions"`
+	Alarms             []AlarmConfig   `mapstructure:"alarms"`
+}
+
+// AlarmConfig declares one metric threshold the daemon evaluates against its
+// own samples. Evaluation is intentionally daemon-side: the daemon reports a
+// `daemon.alarm.<kind>` notification to the cloud when the threshold is
+// exceeded, so the cloud only stores and forwards the resulting notification
+// and never needs to reach back into the daemon.
+type AlarmConfig struct {
+	Kind string `mapstructure:"kind"`
+	// Threshold is the percentage (0..100] at or above which the alarm fires.
+	Threshold float64 `mapstructure:"threshold"`
+	// Enabled defaults to true when absent.
+	Enabled *bool `mapstructure:"enabled"`
+	// CooldownSeconds is the minimum gap between two triggers of the same
+	// alarm; it defaults to 300 when absent. It is evaluated in memory, so a
+	// daemon restart may re-fire once while the metric stays over threshold.
+	CooldownSeconds int `mapstructure:"cooldownSeconds"`
 }
 type WebhookConfig struct {
 	Name            string   `mapstructure:"name"`
@@ -180,6 +202,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.metricsRetentionDays", 7)
 	viper.SetDefault("daemon.auditPath", "/var/lib/maidcafe/audit.jsonl")
 	viper.SetDefault("daemon.actionsDir", "/etc/maidcafe/actions")
+	viper.SetDefault("daemon.alarmsDir", "/etc/maidcafe/alarms")
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -205,6 +228,9 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 	if err := cfg.loadActionFragments(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadAlarmFragments(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -283,6 +309,75 @@ func loadActionFragment(path string) (WebhookConfig, error) {
 	return hook, nil
 }
 
+// loadAlarmFragments merges every `<kind>.toml` under daemon.alarmsDir into
+// Daemon.Alarms, sorted by file name for deterministic ordering. A missing
+// or unreadable directory is not an error (a fresh host has no alarms yet);
+// a fragment that fails to parse or validate is. Each fragment is a flat
+// TOML file holding one alarm's fields — the same shape as an entry of
+// [[daemon.alarms]] — so alarm changes are isolated from the main config
+// file and never rewrite it. A fragment covering an inline alarm wins,
+// mirroring the action-fragment behavior.
+func (c *Config) loadAlarmFragments() error {
+	dir := strings.TrimSpace(c.Daemon.AlarmsDir)
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read alarms dir %s: %w", dir, err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".toml") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	fragments := make([]AlarmConfig, 0, len(paths))
+	kinds := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		alarm, err := loadAlarmFragment(path)
+		if err != nil {
+			return err
+		}
+		kinds[alarm.Kind] = struct{}{}
+		fragments = append(fragments, alarm)
+	}
+	inline := c.Daemon.Alarms
+	c.Daemon.Alarms = make([]AlarmConfig, 0, len(inline)+len(fragments))
+	for _, alarm := range inline {
+		if _, covered := kinds[alarm.Kind]; covered {
+			continue
+		}
+		c.Daemon.Alarms = append(c.Daemon.Alarms, alarm)
+	}
+	c.Daemon.Alarms = append(c.Daemon.Alarms, fragments...)
+	return nil
+}
+
+func loadAlarmFragment(path string) (AlarmConfig, error) {
+	v := viper.New()
+	v.SetConfigType("toml")
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return AlarmConfig{}, fmt.Errorf("read alarm fragment %s: %w", path, err)
+	}
+	var alarm AlarmConfig
+	if err := v.Unmarshal(&alarm); err != nil {
+		return AlarmConfig{}, fmt.Errorf("parse alarm fragment %s: %w", path, err)
+	}
+	if strings.TrimSpace(alarm.Kind) == "" {
+		return AlarmConfig{}, fmt.Errorf("alarm fragment %s has no kind", path)
+	}
+	return alarm, nil
+}
+
 func applyEnvAliases() {
 	aliases := map[string]string{
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
@@ -294,6 +389,7 @@ func applyEnvAliases() {
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
 		"DAEMON_AUDIT_PATH":             "daemon.auditPath",
 		"DAEMON_ACTIONS_DIR":            "daemon.actionsDir",
+		"DAEMON_ALARMS_DIR":             "daemon.alarmsDir",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
@@ -420,6 +516,30 @@ func (c *Config) ValidateDaemon() error {
 		}
 		if err := validateHookExecution(action, "actions", i); err != nil {
 			return err
+		}
+	}
+	alarmKinds := make(map[string]struct{}, len(c.Daemon.Alarms))
+	for i := range c.Daemon.Alarms {
+		alarm := &c.Daemon.Alarms[i]
+		alarm.Kind = strings.TrimSpace(alarm.Kind)
+		if alarm.Kind != "cpu_percent" && alarm.Kind != "memory_used_percent" {
+			return fmt.Errorf("daemon.alarms[%d].kind must be cpu_percent or memory_used_percent", i)
+		}
+		if _, ok := alarmKinds[alarm.Kind]; ok {
+			return fmt.Errorf("daemon.alarms[%d].kind %q is duplicated", i, alarm.Kind)
+		}
+		alarmKinds[alarm.Kind] = struct{}{}
+		if alarm.Threshold <= 0 || alarm.Threshold > 100 {
+			return fmt.Errorf("daemon.alarms[%d].threshold must be between 0 and 100", i)
+		}
+		if alarm.CooldownSeconds <= 0 {
+			alarm.CooldownSeconds = 300
+		}
+		// A fragment omitting `enabled` would otherwise silently disable the
+		// alarm; default it on so a minimal fragment does what it looks like.
+		if alarm.Enabled == nil {
+			enabled := true
+			alarm.Enabled = &enabled
 		}
 	}
 	if strings.TrimSpace(c.Daemon.CloudURL) != "" {

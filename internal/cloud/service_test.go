@@ -143,7 +143,7 @@ func TestMetricHistoryIsOwnedAndOrdered(t *testing.T) {
 		t.Fatalf("expected metric ownership error, got %v", err)
 	}
 }
-func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
+func TestMetricIngestAndPushRequestPersistence(t *testing.T) {
 	svc, db, publisher, _ := testService(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -151,23 +151,18 @@ func TestMetricAlarmAndPushRequestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetAlarm(ctx, "account-a", daemon.ID, AlarmInput{Kind: "cpu_percent", Threshold: 80, Enabled: true, CooldownSeconds: 300}); err != nil {
-		t.Fatal(err)
-	}
 	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{SentAt: time.Now(), CPUPercent: 90}); err != nil {
 		t.Fatal(err)
 	}
-	notifications, err := svc.ListNotifications(ctx, "account-a", "ws-a", false, daemon.ID, 50, nil)
-	if err != nil || len(notifications) != 1 || notifications[0].Kind != "daemon.alarm.cpu_percent" {
-		t.Fatalf("alarm notification: %v %#v", err, notifications)
+	// Alarms are evaluated daemon-side; ingest itself never publishes.
+	if len(publisher.events) != 0 {
+		t.Fatalf("metric ingest published %d events, want 0", len(publisher.events))
 	}
 	requested, err := svc.CreatePushNotification(ctx, "account-a", daemon.ID, NotificationInput{Kind: "maintenance", Title: "Restart", Body: "Restart after backup"})
 	if err != nil || requested.Title != "Restart" {
 		t.Fatalf("push request: %v %#v", err, requested)
 	}
-	if len(publisher.events) != 2 ||
-		publisher.events[0].Kind != "daemon.alarm.cpu_percent" ||
-		publisher.events[1].Kind != "maintenance" {
+	if len(publisher.events) != 1 || publisher.events[0].Kind != "maintenance" {
 		t.Fatalf("notification publication mismatch: %#v", publisher.events)
 	}
 }

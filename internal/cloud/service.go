@@ -211,23 +211,6 @@ type MetricView struct {
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
 }
-type AlarmView struct {
-	ID              string     `json:"id"`
-	DaemonID        string     `json:"daemon_id"`
-	Kind            string     `json:"kind"`
-	Threshold       float64    `json:"threshold"`
-	Enabled         bool       `json:"enabled"`
-	CooldownSeconds int        `json:"cooldown_seconds"`
-	LastTriggeredAt *time.Time `json:"last_triggered_at"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-}
-type AlarmInput struct {
-	Kind            string  `json:"kind"`
-	Threshold       float64 `json:"threshold"`
-	Enabled         bool    `json:"enabled"`
-	CooldownSeconds int     `json:"cooldown_seconds"`
-}
 type NotificationInput struct {
 	Kind     string          `json:"kind"`
 	Title    string          `json:"title"`
@@ -312,63 +295,6 @@ func (s *Service) ListMetrics(ctx context.Context, accountID, daemonID string, l
 		out[i] = MetricView{ID: row.ID, DaemonID: row.DaemonID, SentAt: row.SentAt, ReceivedAt: row.ReceivedAt, UptimeSeconds: row.UptimeSeconds, ProcessMemoryBytes: row.ProcessMemoryBytes, CPUPercent: row.CPUPercent, MemoryUsedPercent: row.MemoryUsedPercent, MemoryUsedBytes: row.MemoryUsedBytes, MemoryTotalBytes: row.MemoryTotalBytes, WebhookExecutions: row.WebhookExecutions, WebhookFailures: row.WebhookFailures}
 	}
 	return out, nil
-}
-func viewAlarm(row database.DaemonAlarm) AlarmView {
-	return AlarmView{ID: row.ID, DaemonID: row.DaemonID, Kind: row.Kind, Threshold: row.Threshold, Enabled: row.Enabled, CooldownSeconds: row.CooldownSeconds, LastTriggeredAt: row.LastTriggeredAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
-}
-func (s *Service) ListAlarms(ctx context.Context, accountID, daemonID string) ([]AlarmView, error) {
-	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
-		return nil, err
-	}
-	var rows []database.DaemonAlarm
-	if err := s.db.WithContext(ctx).Where("daemon_id = ?", daemonID).Order("created_at asc").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make([]AlarmView, len(rows))
-	for i := range rows {
-		out[i] = viewAlarm(rows[i])
-	}
-	return out, nil
-}
-func (s *Service) SetAlarm(ctx context.Context, accountID, daemonID string, input AlarmInput) (AlarmView, error) {
-	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
-		return AlarmView{}, err
-	}
-	input.Kind = strings.TrimSpace(input.Kind)
-	if input.Kind != "cpu_percent" && input.Kind != "memory_used_percent" {
-		return AlarmView{}, fmt.Errorf("kind must be cpu_percent or memory_used_percent")
-	}
-	if input.Threshold <= 0 || input.Threshold > 100 {
-		return AlarmView{}, fmt.Errorf("threshold must be between 0 and 100")
-	}
-	if input.CooldownSeconds <= 0 {
-		input.CooldownSeconds = 300
-	}
-	var row database.DaemonAlarm
-	err := s.db.WithContext(ctx).Where("daemon_id = ? AND kind = ?", daemonID, input.Kind).First(&row).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		row = database.DaemonAlarm{ID: uuid.NewString(), DaemonID: daemonID, Kind: input.Kind}
-	} else if err != nil {
-		return AlarmView{}, err
-	}
-	row.Threshold, row.Enabled, row.CooldownSeconds = input.Threshold, input.Enabled, input.CooldownSeconds
-	if err := s.db.WithContext(ctx).Save(&row).Error; err != nil {
-		return AlarmView{}, err
-	}
-	return viewAlarm(row), nil
-}
-func (s *Service) DeleteAlarm(ctx context.Context, accountID, daemonID, alarmID string) error {
-	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
-		return err
-	}
-	result := s.db.WithContext(ctx).Where("id = ? AND daemon_id = ?", alarmID, daemonID).Delete(&database.DaemonAlarm{})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 func (s *Service) GetDaemon(ctx context.Context, accountID, id string) (DaemonView, error) {
 	d, err := s.daemonForAccount(ctx, accountID, id)
@@ -461,44 +387,10 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}).Error; err != nil {
 		return err
 	}
-	if err := s.evaluateAlarms(ctx, d, input, now); err != nil {
-		return err
-	}
+	// Alarms are evaluated daemon-side: the daemon reports `daemon.alarm.*`
+	// notifications through CreateNotification when a threshold is exceeded,
+	// so the cloud only stores and forwards them.
 	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(map[string]any{"last_seen_at": now, "updated_at": now}).Error
-}
-func (s *Service) evaluateAlarms(ctx context.Context, daemon database.Daemon, input MetricInput, now time.Time) error {
-	var alarms []database.DaemonAlarm
-	if err := s.db.WithContext(ctx).Where("daemon_id = ? AND enabled = ?", daemon.ID, true).Find(&alarms).Error; err != nil {
-		return err
-	}
-	for i := range alarms {
-		alarm := &alarms[i]
-		value := input.CPUPercent
-		if alarm.Kind == "memory_used_percent" {
-			value = input.MemoryUsedPercent
-		}
-		if value < alarm.Threshold ||
-			(alarm.LastTriggeredAt != nil && now.Sub(*alarm.LastTriggeredAt) < time.Duration(alarm.CooldownSeconds)*time.Second) {
-			continue
-		}
-		notification := database.Notification{
-			ID: uuid.NewString(), AccountID: daemon.AccountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemon.ID,
-			Kind:      "daemon.alarm." + alarm.Kind,
-			Title:     fmt.Sprintf("%s threshold exceeded", alarm.Kind),
-			Body:      fmt.Sprintf("%s reached %.2f%% (threshold %.2f%%)", alarm.Kind, value, alarm.Threshold),
-			Metadata:  datatypes.JSON(fmt.Sprintf(`{"value":%.4f,"threshold":%.4f}`, value, alarm.Threshold)),
-			CreatedAt: now,
-		}
-		if err := s.db.WithContext(ctx).Create(&notification).Error; err != nil {
-			return err
-		}
-		alarm.LastTriggeredAt = &now
-		if err := s.db.WithContext(ctx).Save(alarm).Error; err != nil {
-			return err
-		}
-		s.publishNotification(ctx, notification)
-	}
-	return nil
 }
 func (s *Service) publishNotification(ctx context.Context, notification database.Notification) {
 	if s.publisher == nil {

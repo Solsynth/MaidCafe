@@ -8,6 +8,10 @@ metricsRetentionDays = 7
 cloudUrl = "https://mk.solsynth.dev"
 cloudSecret = "replace-with-cloud-issued-secret"
 metricsInterval = "1m"
+# One <kind>.toml fragment per configured alarm, merged at load. Alarms are
+# evaluated locally against each metric sample; the daemon reports a
+# daemon.alarm.<kind> notification to the cloud when a threshold is exceeded.
+alarmsDir = "/etc/maidcafe/alarms"
 # Every action/webhook execution is appended here as JSONL (rotated at 1 MiB,
 # one generation kept). Empty disables auditing.
 auditPath = "/var/lib/maidcafe/audit.jsonl"

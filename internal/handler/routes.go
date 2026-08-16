@@ -27,9 +27,6 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons", createDaemon(svc))
 	user.GET("/daemons", listDaemons(svc))
 	user.GET("/daemons/:id/metrics", listMetrics(svc))
-	user.GET("/daemons/:id/alarms", listAlarms(svc))
-	user.PUT("/daemons/:id/alarms", setAlarm(svc))
-	user.DELETE("/daemons/:id/alarms/:alarm_id", deleteAlarm(svc))
 	user.POST("/daemons/:id/push-notification", requestPushNotification(svc))
 	user.GET("/daemons/:id", getDaemon(svc))
 	user.PATCH("/daemons/:id", updateDaemon(svc))
@@ -147,43 +144,6 @@ func listMetrics(s *cloud.Service) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, out)
-	}
-}
-func listAlarms(s *cloud.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		out, err := s.ListAlarms(c, accountID(c), c.Param("id"))
-		if err != nil {
-			serviceStatus(c, err)
-			return
-		}
-		c.JSON(http.StatusOK, out)
-	}
-}
-func setAlarm(s *cloud.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var input cloud.AlarmInput
-		if !parseJSON(c, &input) {
-			return
-		}
-		out, err := s.SetAlarm(c, accountID(c), c.Param("id"), input)
-		if err != nil {
-			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
-				serviceStatus(c, err)
-			} else {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			}
-			return
-		}
-		c.JSON(http.StatusOK, out)
-	}
-}
-func deleteAlarm(s *cloud.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if err := s.DeleteAlarm(c, accountID(c), c.Param("id"), c.Param("alarm_id")); err != nil {
-			serviceStatus(c, err)
-			return
-		}
-		c.Status(http.StatusNoContent)
 	}
 }
 func requestPushNotification(s *cloud.Service) gin.HandlerFunc {

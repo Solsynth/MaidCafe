@@ -503,6 +503,7 @@ func TestEnvironmentOverrides(t *testing.T) {
 	t.Setenv("DAEMON_PROCESSES_INTERVAL", "3s")
 	t.Setenv("DAEMON_SYSTEMD_INTERVAL", "45s")
 	t.Setenv("DAEMON_PROCESSES_LIMIT", "77")
+	t.Setenv("DAEMON_ALARMS_DIR", "/etc/maidcafe/alarms")
 	t.Setenv("RING_TARGET", "metoer:9090")
 	cfg, err := Load(writeConfig(t, "[daemon]\nid = \"file-host\"\n"))
 	if err != nil {
@@ -516,7 +517,161 @@ func TestEnvironmentOverrides(t *testing.T) {
 		cfg.Daemon.ImagesInterval != 11*time.Second ||
 		cfg.Daemon.ProcessesInterval != 3*time.Second ||
 		cfg.Daemon.SystemdInterval != 45*time.Second ||
-		cfg.Daemon.ProcessesLimit != 77 {
+		cfg.Daemon.ProcessesLimit != 77 ||
+		cfg.Daemon.AlarmsDir != "/etc/maidcafe/alarms" {
 		t.Fatalf("stream environment overrides failed: %#v", cfg.Daemon)
+	}
+}
+
+func TestLoadMergesAlarmFragments(t *testing.T) {
+	dir := t.TempDir()
+	base := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+alarmsDir = "`+filepath.ToSlash(dir)+`"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "cpu_percent.toml"), []byte(`
+kind = "cpu_percent"
+threshold = 85
+cooldownSeconds = 120
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory_used_percent.toml"), []byte(`
+kind = "memory_used_percent"
+threshold = 90
+enabled = false
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("nope"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Alarms) != 2 {
+		t.Fatalf("merged alarms = %d, want 2 (%+v)", len(cfg.Daemon.Alarms), cfg.Daemon.Alarms)
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
+	}
+	cpu, memory := cfg.Daemon.Alarms[0], cfg.Daemon.Alarms[1]
+	if cpu.Kind != "cpu_percent" || memory.Kind != "memory_used_percent" {
+		t.Fatalf("unexpected order: %q, %q", cpu.Kind, memory.Kind)
+	}
+	if cpu.Threshold != 85 || cpu.CooldownSeconds != 120 {
+		t.Fatalf("cpu fragment fields not merged: %+v", cpu)
+	}
+	if memory.Threshold != 90 || memory.Enabled == nil || *memory.Enabled {
+		t.Fatalf("memory fragment fields not merged: %+v", memory)
+	}
+	// Validation defaults: absent enabled -> true, absent cooldown -> 300.
+	if cpu.Enabled == nil || !*cpu.Enabled {
+		t.Fatalf("cpu alarm enabled did not default to true: %+v", cpu)
+	}
+	if memory.CooldownSeconds != 300 {
+		t.Fatalf("memory alarm cooldown did not default to 300: %+v", memory)
+	}
+}
+
+func TestLoadAlarmFragmentOverridesLegacyInlineAlarm(t *testing.T) {
+	dir := t.TempDir()
+	base := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+alarmsDir = "`+filepath.ToSlash(dir)+`"
+
+[[daemon.alarms]]
+kind = "cpu_percent"
+threshold = 50
+`)
+	if err := os.WriteFile(filepath.Join(dir, "cpu_percent.toml"), []byte(`
+kind = "cpu_percent"
+threshold = 95
+cooldownSeconds = 60
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Alarms) != 1 {
+		t.Fatalf("merged alarms = %d, want 1 (%+v)", len(cfg.Daemon.Alarms), cfg.Daemon.Alarms)
+	}
+	if cfg.Daemon.Alarms[0].Threshold != 95 || cfg.Daemon.Alarms[0].CooldownSeconds != 60 {
+		t.Fatalf("fragment did not win over the inline entry: %+v", cfg.Daemon.Alarms[0])
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonRejectsInvalidAlarms(t *testing.T) {
+	cases := []struct {
+		name  string
+		alarm AlarmConfig
+	}{
+		{"unknown kind", AlarmConfig{Kind: "disk_used_percent", Threshold: 80}},
+		{"zero threshold", AlarmConfig{Kind: "cpu_percent", Threshold: 0}},
+		{"threshold above 100", AlarmConfig{Kind: "cpu_percent", Threshold: 120}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Daemon: DaemonConfig{
+				ID:                "host-1",
+				MetricsSecret:     "metrics-secret",
+				Alarms:            []AlarmConfig{tc.alarm},
+				MetricsInterval:   time.Minute,
+				StreamInterval:    time.Second,
+				ProcessesLimit:    50,
+				RequestTimeout:    10 * time.Second,
+				ScriptTimeout:     30 * time.Second,
+				MaxBodyBytes:      65536,
+				MaxConcurrentRuns: 4,
+			}}
+			if err := cfg.ValidateDaemon(); err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+		})
+	}
+	// Duplicate kinds are rejected too.
+	dup := Config{Daemon: DaemonConfig{
+		ID:                "host-1",
+		MetricsSecret:     "metrics-secret",
+		Alarms:            []AlarmConfig{{Kind: "cpu_percent", Threshold: 80}, {Kind: "cpu_percent", Threshold: 90}},
+		MetricsInterval:   time.Minute,
+		StreamInterval:    time.Second,
+		ProcessesLimit:    50,
+		RequestTimeout:    10 * time.Second,
+		ScriptTimeout:     30 * time.Second,
+		MaxBodyBytes:      65536,
+		MaxConcurrentRuns: 4,
+	}}
+	if err := dup.ValidateDaemon(); err == nil {
+		t.Fatal("expected duplicate-kind validation error")
+	}
+}
+
+func TestLoadIgnoresMissingAlarmsDir(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+alarmsDir = "`+filepath.ToSlash(filepath.Join(t.TempDir(), "missing"))+`"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Alarms) != 0 {
+		t.Fatalf("expected no alarms, got %+v", cfg.Daemon.Alarms)
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
 	}
 }

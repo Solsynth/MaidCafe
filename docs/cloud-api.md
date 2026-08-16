@@ -93,19 +93,12 @@ responses.
 
 ### Alarm
 
-```json
-{
-  "id": "77e1...",
-  "daemon_id": "d0f2f0c2-...",
-  "kind": "cpu_percent",
-  "threshold": 80,
-  "enabled": true,
-  "cooldown_seconds": 300,
-  "last_triggered_at": null,
-  "created_at": "2026-08-15T10:00:00Z",
-  "updated_at": "2026-08-15T10:00:00Z"
-}
-```
+Alarms are evaluated **daemon-side**: the daemon declares its thresholds in
+its own config (`[[daemon.alarms]]`, or one `<kind>.toml` fragment under
+`daemon.alarmsDir`) and reports a notification of kind `daemon.alarm.<kind>`
+through `POST /api/daemons/:id/notifications` when a sample crosses a
+threshold. The cloud stores and forwards the notification; it never stores
+alarm configuration or reaches back into the daemon.
 
 ### Notification
 
@@ -276,47 +269,9 @@ curl 'http://localhost:8080/api/daemons/d0f2f0c2-.../metrics?limit=50&before=202
 
 #### `GET /api/daemons/:id/alarms`
 
-List the daemon's alarms, oldest first.
-
-```sh
-curl http://localhost:8080/api/daemons/d0f2f0c2-.../alarms \
-  -H 'Authorization: Bearer <solar-token>'
-```
-
-`200` returns an array of alarms.
-
-#### `PUT /api/daemons/:id/alarms`
-
-Create or update the alarm for a metric kind (one alarm per kind).
-
-```sh
-curl -X PUT http://localhost:8080/api/daemons/d0f2f0c2-.../alarms \
-  -H 'Authorization: Bearer <solar-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"kind":"cpu_percent","threshold":80,"enabled":true,"cooldown_seconds":300}'
-```
-
-`200` returns the alarm.
-
-| Field | Type | Constraints |
-| --- | --- | --- |
-| `kind` | string | `cpu_percent` or `memory_used_percent` |
-| `threshold` | number | `0 < x <= 100` |
-| `enabled` | bool | required |
-| `cooldown_seconds` | int | default `300`; must be positive |
-
-When an ingested metric crosses the threshold, the cloud creates a
-notification of kind `daemon.alarm.<kind>` for the daemon's workspace.
-
-#### `DELETE /api/daemons/:id/alarms/:alarm_id`
-
-Remove an alarm. `204` on success; `404` if the alarm does not belong to the
-daemon.
-
-```sh
-curl -X DELETE http://localhost:8080/api/daemons/d0f2f0c2-.../alarms/77e1... \
-  -H 'Authorization: Bearer <solar-token>'
-```
+Removed: alarms are configured on the daemon (its own config and
+`daemon.alarmsDir` fragments) and evaluated locally; the cloud only receives
+the resulting `daemon.alarm.<kind>` notifications.
 
 #### `POST /api/daemons/:id/push-notification`
 
@@ -466,8 +421,9 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../metrics \
 | `cpu_percent` | `0..100` |
 | `memory_used_percent` | `0..100` |
 
-Ingestion also records `last_seen_at` on the daemon and evaluates enabled
-alarms.
+Ingestion records `last_seen_at` on the daemon. Alarm thresholds are
+evaluated daemon-side; the daemon reports the resulting notifications through
+`POST /api/daemons/:id/notifications`.
 
 #### `POST /api/daemons/:id/notifications`
 
@@ -531,8 +487,9 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests/3f9
    daemon configuration (`daemon.cloudUrl` + `daemon.cloudSecret`).
 2. The daemon polls `GET /api/daemons/:id/webhook-requests/pending`, executes
    leased requests locally, and reports results.
-3. The daemon pushes metrics on its interval and notifications on webhook
-   success/failure; the cloud stamps `received_at` and `last_seen_at`.
-4. Workspace members list daemons, metrics, alarms, and notifications, and
-   invoke webhooks through the relay. Everything is scoped to the workspace
+3. The daemon pushes metrics on its interval, evaluates its configured
+   alarms against each sample, and reports webhook and alarm notifications
+   on success/failure; the cloud stamps `received_at` and `last_seen_at`.
+4. Workspace members list daemons, metrics, and notifications, and invoke
+   webhooks through the relay. Everything is scoped to the workspace
    the daemon belongs to.
