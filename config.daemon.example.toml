@@ -39,9 +39,9 @@ enabled = true
 
 # Deployed scripts may also pick a working directory, a run-as user, and
 # environment assignments. Running as another user goes through sudo, so the
-# daemon needs the sudoers rule MaidKit installs for it:
-#   maidcafe ALL=(<user>) NOPASSWD: /etc/maidcafe/actions/*
-# cwd must be an absolute path; env entries are KEY=VALUE.
+# daemon needs the sudoers rule MaidKit installs for it (note the two specs —
+# sudoers wildcards do not cross "/", and user-mode scripts render under .run):
+#   maidcafe ALL=(<user>) NOPASSWD: /etc/maidcafe/actions/.run/*, /etc/maidcafe/actions/*
 [[daemon.actions]]
 name = "deploy"
 command = "/etc/maidcafe/actions/deploy.sh"

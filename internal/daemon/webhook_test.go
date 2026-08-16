@@ -226,11 +226,14 @@ func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
 		Env:     []string{"CI_BUILD=42", "SPACED=two words"},
 	}
 	cmd := buildRunCommand(context.Background(), hook, hook.Command, []string{"--force"})
+	// The command stays the absolute script path (never a shell wrapper) so
+	// the sudoers rule `/etc/maidcafe/actions/*` matches it; the working
+	// directory rides on sudo -D.
 	want := []string{
 		"sudo", "-H", "-u", "deploy",
+		"-D", "/srv/myapp",
 		"CI_BUILD=42", "SPACED=two words",
-		"sh", "-c", `cd -- "$1" && shift && exec "$@"`,
-		"maidcafe", "/srv/myapp", "/etc/maidcafe/actions/deploy.sh", "--force",
+		"/etc/maidcafe/actions/deploy.sh", "--force",
 	}
 	if len(cmd.Args) != len(want) {
 		t.Fatalf("argv = %v", cmd.Args)
@@ -241,7 +244,7 @@ func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
 		}
 	}
 
-	// Without a cwd the wrapper is skipped.
+	// Without a cwd no -D is passed and the command still comes last.
 	noCwd := buildRunCommand(context.Background(), config.WebhookConfig{
 		Command: "/bin/true", User: "deploy",
 	}, "/bin/true", nil)
@@ -340,8 +343,19 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root to switch users through sudo")
 	}
+	// The whole chain must be traversable by the target user: the rendered
+	// script lives in <script dir>/.run (0755) and the cwd needs world
+	// traverse, since the injected `cd` runs as the target user.
+	workDir := t.TempDir()
+	if err := os.Chmod(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(workDir, "work")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	output := filepath.Join(t.TempDir(), "who")
-	script := executable(t, "#!/bin/sh\nid -un > "+output+"\n")
+	script := executable(t, "#!/bin/sh\nid -un > "+output+"\npwd >> "+output+"\n")
 	cfg := config.DaemonConfig{
 		ScriptTimeout:     time.Second,
 		MaxBodyBytes:      1024,
@@ -349,8 +363,10 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 		Actions: []config.WebhookConfig{{
 			Name:    "as-user",
 			Command: script,
+			Script:  true,
 			Enabled: true,
 			User:    "nobody",
+			Cwd:     cwd,
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
@@ -365,8 +381,44 @@ func TestExecuteUserActionThroughSudo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(got)) != "nobody" {
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	if len(lines) != 2 || lines[0] != "nobody" {
 		t.Fatalf("ran as %q, want nobody", strings.TrimSpace(string(got)))
+	}
+	realCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines[1] != realCwd {
+		t.Fatalf("pwd = %q, want %q", lines[1], realCwd)
+	}
+}
+
+func TestPrependWorkingDirectory(t *testing.T) {
+	// Inserted after the shebang, which must stay on line one.
+	got := prependWorkingDirectory("/srv/myapp", []byte("#!/bin/sh\necho hi\n"))
+	want := "#!/bin/sh\ncd -- '/srv/myapp'\necho hi\n"
+	if string(got) != want {
+		t.Fatalf("prepend = %q, want %q", got, want)
+	}
+
+	// Single quotes in the cwd are escaped so the line stays one argument.
+	got = prependWorkingDirectory("/srv/it's", []byte("#!/bin/sh\npwd\n"))
+	want = "#!/bin/sh\ncd -- '/srv/it'\\''s'\npwd\n"
+	if string(got) != want {
+		t.Fatalf("quoting = %q, want %q", got, want)
+	}
+
+	// A body without a shebang gets the line at the top.
+	got = prependWorkingDirectory("/srv/app", []byte("echo hi\n"))
+	if string(got) != "cd -- '/srv/app'\necho hi\n" {
+		t.Fatalf("no-shebang prepend = %q", got)
+	}
+
+	// A bare shebang without a newline still yields a valid script.
+	got = prependWorkingDirectory("/srv/app", []byte("#!/bin/sh"))
+	if string(got) != "#!/bin/sh\ncd -- '/srv/app'\n" {
+		t.Fatalf("bare shebang = %q", got)
 	}
 }
 

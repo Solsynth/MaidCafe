@@ -51,8 +51,8 @@ GET /health
 - Request bodies are opaque stdin bytes. They are never parsed, templated, or
   appended to command arguments.
 - Commands run directly with `exec.CommandContext`; the daemon never invokes
-  `sh -c` except for the fixed working-directory wrapper of user-switching
-  runs (see below).
+  `sh -c` (script actions apply their working directory with a `cd` line
+  prepended to the rendered body instead).
 - Static configured arguments only.
 - Absolute command paths and controlled working directory.
 - Per-hook `cwd` (absolute working directory), `env` (`KEY=VALUE`
@@ -62,11 +62,12 @@ GET /health
 - `user` runs are delegated to `sudo -H -u <user>`, so the daemon process
   itself stays unprivileged. Environment assignments are passed as
   command-line `VAR=value` entries (sudo applies them on top of its reset
-  environment) and the working directory is applied by a fixed `sh -c`
-  wrapper; no request-controlled input is ever interpolated into it. The
-  sudoers rule granting the daemon the right to run MaidKit-deployed scripts
-  as the configured users is installed by MaidKit; hand-configured entries
-  must provide their own rule.
+  environment) and the working directory is applied with sudo `-D` for plain
+  commands (sudo 1.9.9+) or a `cd` line prepended to script bodies — the
+  executed command is always the configured absolute path, never a shell
+  wrapper, so the sudoers rule matches it. The sudoers rule granting the
+  daemon the right to run MaidKit-deployed scripts as the configured users is
+  installed by MaidKit; hand-configured entries must provide their own rule.
 - Script actions that run as another user render their substituted body next
   to the deployed script under a hidden `.run` directory (0755, created on
   demand), so the target account can read and execute them; the daemon user
@@ -368,9 +369,12 @@ and the daemon account needs a sudoers rule such as:
 
 ```sh
 sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidcafe-actions <<'EOF'
-maidcafe ALL=(deploy) NOPASSWD: /etc/maidcafe/actions/*
+maidcafe ALL=(deploy) NOPASSWD: /etc/maidcafe/actions/.run/*, /etc/maidcafe/actions/*
 EOF
 ```
+
+The two specs matter: user-mode script actions render their substituted body
+under `/etc/maidcafe/actions/.run/`, and sudoers wildcards do not cross `/`.
 
 The same rule must exist for the SSH user that runs the daemon in `stdio`
 transport mode. MaidKit deploys all of this automatically when an action
