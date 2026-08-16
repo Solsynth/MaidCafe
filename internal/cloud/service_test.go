@@ -151,12 +151,41 @@ func TestMetricIngestAndPushRequestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{SentAt: time.Now(), CPUPercent: 90}); err != nil {
-		t.Fatal(err)
+	// The daemon reports the full MetricsPayload (load/swap/disk/net extras);
+	// the strict decoder must accept it or every push 400s and last_seen_at
+	// never updates.
+	now := time.Now().UTC()
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{
+		SentAt: now, UptimeSeconds: 42, ProcessMemoryBytes: 1024,
+		CPUPercent: 12.5, CPUCount: 4,
+		Load1: 0.5, Load5: 0.4, Load15: 0.3,
+		MemoryUsedPercent: 55, MemoryUsedBytes: 1 << 30, MemoryTotalBytes: 2 << 30,
+		SwapTotalKb: 1024, SwapFreeKb: 512,
+		DiskTotalKb: 102400, DiskAvailableKb: 51200,
+		NetRxBytes: 100, NetTxBytes: 200,
+		WebhookExecutions: 2, WebhookFailures: 1,
+	}); err != nil {
+		t.Fatalf("full daemon payload rejected: %v", err)
 	}
 	// Alarms are evaluated daemon-side; ingest itself never publishes.
 	if len(publisher.events) != 0 {
 		t.Fatalf("metric ingest published %d events, want 0", len(publisher.events))
+	}
+	history, err := svc.ListMetrics(ctx, "account-a", daemon.ID, 100, nil)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("metric history: %v %#v", err, history)
+	}
+	m := history[0]
+	if m.CPUCount != 4 || m.Load1 != 0.5 || m.SwapTotalKb != 1024 ||
+		m.DiskAvailableKb != 51200 || m.NetTxBytes != 200 {
+		t.Fatalf("metric extras not stored: %+v", m)
+	}
+	var row database.Daemon
+	if err := db.WithContext(ctx).Where("id = ?", daemon.ID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.LastSeenAt == nil || row.LastSeenAt.Before(now.Add(-time.Minute)) {
+		t.Fatalf("last_seen_at not updated: %+v", row)
 	}
 	requested, err := svc.CreatePushNotification(ctx, "account-a", daemon.ID, NotificationInput{Kind: "maintenance", Title: "Restart", Body: "Restart after backup"})
 	if err != nil || requested.Title != "Restart" {

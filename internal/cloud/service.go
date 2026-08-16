@@ -191,9 +191,19 @@ type MetricInput struct {
 	UptimeSeconds      int64     `json:"uptime_seconds"`
 	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
 	CPUPercent         float64   `json:"cpu_percent"`
+	CPUCount           int       `json:"cpu_count"`
+	Load1              float64   `json:"load1"`
+	Load5              float64   `json:"load5"`
+	Load15             float64   `json:"load15"`
 	MemoryUsedPercent  float64   `json:"memory_used_percent"`
 	MemoryUsedBytes    uint64    `json:"memory_used_bytes"`
 	MemoryTotalBytes   uint64    `json:"memory_total_bytes"`
+	SwapTotalKb        int64     `json:"swap_total_kb"`
+	SwapFreeKb         int64     `json:"swap_free_kb"`
+	DiskTotalKb        int64     `json:"disk_total_kb"`
+	DiskAvailableKb    int64     `json:"disk_available_kb"`
+	NetRxBytes         uint64    `json:"net_rx_bytes"`
+	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
 }
@@ -205,9 +215,19 @@ type MetricView struct {
 	UptimeSeconds      int64     `json:"uptime_seconds"`
 	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
 	CPUPercent         float64   `json:"cpu_percent"`
+	CPUCount           int       `json:"cpu_count"`
+	Load1              float64   `json:"load1"`
+	Load5              float64   `json:"load5"`
+	Load15             float64   `json:"load15"`
 	MemoryUsedPercent  float64   `json:"memory_used_percent"`
 	MemoryUsedBytes    uint64    `json:"memory_used_bytes"`
 	MemoryTotalBytes   uint64    `json:"memory_total_bytes"`
+	SwapTotalKb        int64     `json:"swap_total_kb"`
+	SwapFreeKb         int64     `json:"swap_free_kb"`
+	DiskTotalKb        int64     `json:"disk_total_kb"`
+	DiskAvailableKb    int64     `json:"disk_available_kb"`
+	NetRxBytes         uint64    `json:"net_rx_bytes"`
+	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
 }
@@ -292,7 +312,7 @@ func (s *Service) ListMetrics(ctx context.Context, accountID, daemonID string, l
 	}
 	out := make([]MetricView, len(rows))
 	for i, row := range rows {
-		out[i] = MetricView{ID: row.ID, DaemonID: row.DaemonID, SentAt: row.SentAt, ReceivedAt: row.ReceivedAt, UptimeSeconds: row.UptimeSeconds, ProcessMemoryBytes: row.ProcessMemoryBytes, CPUPercent: row.CPUPercent, MemoryUsedPercent: row.MemoryUsedPercent, MemoryUsedBytes: row.MemoryUsedBytes, MemoryTotalBytes: row.MemoryTotalBytes, WebhookExecutions: row.WebhookExecutions, WebhookFailures: row.WebhookFailures}
+		out[i] = MetricView{ID: row.ID, DaemonID: row.DaemonID, SentAt: row.SentAt, ReceivedAt: row.ReceivedAt, UptimeSeconds: row.UptimeSeconds, ProcessMemoryBytes: row.ProcessMemoryBytes, CPUPercent: row.CPUPercent, CPUCount: row.CPUCount, Load1: row.Load1, Load5: row.Load5, Load15: row.Load15, MemoryUsedPercent: row.MemoryUsedPercent, MemoryUsedBytes: row.MemoryUsedBytes, MemoryTotalBytes: row.MemoryTotalBytes, SwapTotalKb: row.SwapTotalKb, SwapFreeKb: row.SwapFreeKb, DiskTotalKb: row.DiskTotalKb, DiskAvailableKb: row.DiskAvailableKb, NetRxBytes: row.NetRxBytes, NetTxBytes: row.NetTxBytes, WebhookExecutions: row.WebhookExecutions, WebhookFailures: row.WebhookFailures}
 	}
 	return out, nil
 }
@@ -381,8 +401,13 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	if err := s.db.WithContext(ctx).Create(&database.DaemonMetric{
 		ID: uuid.NewString(), DaemonID: d.ID, SentAt: input.SentAt.UTC(), ReceivedAt: now,
 		UptimeSeconds: input.UptimeSeconds, ProcessMemoryBytes: input.ProcessMemoryBytes,
-		CPUPercent: input.CPUPercent, MemoryUsedPercent: input.MemoryUsedPercent,
+		CPUPercent: input.CPUPercent, CPUCount: input.CPUCount,
+		Load1: input.Load1, Load5: input.Load5, Load15: input.Load15,
+		MemoryUsedPercent: input.MemoryUsedPercent,
 		MemoryUsedBytes: input.MemoryUsedBytes, MemoryTotalBytes: input.MemoryTotalBytes,
+		SwapTotalKb: input.SwapTotalKb, SwapFreeKb: input.SwapFreeKb,
+		DiskTotalKb: input.DiskTotalKb, DiskAvailableKb: input.DiskAvailableKb,
+		NetRxBytes: input.NetRxBytes, NetTxBytes: input.NetTxBytes,
 		WebhookExecutions: input.WebhookExecutions, WebhookFailures: input.WebhookFailures,
 	}).Error; err != nil {
 		return err

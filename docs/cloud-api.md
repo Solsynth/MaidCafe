@@ -83,13 +83,27 @@ responses.
   "uptime_seconds": 86400,
   "process_memory_bytes": 52428800,
   "cpu_percent": 12.5,
+  "cpu_count": 4,
+  "load1": 0.5,
+  "load5": 0.4,
+  "load15": 0.3,
   "memory_used_percent": 41.2,
   "memory_used_bytes": 8430546944,
   "memory_total_bytes": 20462829568,
+  "swap_total_kb": 2097152,
+  "swap_free_kb": 1048576,
+  "disk_total_kb": 102400,
+  "disk_available_kb": 51200,
+  "net_rx_bytes": 100,
+  "net_tx_bytes": 200,
   "webhook_executions": 42,
   "webhook_failures": 1
 }
 ```
+
+The daemon reports the full sample (including the load, swap, disk and
+network extras) every `metricsInterval`; the cloud stores it and stamps
+`last_seen_at` on the daemon.
 
 ### Alarm
 

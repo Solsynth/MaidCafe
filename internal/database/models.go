@@ -26,9 +26,19 @@ type DaemonMetric struct {
 	UptimeSeconds      int64
 	ProcessMemoryBytes int64
 	CPUPercent         float64
+	CPUCount           int
+	Load1              float64
+	Load5              float64
+	Load15             float64
 	MemoryUsedPercent  float64
 	MemoryUsedBytes    uint64
 	MemoryTotalBytes   uint64
+	SwapTotalKb        int64
+	SwapFreeKb         int64
+	DiskTotalKb        int64
+	DiskAvailableKb    int64
+	NetRxBytes         uint64
+	NetTxBytes         uint64
 	WebhookExecutions  uint64
 	WebhookFailures    uint64
 }
