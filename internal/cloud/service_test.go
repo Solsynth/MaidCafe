@@ -1,11 +1,11 @@
 package cloud
 
 import (
-	"strings"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,12 +96,23 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	notification, err := svc.CreateNotification(ctx, daemon.ID, daemon.Secret, NotificationInput{Kind: "webhook.failure", Title: "failed", Body: "details", Metadata: json.RawMessage(`{"x":1}`)})
+	notification, err := svc.CreateNotification(ctx, daemon.ID, daemon.Secret, NotificationInput{Kind: "webhook.failure", Title: "failed", Subtitle: "nightly", Body: "details", Metadata: json.RawMessage(`{"x":1}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(publisher.events) != 1 || publisher.events[0].NotificationID != notification.ID {
 		t.Fatalf("event mismatch: %#v", publisher.events)
+	}
+	event := publisher.events[0]
+	if event.Subtitle != "nightly" {
+		t.Fatalf("event subtitle missing: %#v", event)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(event.Metadata, &meta); err != nil {
+		t.Fatalf("event metadata: %v", err)
+	}
+	if meta["daemon_id"] != daemon.ID || meta["daemon_name"] != "host" || meta["x"] != float64(1) {
+		t.Fatalf("unexpected enriched metadata: %#v", meta)
 	}
 	rows, err := svc.ListNotifications(ctx, "account-a", "ws-a", true, "", 50, nil)
 	if err != nil || len(rows) != 1 {

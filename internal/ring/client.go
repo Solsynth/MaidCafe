@@ -53,6 +53,7 @@ func (c *Client) Publish(ctx context.Context, event cloud.NotificationEvent) err
 		Notification: &gen.DyPushNotification{
 			Topic:     event.Kind,
 			Title:     event.Title,
+			Subtitle:  event.Subtitle,
 			Body:      event.Body,
 			Meta:      event.Metadata,
 			IsSavable: true,

@@ -393,6 +393,48 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		})
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
+	// Custom notification: any local tool (the `notify` CLI included) can
+	// send a fully customized title/subtitle/body payload through the daemon
+	// to the cloud and on to the user's Metoer feed.
+	router.POST("/api/v1/notifications", authorizeMetrics, func(c *gin.Context) {
+		if app.publisher == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "cloud relay is not configured"})
+			return
+		}
+		var in struct {
+			Kind     string         `json:"kind"`
+			Title    string         `json:"title"`
+			Subtitle string         `json:"subtitle"`
+			Body     string         `json:"body"`
+			Metadata map[string]any `json:"metadata"`
+		}
+		if err := c.ShouldBindJSON(&in); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid JSON body"})
+			return
+		}
+		kind := strings.TrimSpace(in.Kind)
+		if kind == "" {
+			kind = "daemon.notification"
+		}
+		title := strings.TrimSpace(in.Title)
+		body := strings.TrimSpace(in.Body)
+		if title == "" || body == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "title and body are required"})
+			return
+		}
+		if len(body) > 4096 {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "body must be at most 4096 bytes"})
+			return
+		}
+		app.publisher.PublishNotification(context.Background(), notificationPayload{
+			Kind:     kind,
+			Title:    title,
+			Subtitle: strings.TrimSpace(in.Subtitle),
+			Body:     body,
+			Metadata: in.Metadata,
+		})
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 	app.server = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           router,

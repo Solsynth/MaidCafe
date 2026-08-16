@@ -17,6 +17,7 @@ import (
 type notificationPayload struct {
 	Kind     string         `json:"kind"`
 	Title    string         `json:"title"`
+	Subtitle string         `json:"subtitle,omitempty"`
 	Body     string         `json:"body"`
 	Metadata map[string]any `json:"metadata"`
 }

@@ -64,23 +64,24 @@ type Notification struct {
 	AccountID   string         `gorm:"size:191;index;not null"`
 	WorkspaceID string         `gorm:"size:191;index;not null"`
 	DaemonID    string         `gorm:"size:191;index;not null"`
-	Kind      string         `gorm:"size:128;not null"`
-	Title     string         `gorm:"size:128;not null"`
-	Body      string         `gorm:"size:4096;not null"`
-	Metadata  datatypes.JSON `gorm:"type:json"`
-	ReadAt    *time.Time
-	CreatedAt time.Time
+	Kind        string         `gorm:"size:128;not null"`
+	Title       string         `gorm:"size:128;not null"`
+	Subtitle    string         `gorm:"size:128"`
+	Body        string         `gorm:"size:4096;not null"`
+	Metadata    datatypes.JSON `gorm:"type:json"`
+	ReadAt      *time.Time
+	CreatedAt   time.Time
 }
 
 // WebhookRequest is a webhook invocation queued through the MaidKit cloud
 // relay. The daemon polls for pending requests, verifies the HMAC signature
 // against its own config, executes the webhook and stores the result here.
 type WebhookRequest struct {
-	ID          string `gorm:"type:char(36);primaryKey"`
-	DaemonID    string `gorm:"size:191;index;not null"`
-	Name        string `gorm:"size:128;not null"`
-	Body        []byte `gorm:"type:bytea;not null"`
-	Signature   string `gorm:"size:128;not null"`
+	ID        string `gorm:"type:char(36);primaryKey"`
+	DaemonID  string `gorm:"size:191;index;not null"`
+	Name      string `gorm:"size:128;not null"`
+	Body      []byte `gorm:"type:bytea;not null"`
+	Signature string `gorm:"size:128;not null"`
 	// InvokedBy names the caller: a Solarpass handle or a credential label.
 	InvokedBy   string `gorm:"size:191"`
 	Status      string `gorm:"size:16;not null;index"`

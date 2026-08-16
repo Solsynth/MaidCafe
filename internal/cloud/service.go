@@ -18,11 +18,11 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/datatypes"
-	"gorm.io/gorm"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
 	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
@@ -118,6 +118,7 @@ type NotificationEvent struct {
 	NotificationID string          `json:"notification_id"`
 	Kind           string          `json:"kind"`
 	Title          string          `json:"title"`
+	Subtitle       string          `json:"subtitle,omitempty"`
 	Body           string          `json:"body"`
 	Metadata       json.RawMessage `json:"metadata,omitempty"`
 }
@@ -188,6 +189,7 @@ type NotificationView struct {
 	DaemonID    string         `json:"daemon_id"`
 	Kind        string         `json:"kind"`
 	Title       string         `json:"title"`
+	Subtitle    string         `json:"subtitle,omitempty"`
 	Body        string         `json:"body"`
 	Metadata    datatypes.JSON `json:"metadata"`
 	ReadAt      *time.Time     `json:"read_at"`
@@ -242,8 +244,9 @@ type MetricView struct {
 type NotificationInput struct {
 	Kind     string          `json:"kind"`
 	Title    string          `json:"title"`
+	Subtitle string          `json:"subtitle,omitempty"`
 	Body     string          `json:"body"`
-	Metadata json.RawMessage `json:"metadata"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // ActionInput is one action the daemon reports for cloud-side listing. The
@@ -421,6 +424,7 @@ func (s *Service) authenticateDaemon(ctx context.Context, id, secret string) (da
 	}
 	return d, nil
 }
+
 // SyncActions replaces the action list the daemon reported for cloud-side
 // listing. Authenticated with the daemon secret, like metric ingest.
 func (s *Service) SyncActions(ctx context.Context, id, secret string, input []ActionInput) error {
@@ -498,7 +502,7 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		CPUPercent: input.CPUPercent, CPUCount: input.CPUCount,
 		Load1: input.Load1, Load5: input.Load5, Load15: input.Load15,
 		MemoryUsedPercent: input.MemoryUsedPercent,
-		MemoryUsedBytes: input.MemoryUsedBytes, MemoryTotalBytes: input.MemoryTotalBytes,
+		MemoryUsedBytes:   input.MemoryUsedBytes, MemoryTotalBytes: input.MemoryTotalBytes,
 		SwapTotalKb: input.SwapTotalKb, SwapFreeKb: input.SwapFreeKb,
 		DiskTotalKb: input.DiskTotalKb, DiskAvailableKb: input.DiskAvailableKb,
 		NetRxBytes: input.NetRxBytes, NetTxBytes: input.NetTxBytes,
@@ -515,9 +519,27 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}
 	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(updates).Error
 }
-func (s *Service) publishNotification(ctx context.Context, notification database.Notification) error {
+func (s *Service) publishNotification(ctx context.Context, daemon database.Daemon, notification database.Notification) error {
 	if s.publisher == nil {
 		return nil
+	}
+	// Enrich the payload metadata with the daemon's identity so the feed can
+	// show which server sent the notification. Daemon-supplied keys are kept;
+	// the identity fields are authoritative and always win.
+	meta := map[string]any{}
+	if len(notification.Metadata) > 0 {
+		if err := json.Unmarshal(notification.Metadata, &meta); err != nil {
+			meta = map[string]any{}
+		}
+	}
+	meta["daemon_id"] = daemon.ID
+	meta["daemon_name"] = daemon.Name
+	if daemon.HostID != "" {
+		meta["host_id"] = daemon.HostID
+	}
+	merged, err := json.Marshal(meta)
+	if err != nil {
+		merged = notification.Metadata
 	}
 	event := NotificationEvent{
 		EventID:        uuid.NewString(),
@@ -528,8 +550,9 @@ func (s *Service) publishNotification(ctx context.Context, notification database
 		NotificationID: notification.ID,
 		Kind:           notification.Kind,
 		Title:          notification.Title,
+		Subtitle:       notification.Subtitle,
 		Body:           notification.Body,
-		Metadata:       json.RawMessage(notification.Metadata),
+		Metadata:       merged,
 	}
 	if err := s.publisher.Publish(ctx, event); err != nil {
 		s.logger.Error("publish notification to Metoer failed",
@@ -553,6 +576,10 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err != nil {
 		return NotificationView{}, fmt.Errorf("title: %w", err)
 	}
+	subtitle := strings.TrimSpace(input.Subtitle)
+	if subtitle != "" && (len(subtitle) > 128 || !utf8.ValidString(subtitle)) {
+		return NotificationView{}, fmt.Errorf("subtitle exceeds bounds")
+	}
 	body := strings.TrimSpace(input.Body)
 	if body == "" || len(body) > 4096 || !utf8.ValidString(body) {
 		return NotificationView{}, fmt.Errorf("body is required and must be at most 4096 bytes")
@@ -569,11 +596,11 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err != nil || len(normalized) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
-	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemonID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
+	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemonID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
 	}
-	if err := s.publishNotification(ctx, row); err != nil {
+	if err := s.publishNotification(ctx, daemon, row); err != nil {
 		return NotificationView{}, err
 	}
 	return notificationView(row), nil
@@ -602,6 +629,10 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 		return NotificationView{}, fmt.Errorf("body exceeds bounds")
 	}
 	body := strings.TrimSpace(input.Body)
+	subtitle := strings.TrimSpace(input.Subtitle)
+	if subtitle != "" && (len(subtitle) > 128 || !utf8.ValidString(subtitle)) {
+		return NotificationView{}, fmt.Errorf("subtitle exceeds bounds")
+	}
 	if body == "" {
 		return NotificationView{}, fmt.Errorf("body is required")
 	}
@@ -617,17 +648,17 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err != nil || len(metadata) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
-	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID, DaemonID: d.ID, Kind: kind, Title: title, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
+	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID, DaemonID: d.ID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err
 	}
-	if err := s.publishNotification(ctx, n); err != nil {
+	if err := s.publishNotification(ctx, d, n); err != nil {
 		return NotificationView{}, err
 	}
 	return notificationView(n), nil
 }
 func notificationView(n database.Notification) NotificationView {
-	return NotificationView{ID: n.ID, AccountID: n.AccountID, WorkspaceID: n.WorkspaceID, DaemonID: n.DaemonID, Kind: n.Kind, Title: n.Title, Body: n.Body, Metadata: n.Metadata, ReadAt: n.ReadAt, CreatedAt: n.CreatedAt}
+	return NotificationView{ID: n.ID, AccountID: n.AccountID, WorkspaceID: n.WorkspaceID, DaemonID: n.DaemonID, Kind: n.Kind, Title: n.Title, Subtitle: n.Subtitle, Body: n.Body, Metadata: n.Metadata, ReadAt: n.ReadAt, CreatedAt: n.CreatedAt}
 }
 func (s *Service) ListNotifications(ctx context.Context, accountID, workspaceID string, unread bool, daemonID string, limit int, before *time.Time) ([]NotificationView, error) {
 	workspaceID = strings.TrimSpace(workspaceID)

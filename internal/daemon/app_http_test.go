@@ -811,3 +811,74 @@ func TestWatchedProcessesAPI(t *testing.T) {
 		t.Fatalf("app.Run returned: %v", err)
 	}
 }
+
+func TestCustomNotificationEndpoint(t *testing.T) {
+	cfg := config.DaemonConfig{
+		ID:                "notify-host",
+		Transport:         "http",
+		Listen:            "127.0.0.1:0",
+		MetricsSecret:     "metrics-secret",
+		CloudURL:          "https://cloud.invalid",
+		CloudSecret:       "cloud-secret",
+		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Second,
+		Runtimes:          []string{"java"},
+		ProcessesLimit:    50,
+		RequestTimeout:    200 * time.Millisecond,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+	}
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	defer app.Shutdown(ctx)
+	baseURL := "http://" + app.ListenAddr()
+
+	post := func(body string, authorized bool) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/notifications", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorized {
+			req.Header.Set("Authorization", "Bearer metrics-secret")
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	if resp := post(`{"title":"t","body":"b"}`, false); resp.StatusCode != http.StatusUnauthorized {
+		resp.Body.Close()
+		t.Fatalf("unauthenticated status = %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	if resp := post(`{not json`, true); resp.StatusCode != http.StatusBadRequest {
+		resp.Body.Close()
+		t.Fatalf("malformed body status = %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	if resp := post(`{"title":"t"}`, true); resp.StatusCode != http.StatusBadRequest {
+		resp.Body.Close()
+		t.Fatalf("missing body status = %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	if resp := post(`{"title":"Deploy done","subtitle":"prod-vps","body":"it works","kind":"deploy.finished","metadata":{"x":1}}`, true); resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("valid payload status = %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+}

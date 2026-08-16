@@ -12,6 +12,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "notify" {
+		notifyCmd(os.Args[2:])
+		return
+	}
 	configPath := flag.String("config", "", "configuration file path")
 	flag.Parse()
 	cfg, err := config.Load(*configPath)
