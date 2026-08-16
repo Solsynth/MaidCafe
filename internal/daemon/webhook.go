@@ -230,14 +230,14 @@ func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature str
 // unprivileged; the sudoers rule granting the daemon the right to run
 // MaidKit-deployed scripts as that user is installed by MaidKit). The command
 // stays the configured absolute path — never a shell wrapper — so the sudoers
-// rule matches it (a wrapper like `sh -c ...` would match the rule against
-// `sh` and fall through to a password prompt). Environment entries are passed
-// as command-line VAR=value assignments so sudo's env_reset still applies
-// them; HOME is set to the target user's home with -H; a non-empty working
-// directory is applied with sudo -D (requires sudo 1.9.9+).
+// rule matches it. Environment entries are passed as command-line VAR=value
+// assignments so sudo's env_reset still applies them; HOME is set to the
+// target user's home with -H.
 //
-// Script actions never need -D: the executor prepends `cd` to the rendered
-// body instead, which works on every sudo version.
+// The working directory is applied without sudo -D (which default sudoers
+// rules reject): script actions already carry an injected `cd` line in their
+// body, and plain commands inherit the daemon-set cwd, since sudo does not
+// reset the working directory of the command it runs.
 func buildRunCommand(ctx context.Context, hook config.WebhookConfig, command string, args []string) *exec.Cmd {
 	if hook.User == "" {
 		cmd := exec.CommandContext(ctx, command, args...)
@@ -251,13 +251,17 @@ func buildRunCommand(ctx context.Context, hook config.WebhookConfig, command str
 		return cmd
 	}
 	argv := []string{"sudo", "-H", "-u", hook.User}
-	if hook.Cwd != "" {
-		argv = append(argv, "-D", hook.Cwd)
-	}
 	argv = append(argv, hook.Env...)
 	argv = append(argv, command)
 	argv = append(argv, args...)
-	return exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if !hook.Script && hook.Cwd != "" {
+		// The chdir happens as the daemon user before sudo execs; the target
+		// account inherits it. Script actions skip this — their body cds as
+		// the target user instead.
+		cmd.Dir = hook.Cwd
+	}
+	return cmd
 }
 
 // prependWorkingDirectory prefixes a `cd -- '<cwd>'` line to a script body so

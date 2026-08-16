@@ -227,11 +227,11 @@ func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
 	}
 	cmd := buildRunCommand(context.Background(), hook, hook.Command, []string{"--force"})
 	// The command stays the absolute script path (never a shell wrapper) so
-	// the sudoers rule `/etc/maidcafe/actions/*` matches it; the working
-	// directory rides on sudo -D.
+	// the sudoers rule `/etc/maidcafe/actions/.run/*` matches it. No -D:
+	// default sudoers rules reject it. A non-script command inherits the
+	// daemon-set cwd through sudo instead.
 	want := []string{
 		"sudo", "-H", "-u", "deploy",
-		"-D", "/srv/myapp",
 		"CI_BUILD=42", "SPACED=two words",
 		"/etc/maidcafe/actions/deploy.sh", "--force",
 	}
@@ -243,8 +243,26 @@ func TestBuildRunCommandDelegatesUserRunsToSudo(t *testing.T) {
 			t.Fatalf("argv[%d] = %q, want %q (full: %v)", i, cmd.Args[i], want[i], cmd.Args)
 		}
 	}
+	if cmd.Dir != "/srv/myapp" {
+		t.Fatalf("cwd = %q", cmd.Dir)
+	}
 
-	// Without a cwd no -D is passed and the command still comes last.
+	// Script actions apply cwd through their injected cd line, so the sudo
+	// process keeps the daemon's own cwd (the daemon user may not be able to
+	// traverse the target directory).
+	scriptHook := hook
+	scriptHook.Script = true
+	scriptCmd := buildRunCommand(context.Background(), scriptHook, scriptHook.Command, nil)
+	if scriptCmd.Dir != "" {
+		t.Fatalf("script action cwd = %q, want unset", scriptCmd.Dir)
+	}
+	for _, arg := range scriptCmd.Args {
+		if arg == "-D" {
+			t.Fatalf("script action must not pass -D: %v", scriptCmd.Args)
+		}
+	}
+
+	// Without a cwd no directory is forced and the command still comes last.
 	noCwd := buildRunCommand(context.Background(), config.WebhookConfig{
 		Command: "/bin/true", User: "deploy",
 	}, "/bin/true", nil)

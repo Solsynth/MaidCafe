@@ -62,12 +62,14 @@ GET /health
 - `user` runs are delegated to `sudo -H -u <user>`, so the daemon process
   itself stays unprivileged. Environment assignments are passed as
   command-line `VAR=value` entries (sudo applies them on top of its reset
-  environment) and the working directory is applied with sudo `-D` for plain
-  commands (sudo 1.9.9+) or a `cd` line prepended to script bodies — the
-  executed command is always the configured absolute path, never a shell
-  wrapper, so the sudoers rule matches it. The sudoers rule granting the
-  daemon the right to run MaidKit-deployed scripts as the configured users is
-  installed by MaidKit; hand-configured entries must provide their own rule.
+  environment) and the working directory is applied without sudo `-D` (which
+  default sudoers rules reject): script bodies carry a `cd` line prepended by
+  the executor, and plain commands inherit the daemon-set working directory,
+  since sudo does not reset it. The executed command is always the configured
+  absolute path, never a shell wrapper, so the sudoers rule matches it. The
+  sudoers rule granting the daemon the right to run MaidKit-deployed scripts
+  as the configured users is installed by MaidKit; hand-configured entries
+  must provide their own rule.
 - Script actions that run as another user render their substituted body next
   to the deployed script under a hidden `.run` directory (0755, created on
   demand), so the target account can read and execute them; the daemon user
