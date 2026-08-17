@@ -82,6 +82,30 @@ func main() {
 	}
 	svc := cloud.NewService(db, publisher, workspaces)
 	router := server.NewRouter(cfg, svc, authenticator)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Metric retention: prune rows older than each workspace's
+	// metrics_retention_days quota, once at startup then hourly.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		prune := func() {
+			if err := svc.PruneMetrics(ctx); err != nil {
+				log.Warn().Err(err).Msg("metric retention prune")
+			}
+		}
+		prune()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				prune()
+			}
+		}
+	}()
+
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           router,
@@ -90,8 +114,6 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("cloud server")

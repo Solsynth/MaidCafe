@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +34,14 @@ var ErrUnauthorized = errors.New("unauthorized")
 var ErrNotFound = errors.New("not found")
 var ErrForbidden = errors.New("forbidden")
 var ErrPublishFailed = errors.New("notification publish failed")
+
+// ErrRateLimited reports a daemon-initiated request that arrived sooner than
+// the workspace's polling_interval_seconds quota allows (HTTP 429).
+var ErrRateLimited = errors.New("rate limited")
+
+// ErrMetricOutOfRetention reports a metric whose SentAt predates the
+// workspace's metrics_retention_days quota (HTTP 400).
+var ErrMetricOutOfRetention = errors.New("metric outside retention window")
 
 // workspaceMemberRole is the minimum DyWorkspace member role level required
 // to manage daemons inside a workspace. Role levels follow the workspace
@@ -173,15 +182,118 @@ func (s *Service) authorizeWorkspace(ctx context.Context, accountID, workspaceID
 	return nil
 }
 
+// workspaceQuota returns the workspace-effective quota map (plan preset +
+// active addon grants). Fails closed when the workspace service is absent.
+func (s *Service) workspaceQuota(ctx context.Context, workspaceID string) (map[string]int64, error) {
+	if s.workspaces == nil {
+		return nil, ErrForbidden
+	}
+	quotas, err := s.workspaces.GetPlanQuota(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace quota: %w", err)
+	}
+	return quotas, nil
+}
+
+// enforcePollInterval applies the workspace polling_interval_seconds quota to
+// daemon-initiated traffic (metric ingest, webhook relay pickup): requests
+// arriving sooner than the allowed interval are ErrRateLimited (HTTP 429).
+// A missing or non-positive dimension disables throttling.
+func (s *Service) enforcePollInterval(daemon database.Daemon, quotas map[string]int64, now time.Time) error {
+	intervalSeconds := quotas["polling_interval_seconds"]
+	if intervalSeconds <= 0 {
+		return nil
+	}
+	interval := time.Duration(intervalSeconds) * time.Second
+
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	if last, ok := s.pollHit[daemon.ID]; ok && now.Sub(last) < interval {
+		return ErrRateLimited
+	}
+	s.pollHit[daemon.ID] = now
+
+	// Bound memory: prune entries that have gone quiet.
+	if len(s.pollHit) > 10_000 {
+		for id, hit := range s.pollHit {
+			if now.Sub(hit) > time.Hour {
+				delete(s.pollHit, id)
+			}
+		}
+	}
+	return nil
+}
+
+// clampRetentionDays bounds the metrics_retention_days dimension to a sane
+// range (0..10 years) before it is used in date arithmetic.
+func clampRetentionDays(days int64) int {
+	if days < 0 {
+		return 0
+	}
+	if days > 3650 {
+		return 3650
+	}
+	return int(days)
+}
+
+// PruneMetrics deletes metric rows older than each workspace's
+// metrics_retention_days quota (measured on received_at, the cloud-side
+// storage time). Workspaces without the dimension keep their metrics. Runs on
+// an hourly schedule from the cloud main loop.
+func (s *Service) PruneMetrics(ctx context.Context) error {
+	var workspaceIDs []string
+	if err := s.db.WithContext(ctx).Model(&database.Daemon{}).Distinct().Pluck("workspace_id", &workspaceIDs).Error; err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, workspaceID := range workspaceIDs {
+		quotas, err := s.workspaceQuota(ctx, workspaceID)
+		if err != nil {
+			s.logger.Warn("metric retention prune skipped: workspace quota unavailable", "workspace_id", workspaceID, "error", err)
+			continue
+		}
+		retentionDays := clampRetentionDays(quotas["metrics_retention_days"])
+		if retentionDays <= 0 {
+			continue
+		}
+		cutoff := now.AddDate(0, 0, -retentionDays)
+		res := s.db.WithContext(ctx).
+			Where("daemon_id IN (SELECT id FROM daemons WHERE workspace_id = ?)", workspaceID).
+			Where("received_at < ?", cutoff).
+			Delete(&database.DaemonMetric{})
+		if res.Error != nil {
+			s.logger.Warn("metric retention prune failed", "workspace_id", workspaceID, "error", res.Error)
+			continue
+		}
+		if res.RowsAffected > 0 {
+			s.logger.Info("pruned expired metrics", "workspace_id", workspaceID, "rows", res.RowsAffected)
+		}
+	}
+	return nil
+}
+
 type Service struct {
 	db         *database.DB
 	publisher  PushPublisher
 	workspaces WorkspaceClient
 	logger     *slog.Logger
+
+	// pollHit tracks the last accepted daemon-initiated request (metric ingest,
+	// webhook relay pickup) per daemon for the workspace polling_interval_seconds
+	// quota. In-memory only: accurate per cloud instance; multi-replica deploys
+	// should move this to shared state.
+	pollMu  sync.Mutex
+	pollHit map[string]time.Time
 }
 
 func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceClient) *Service {
-	return &Service{db: db, publisher: publisher, workspaces: workspaces, logger: slog.Default()}
+	return &Service{
+		db:         db,
+		publisher:  publisher,
+		workspaces: workspaces,
+		logger:     slog.Default(),
+		pollHit:    make(map[string]time.Time),
+	}
 }
 
 type DaemonView struct {
@@ -527,6 +639,22 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		return fmt.Errorf("invalid metric")
 	}
 	now := time.Now().UTC()
+
+	// Workspace quotas: polling_interval_seconds throttles the report rate;
+	// metrics_retention_days rejects data outside the storage window.
+	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	if err := s.enforcePollInterval(d, quotas, now); err != nil {
+		return err
+	}
+	if retentionDays := clampRetentionDays(quotas["metrics_retention_days"]); retentionDays > 0 {
+		if input.SentAt.Before(now.AddDate(0, 0, -retentionDays)) {
+			return fmt.Errorf("%w: sent_at older than %d days", ErrMetricOutOfRetention, retentionDays)
+		}
+	}
+
 	if err := s.db.WithContext(ctx).Create(&database.DaemonMetric{
 		ID: uuid.NewString(), DaemonID: d.ID, SentAt: input.SentAt.UTC(), ReceivedAt: now,
 		UptimeSeconds: input.UptimeSeconds, ProcessMemoryBytes: input.ProcessMemoryBytes,
@@ -992,7 +1120,16 @@ func (s *Service) CredentialByToken(ctx context.Context, token string) (*databas
 // invocations for the daemon. Leases older than webhookLeaseDuration are
 // reclaimed first so a daemon that died mid-execution does not lose requests.
 func (s *Service) ListPendingWebhooks(ctx context.Context, daemonID, secret string, limit int) ([]WebhookRequestView, error) {
-	if _, err := s.authenticateDaemon(ctx, daemonID, secret); err != nil {
+	d, err := s.authenticateDaemon(ctx, daemonID, secret)
+	if err != nil {
+		return nil, err
+	}
+	// Workspace polling_interval_seconds quota throttles relay pickup speed.
+	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enforcePollInterval(d, quotas, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 	if limit <= 0 || limit > webhookPendingLimit {

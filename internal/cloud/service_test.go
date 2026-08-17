@@ -454,6 +454,118 @@ func TestCreateDaemonEnforcesQuotaLimit(t *testing.T) {
 	}
 }
 
+func TestMetricIngestRateLimited(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "polling_interval_seconds": 3600}}
+
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestMetric(ctx, created.ID, created.Secret, MetricInput{SentAt: time.Now(), UptimeSeconds: 1}); err != nil {
+		t.Fatalf("first ingest should be accepted: %v", err)
+	}
+	if err := svc.IngestMetric(ctx, created.ID, created.Secret, MetricInput{SentAt: time.Now(), UptimeSeconds: 2}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got %v", err)
+	}
+
+	// A daemon in a workspace without the dimension is not throttled.
+	other, err := svc.CreateDaemon(ctx, "account-a", "ws-b", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestMetric(ctx, other.ID, other.Secret, MetricInput{SentAt: time.Now(), UptimeSeconds: 1}); err != nil {
+		t.Fatalf("ws-b ingest should not be throttled: %v", err)
+	}
+}
+
+func TestMetricIngestRejectsOutOfRetention(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "metrics_retention_days": 1}}
+
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := MetricInput{SentAt: time.Now().Add(-48 * time.Hour), UptimeSeconds: 1}
+	if err := svc.IngestMetric(ctx, created.ID, created.Secret, stale); !errors.Is(err, ErrMetricOutOfRetention) {
+		t.Fatalf("expected ErrMetricOutOfRetention, got %v", err)
+	}
+	fresh := MetricInput{SentAt: time.Now(), UptimeSeconds: 1}
+	if err := svc.IngestMetric(ctx, created.ID, created.Secret, fresh); err != nil {
+		t.Fatalf("fresh metric should be accepted: %v", err)
+	}
+}
+
+func TestWebhookRelayPickupRateLimited(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "polling_interval_seconds": 3600}}
+
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10); err != nil {
+		t.Fatalf("first pickup should be accepted: %v", err)
+	}
+	if _, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got %v", err)
+	}
+}
+
+func TestPruneMetricsPerWorkspaceRetention(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{
+		"ws-a": {"max_daemons": 10, "metrics_retention_days": 1},
+		"ws-b": {"max_daemons": 10}, // no retention dimension — keep everything
+	}
+	now := time.Now().UTC()
+
+	a, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.CreateDaemon(ctx, "account-a", "ws-b", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := []database.DaemonMetric{
+		{ID: "m-a-old", DaemonID: a.ID, SentAt: now.Add(-72 * time.Hour), ReceivedAt: now.Add(-72 * time.Hour)},
+		{ID: "m-a-new", DaemonID: a.ID, SentAt: now, ReceivedAt: now},
+		{ID: "m-b-old", DaemonID: b.ID, SentAt: now.Add(-72 * time.Hour), ReceivedAt: now.Add(-72 * time.Hour)},
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.PruneMetrics(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var remaining []string
+	if err := db.Model(&database.DaemonMetric{}).Pluck("id", &remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"m-a-new": true, "m-b-old": true}
+	if len(remaining) != len(want) {
+		t.Fatalf("expected %v remaining, got %v", want, remaining)
+	}
+	for _, id := range remaining {
+		if !want[id] {
+			t.Fatalf("unexpected remaining metric %s", id)
+		}
+	}
+}
+
 func TestCredentialLifecycleAndScopes(t *testing.T) {
 	svc, db, _, _ := testService(t)
 	defer db.Close()

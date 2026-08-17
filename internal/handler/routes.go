@@ -157,6 +157,8 @@ func serviceStatus(c *gin.Context, err error) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 	case errors.Is(err, cloud.ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	case errors.Is(err, cloud.ErrRateLimited):
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limited"})
 	case errors.Is(err, cloud.ErrPublishFailed):
 		c.JSON(http.StatusBadGateway, gin.H{"error": "notification publish failed"})
 	default:
@@ -318,6 +320,8 @@ func ingestMetric(s *cloud.Service) gin.HandlerFunc {
 		if err := s.IngestMetric(c, c.Param("id"), secret, in); err != nil {
 			if errors.Is(err, cloud.ErrUnauthorized) {
 				serviceStatus(c, err)
+			} else if errors.Is(err, cloud.ErrRateLimited) {
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			}
