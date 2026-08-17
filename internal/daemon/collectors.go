@@ -1304,16 +1304,40 @@ func (c *DatabaseMetricsCollector) collect(ctx context.Context) ([]byte, error) 
 	return json.Marshal(databaseMetricsPayload{Engines: entries})
 }
 
-const postgresMetricsScript = `PGBIN=$(for d in /usr/pgsql-*/bin /usr/lib/postgresql/*/bin /usr/local/pgsql/bin; do [ -d "$d" ] && echo "$d"; done | sort -V | tail -n 1)
-if [ -z "$PGBIN" ]; then exit 1; fi
+const postgresMetricsScript = `PGBIN=$(for d in /usr/pgsql-*/bin /usr/lib/postgresql/*/bin /usr/local/pgsql/bin; do
+  [ -d "$d" ] && echo "$d"
+done | sort -V | tail -n 1)
+PSQL=""
+if [ -n "$PGBIN" ] && [ -x "$PGBIN/psql" ]; then
+  PSQL="$PGBIN/psql"
+else
+  PSQL=$(command -v psql 2>/dev/null || true)
+fi
+if [ -z "$PSQL" ]; then exit 1; fi
 echo '--DB-PG-ROWS--'
-su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -F '|' -c 'SELECT d.datname, s.numbackends, s.xact_commit, s.xact_rollback, s.blks_read, s.blks_hit, s.deadlocks, s.temp_bytes FROM pg_catalog.pg_stat_database s JOIN pg_catalog.pg_database d ON d.oid = s.datid WHERE d.datallowconn ORDER BY d.datname'"
+if id postgres >/dev/null 2>&1; then
+  su -s /bin/sh postgres -c "$PSQL -X -A -t -F '|' -c 'SELECT d.datname, s.numbackends, s.xact_commit, s.xact_rollback, s.blks_read, s.blks_hit, s.deadlocks, s.temp_bytes FROM pg_catalog.pg_stat_database s JOIN pg_catalog.pg_database d ON d.oid = s.datid WHERE d.datallowconn ORDER BY d.datname'" 2>&1
+else
+  "$PSQL" -X -A -t -F '|' -c 'SELECT d.datname, s.numbackends, s.xact_commit, s.xact_rollback, s.blks_read, s.blks_hit, s.deadlocks, s.temp_bytes FROM pg_catalog.pg_stat_database s JOIN pg_catalog.pg_database d ON d.oid = s.datid WHERE d.datallowconn ORDER BY d.datname' 2>&1
+fi
 echo '--DB-PG-MAXCONN--'
-su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -c 'SHOW max_connections'"
+if id postgres >/dev/null 2>&1; then
+  su -s /bin/sh postgres -c "$PSQL -X -A -t -c 'SHOW max_connections'" 2>&1
+else
+  "$PSQL" -X -A -t -c 'SHOW max_connections' 2>&1
+fi
 echo '--DB-PG-SHARED--'
-su -s /bin/sh postgres -c "$PGBIN/psql -X -A -t -c 'SHOW shared_buffers'"
+if id postgres >/dev/null 2>&1; then
+  su -s /bin/sh postgres -c "$PSQL -X -A -t -c 'SHOW shared_buffers'" 2>&1
+else
+  "$PSQL" -X -A -t -c 'SHOW shared_buffers' 2>&1
+fi
 echo '--DB-PG-VERSION--'
-"$PGBIN/postgres" --version`
+if [ -n "$PGBIN" ] && [ -x "$PGBIN/postgres" ]; then
+  "$PGBIN/postgres" --version
+else
+  "$PSQL" --version
+fi`
 
 const mysqlMetricsScript = `MYSQL=$(command -v mysql 2>/dev/null || command -v mariadb 2>/dev/null || true)
 if [ -z "$MYSQL" ]; then exit 1; fi
@@ -1420,6 +1444,13 @@ func parsePostgresDatabaseMetricsOutput(output string) *databaseMetricsEntry {
 		})
 	}
 	if len(entry.Databases) == 0 {
+		for _, line := range strings.Split(rows, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "psql:") || strings.HasPrefix(line, "su:") {
+				entry.Error = strPtr(line)
+				break
+			}
+		}
 		return entry
 	}
 	entry.Available = true

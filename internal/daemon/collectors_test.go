@@ -517,12 +517,12 @@ postgres (PostgreSQL) 15.4 (Ubuntu 15.4-2.pgdg22.04+1)
 }
 
 func TestParsePostgresDatabaseMetricsOutputUnavailable(t *testing.T) {
-	entry := parsePostgresDatabaseMetricsOutput("--DB-PG-ROWS--\n")
+	entry := parsePostgresDatabaseMetricsOutput("--DB-PG-ROWS--\npsql: error: connection to server failed\n--DB-PG-MAXCONN--\n")
 	if entry == nil || entry.Available {
 		t.Fatalf("expected unavailable entry, got %+v", entry)
 	}
-	if entry.Error == nil {
-		t.Fatal("expected error")
+	if entry.Error == nil || *entry.Error != "psql: error: connection to server failed" {
+		t.Fatalf("expected psql diagnostic, got %v", entry.Error)
 	}
 }
 
