@@ -747,8 +747,8 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}).Error; err != nil {
 		return err
 	}
-	// Alarms are evaluated daemon-side; this metric only records the
-	// cloud-side heartbeat and clears a prior disconnect state.
+	// Alarms are evaluated daemon-side; this metric records the cloud-side
+	// heartbeat and clears a prior disconnect state.
 	columns := []string{"last_seen_at", "updated_at"}
 	updates := database.Daemon{LastSeenAt: &now, UpdatedAt: now}
 	if hostID := strings.TrimSpace(input.HostID); hostID != "" && hostID != d.HostID {
@@ -759,31 +759,64 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	if q.Error != nil {
 		return q.Error
 	}
-	result := s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).
+	result := s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ? AND disconnected_at IS NOT NULL", d.ID).
 		Update("disconnected_at", gorm.Expr("NULL"))
 	if result.Error != nil {
 		return result.Error
 	}
-	if result.RowsAffected != 1 {
-		return fmt.Errorf("clear daemon disconnect state: expected 1 row, updated %d", result.RowsAffected)
+	if result.RowsAffected == 1 {
+		metadata := map[string]any{"reconnected_at": now, "last_seen_at": now}
+		body := "Metrics received again after the daemon disconnected."
+		if d.DisconnectedAt != nil {
+			downtime := now.Sub(d.DisconnectedAt.UTC())
+			if downtime < 0 {
+				downtime = 0
+			}
+			metadata["disconnected_at"] = d.DisconnectedAt.UTC()
+			metadata["downtime_seconds"] = int64(downtime / time.Second)
+			body = fmt.Sprintf("Metrics resumed after %s.", downtime.Round(time.Second))
+		}
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		notification := database.Notification{
+			ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID,
+			DaemonID: d.ID, Kind: "daemon.reconnected", Title: "Daemon reconnected",
+			Body: body, Metadata: datatypes.JSON(encoded), CreatedAt: now,
+		}
+		if err := s.db.WithContext(ctx).Create(&notification).Error; err != nil {
+			return err
+		}
+		if err := s.publishNotification(ctx, d, notification); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 const (
-	DefaultDaemonDisconnectAfter = 5 * time.Minute
-	DefaultAlarmCheckInterval    = time.Minute
+	DefaultDaemonDisconnectAfter                = 5 * time.Minute
+	DefaultDaemonDisconnectNotificationCooldown = 30 * time.Minute
+	DefaultAlarmCheckInterval                   = time.Minute
 )
 
 // EvaluateDisconnectedDaemons marks enabled daemons disconnected when the
-// cloud has not accepted a metric within disconnectedAfter. A notification is
-// persisted and published only on the transition into the disconnected state.
-// A later metric clears the state, allowing a future outage to alarm again.
-// Daemons that have never sent a metric are left pending rather than reported
-// as disconnected.
+// cloud has not accepted a metric within disconnectedAfter. It uses the
+// default repeat-notification cooldown.
 func (s *Service) EvaluateDisconnectedDaemons(ctx context.Context, disconnectedAfter time.Duration, now time.Time) error {
+	return s.EvaluateDisconnectedDaemonsWithCooldown(ctx, disconnectedAfter, DefaultDaemonDisconnectNotificationCooldown, now)
+}
+
+// EvaluateDisconnectedDaemonsWithCooldown is the configurable form of
+// EvaluateDisconnectedDaemons. A later metric clears the state and publishes
+// a reconnected notification, allowing a future outage to alarm again.
+func (s *Service) EvaluateDisconnectedDaemonsWithCooldown(ctx context.Context, disconnectedAfter, disconnectNotificationCooldown time.Duration, now time.Time) error {
 	if disconnectedAfter <= 0 {
 		disconnectedAfter = DefaultDaemonDisconnectAfter
+	}
+	if disconnectNotificationCooldown <= 0 {
+		disconnectNotificationCooldown = DefaultDaemonDisconnectNotificationCooldown
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -811,6 +844,16 @@ func (s *Service) EvaluateDisconnectedDaemons(ctx context.Context, disconnectedA
 			if stale {
 				if daemon.DisconnectedAt != nil {
 					return nil
+				}
+				var previous database.Notification
+				err := tx.Where("daemon_id = ? AND kind = ?", daemon.ID, "daemon.disconnected").
+					Order("created_at DESC").First(&previous).Error
+				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				if err == nil && now.Before(previous.CreatedAt.Add(disconnectNotificationCooldown)) {
+					return tx.Model(&database.Daemon{}).Where("id = ? AND disconnected_at IS NULL", daemon.ID).
+						Updates(map[string]any{"disconnected_at": now, "updated_at": now}).Error
 				}
 				disconnectedAt := now
 				result := tx.Model(&database.Daemon{}).
@@ -909,7 +952,7 @@ func (s *Service) publishNotification(ctx context.Context, daemon database.Daemo
 		NotificationID: notification.ID,
 		Kind:           notification.Kind,
 		Title:          notification.Title,
-		Subtitle:       notification.Subtitle,
+		Subtitle:       notificationSubtitle(daemon.Name, notification.Subtitle),
 		Body:           notification.Body,
 		Metadata:       merged,
 	}
@@ -921,6 +964,15 @@ func (s *Service) publishNotification(ctx context.Context, daemon database.Daemo
 		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
 	}
 	return nil
+}
+
+func notificationSubtitle(daemonName, subtitle string) string {
+	source := "From " + strings.TrimSpace(daemonName)
+	subtitle = strings.TrimSpace(subtitle)
+	if subtitle == "" {
+		return source
+	}
+	return source + ": " + subtitle
 }
 func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonID string, input NotificationInput) (NotificationView, error) {
 	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)

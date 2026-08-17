@@ -115,6 +115,10 @@ func main() {
 	if disconnectAfter <= 0 {
 		disconnectAfter = cloud.DefaultDaemonDisconnectAfter
 	}
+	disconnectCooldown := cfg.Cloud.DaemonDisconnectNotificationCooldown
+	if disconnectCooldown <= 0 {
+		disconnectCooldown = cloud.DefaultDaemonDisconnectNotificationCooldown
+	}
 	alarmCheckInterval := cfg.Cloud.AlarmCheckInterval
 	if alarmCheckInterval <= 0 {
 		alarmCheckInterval = cloud.DefaultAlarmCheckInterval
@@ -123,7 +127,7 @@ func main() {
 		ticker := time.NewTicker(alarmCheckInterval)
 		defer ticker.Stop()
 		check := func() {
-			if err := svc.EvaluateDisconnectedDaemons(ctx, disconnectAfter, time.Now().UTC()); err != nil {
+			if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, disconnectAfter, disconnectCooldown, time.Now().UTC()); err != nil {
 				log.Warn().Err(err).Msg("daemon disconnect alarm evaluation")
 			}
 		}
@@ -134,7 +138,7 @@ func main() {
 				return
 			case now := <-ticker.C:
 				checkAt := now.UTC()
-				if err := svc.EvaluateDisconnectedDaemons(ctx, disconnectAfter, checkAt); err != nil {
+				if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, disconnectAfter, disconnectCooldown, checkAt); err != nil {
 					log.Warn().Err(err).Msg("daemon disconnect alarm evaluation")
 				}
 			}

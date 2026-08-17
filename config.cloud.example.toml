@@ -37,5 +37,8 @@ subjectPrefix = ""
 # A daemon with an accepted metric older than this is marked disconnected
 # and emits one daemon.disconnected notification until it reports again.
 daemonDisconnectAfter = "5m"
+# Suppress another disconnect notification for this period after a prior one,
+# even if the daemon briefly wakes up and then goes stale again.
+daemonDisconnectNotificationCooldown = "30m"
 # How often the cloud evaluates daemon heartbeat state.
 alarmCheckInterval = "1m"

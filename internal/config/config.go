@@ -31,6 +31,9 @@ type CloudConfig struct {
 	// DaemonDisconnectAfter is the quiet period after which a daemon with a
 	// previously accepted metric is considered disconnected.
 	DaemonDisconnectAfter time.Duration `mapstructure:"daemonDisconnectAfter"`
+	// DaemonDisconnectNotificationCooldown suppresses repeat disconnect pushes
+	// for a daemon that recovers and becomes stale again within this period.
+	DaemonDisconnectNotificationCooldown time.Duration `mapstructure:"daemonDisconnectNotificationCooldown"`
 	// AlarmCheckInterval controls how often the cloud evaluates daemon state.
 	AlarmCheckInterval time.Duration `mapstructure:"alarmCheckInterval"`
 }
@@ -256,9 +259,10 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
-	viper.SetDefault("daemon.databaseMetricsInterval", 10*time.Second)
 	viper.SetDefault("cloud.daemonDisconnectAfter", 5*time.Minute)
+	viper.SetDefault("cloud.daemonDisconnectNotificationCooldown", 30*time.Minute)
 	viper.SetDefault("cloud.alarmCheckInterval", time.Minute)
+	viper.SetDefault("daemon.databaseMetricsInterval", 10*time.Second)
 	viper.SetDefault("daemon.runtimes", []string{"java", "dotnet", "python", "node", "deno", "go", "ruby", "php"})
 	viper.SetDefault("daemon.watchedProcesses", []string{})
 	viper.SetDefault("daemon.watchedProcessesFile", "/var/lib/maidcafe/watched-processes.json")
@@ -441,7 +445,7 @@ func applyEnvAliases() {
 		"WORKSPACE_TARGET": "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
-		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
+		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_DAEMON_DISCONNECT_NOTIFICATION_COOLDOWN": "cloud.daemonDisconnectNotificationCooldown", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
 		"DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
@@ -479,6 +483,9 @@ func (c *Config) ValidateCloud() error {
 	}
 	if c.Cloud.DaemonDisconnectAfter < 0 {
 		return fmt.Errorf("cloud.daemonDisconnectAfter must not be negative")
+	}
+	if c.Cloud.DaemonDisconnectNotificationCooldown < 0 {
+		return fmt.Errorf("cloud.daemonDisconnectNotificationCooldown must not be negative")
 	}
 	if c.Cloud.AlarmCheckInterval < 0 {
 		return fmt.Errorf("cloud.alarmCheckInterval must not be negative")

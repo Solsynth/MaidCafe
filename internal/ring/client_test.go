@@ -52,6 +52,7 @@ func TestPublishSendsMetoerNotification(t *testing.T) {
 		NotificationID: "notification-1",
 		Kind:           "daemon.alarm.cpu_percent",
 		Title:          "CPU alarm",
+		Subtitle:       "From host",
 		Body:           "CPU reached 90%",
 		Metadata:       []byte(`{"value":90}`),
 	}
@@ -68,7 +69,8 @@ func TestPublishSendsMetoerNotification(t *testing.T) {
 		}
 		notification := request.Notification
 		if notification.Topic != event.Kind || notification.Title != event.Title ||
-			notification.Body != event.Body || string(notification.Meta) != string(event.Metadata) ||
+			notification.Subtitle != event.Subtitle || notification.Body != event.Body ||
+			string(notification.Meta) != string(event.Metadata) ||
 			notification.GetAppId() != maidKitAppID || !notification.IsSavable {
 			t.Fatalf("unexpected notification: %#v", notification)
 		}

@@ -116,8 +116,8 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 		t.Fatalf("event mismatch: %#v", publisher.events)
 	}
 	event := publisher.events[0]
-	if event.Subtitle != "nightly" {
-		t.Fatalf("event subtitle missing: %#v", event)
+	if event.Subtitle != "From host: nightly" {
+		t.Fatalf("event subtitle missing daemon source: %#v", event)
 	}
 	var meta map[string]any
 	if err := json.Unmarshal(event.Metadata, &meta); err != nil {
@@ -218,6 +218,9 @@ func TestMetricIngestAndPushRequestPersistence(t *testing.T) {
 	if len(publisher.events) != 1 || publisher.events[0].Kind != "maintenance" {
 		t.Fatalf("notification publication mismatch: %#v", publisher.events)
 	}
+	if publisher.events[0].Subtitle != "From host" {
+		t.Fatalf("push subtitle missing daemon source: %#v", publisher.events[0])
+	}
 }
 
 func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
@@ -235,7 +238,7 @@ func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.EvaluateDisconnectedDaemons(ctx, 5*time.Minute, now); err != nil {
+	if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, 5*time.Minute, 5*time.Minute, now); err != nil {
 		t.Fatal(err)
 	}
 	if len(publisher.events) != 1 || publisher.events[0].Kind != "daemon.disconnected" {
@@ -258,7 +261,7 @@ func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
 	if row.DisconnectedAt == nil {
 		t.Fatalf("daemon was not marked disconnected: %+v", row)
 	}
-	if err := svc.EvaluateDisconnectedDaemons(ctx, 5*time.Minute, now.Add(time.Minute)); err != nil {
+	if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, 5*time.Minute, 5*time.Minute, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if len(publisher.events) != 1 {
@@ -275,16 +278,30 @@ func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
 	if row.DisconnectedAt != nil {
 		t.Fatalf("metric did not recover daemon: %+v", row)
 	}
+	if len(publisher.events) != 2 || publisher.events[1].Kind != "daemon.reconnected" {
+		t.Fatalf("reconnect notification: %#v", publisher.events)
+	}
 
 	if err := db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", daemon.ID).
 		Updates(map[string]any{"last_seen_at": now.Add(-10 * time.Minute)}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.EvaluateDisconnectedDaemons(ctx, 5*time.Minute, now.Add(2*time.Minute)); err != nil {
+	if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, 5*time.Minute, 5*time.Minute, now.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if len(publisher.events) != 2 {
-		t.Fatalf("repeated outage did not re-alarm: %#v", publisher.events)
+		t.Fatalf("disconnect cooldown failed: %#v", publisher.events)
+	}
+
+	if err := db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", daemon.ID).
+		Updates(map[string]any{"disconnected_at": nil, "last_seen_at": now.Add(-10 * time.Minute)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, 5*time.Minute, 5*time.Minute, now.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisher.events) != 3 {
+		t.Fatalf("outage did not re-alarm after cooldown: %#v", publisher.events)
 	}
 }
 
@@ -303,7 +320,7 @@ func TestEvaluateDisconnectedDaemonsIgnoresNeverSeenAndDisabled(t *testing.T) {
 	if err := svc.DisableDaemon(ctx, "account-a", disabled.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.EvaluateDisconnectedDaemons(ctx, time.Minute, time.Now().UTC()); err != nil {
+	if err := svc.EvaluateDisconnectedDaemonsWithCooldown(ctx, time.Minute, time.Minute, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if len(publisher.events) != 0 {

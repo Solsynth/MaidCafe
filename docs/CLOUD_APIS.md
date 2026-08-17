@@ -126,10 +126,16 @@ with English fallback when the account service is unavailable.
 The cloud independently evaluates the heartbeat: by default, an enabled daemon
 whose last accepted metric is older than five minutes is marked disconnected
 and emits one `daemon.disconnected` notification through the configured push
-publishers. `cloud.daemonDisconnectAfter` changes the threshold and
-`cloud.alarmCheckInterval` changes the evaluation cadence. Daemons with no
-accepted metric are not alarmed. A subsequent accepted metric clears
-`disconnected_at`; a later outage can emit another notification.
+publishers. `cloud.daemonDisconnectAfter` changes the stale threshold,
+`cloud.daemonDisconnectNotificationCooldown` suppresses repeat disconnect
+notifications after a brief recovery, and `cloud.alarmCheckInterval` changes
+the evaluation cadence. Daemons with no accepted metric are not alarmed.
+A subsequent accepted metric clears `disconnected_at` and emits one
+`daemon.reconnected` notification. A later outage can emit another disconnect
+notification after the cooldown.
+For push delivery, the cloud prefixes the daemon name in the subtitle as
+`From <daemon name>`. If a notification already has a subtitle, it is retained
+after the source prefix.
 
 ### Notification
 
@@ -544,11 +550,13 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../metrics \
 | `process_memory_bytes` | `>= 0` |
 | `cpu_percent` | `0..100` |
 | `memory_used_percent` | `0..100` |
-Ingestion records `last_seen_at` on the daemon and clears `disconnected_at`.
-Daemon metric alarm thresholds are evaluated daemon-side; the daemon reports
-the resulting notifications through `POST /api/daemons/:id/notifications`.
-The cloud scheduler independently marks enabled daemons disconnected after the
-configured heartbeat threshold and emits `daemon.disconnected` once per outage.
+Ingestion records `last_seen_at` on the daemon and clears `disconnected_at`;
+when it clears a prior disconnect, the cloud emits one `daemon.reconnected`
+notification. Daemon metric alarm thresholds are evaluated daemon-side; the
+daemon reports the resulting notifications through
+`POST /api/daemons/:id/notifications`. The cloud scheduler independently marks
+enabled daemons disconnected after the configured heartbeat threshold and emits
+`daemon.disconnected` once per outage, subject to the notification cooldown.
 
 #### `POST /api/daemons/:id/notifications`
 
@@ -622,8 +630,9 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests/3f9
 3. The daemon pushes metrics on its interval, evaluates its configured alarms
    against each sample, and reports webhook and alarm notifications on
    success/failure; the cloud stamps `received_at` and `last_seen_at`, clears
-   `disconnected_at`, and independently emits a disconnect notification when
-   the heartbeat threshold is exceeded.
+   `disconnected_at`, and emits `daemon.reconnected` when that clears a prior
+   disconnect. The cloud independently emits `daemon.disconnected` when the
+   heartbeat threshold is exceeded, subject to the notification cooldown.
 4. Workspace members list daemons, metrics, and notifications, and invoke
    webhooks through the relay. Everything is scoped to the workspace the
    daemon belongs to.
