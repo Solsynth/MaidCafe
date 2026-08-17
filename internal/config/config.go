@@ -23,7 +23,16 @@ type Config struct {
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
 	Eventbus  EventbusConfig  `mapstructure:"eventbus"`
 	Ring      RingConfig      `mapstructure:"ring"`
+	Cloud     CloudConfig     `mapstructure:"cloud"`
 	Daemon    DaemonConfig    `mapstructure:"daemon"`
+}
+
+type CloudConfig struct {
+	// DaemonDisconnectAfter is the quiet period after which a daemon with a
+	// previously accepted metric is considered disconnected.
+	DaemonDisconnectAfter time.Duration `mapstructure:"daemonDisconnectAfter"`
+	// AlarmCheckInterval controls how often the cloud evaluates daemon state.
+	AlarmCheckInterval time.Duration `mapstructure:"alarmCheckInterval"`
 }
 
 type AppConfig struct {
@@ -243,6 +252,8 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
 	viper.SetDefault("daemon.databaseMetricsInterval", 10*time.Second)
+	viper.SetDefault("cloud.daemonDisconnectAfter", 5*time.Minute)
+	viper.SetDefault("cloud.alarmCheckInterval", time.Minute)
 	viper.SetDefault("daemon.runtimes", []string{"java", "dotnet", "python", "node", "deno", "go", "ruby", "php"})
 	viper.SetDefault("daemon.watchedProcesses", []string{})
 	viper.SetDefault("daemon.watchedProcessesFile", "/var/lib/maidcafe/watched-processes.json")
@@ -424,7 +435,9 @@ func applyEnvAliases() {
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"WORKSPACE_TARGET": "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
-		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix", "DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
+		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
+		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
+		"DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
 		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
@@ -458,6 +471,12 @@ func (c *Config) ValidateCloud() error {
 	}
 	if err := validatePort(c.HTTP.Port); err != nil {
 		return fmt.Errorf("http.port: %w", err)
+	}
+	if c.Cloud.DaemonDisconnectAfter < 0 {
+		return fmt.Errorf("cloud.daemonDisconnectAfter must not be negative")
+	}
+	if c.Cloud.AlarmCheckInterval < 0 {
+		return fmt.Errorf("cloud.alarmCheckInterval must not be negative")
 	}
 	return nil
 }

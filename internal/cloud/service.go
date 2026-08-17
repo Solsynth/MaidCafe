@@ -297,14 +297,15 @@ func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceCl
 }
 
 type DaemonView struct {
-	ID          string     `json:"id"`
-	WorkspaceID string     `json:"workspace_id"`
-	Name        string     `json:"name"`
-	HostID      string     `json:"host_id"`
-	Enabled     bool       `json:"enabled"`
-	LastSeenAt  *time.Time `json:"last_seen_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID             string     `json:"id"`
+	WorkspaceID    string     `json:"workspace_id"`
+	Name           string     `json:"name"`
+	HostID         string     `json:"host_id"`
+	Enabled        bool       `json:"enabled"`
+	LastSeenAt     *time.Time `json:"last_seen_at"`
+	DisconnectedAt *time.Time `json:"disconnected_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 type Credential struct {
 	DaemonView
@@ -411,7 +412,7 @@ func generateSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 func viewDaemon(d database.Daemon) DaemonView {
-	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, HostID: d.HostID, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
+	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, HostID: d.HostID, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, DisconnectedAt: d.DisconnectedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
 }
 func (s *Service) CreateDaemon(ctx context.Context, accountID, workspaceID, name string) (Credential, error) {
 	workspaceID = strings.TrimSpace(workspaceID)
@@ -516,6 +517,9 @@ func (s *Service) UpdateDaemon(ctx context.Context, accountID, id string, name *
 	}
 	if enabled != nil {
 		d.Enabled = *enabled
+		if !d.Enabled {
+			d.DisconnectedAt = nil
+		}
 	}
 	if err := s.db.WithContext(ctx).Save(&d).Error; err != nil {
 		return DaemonView{}, err
@@ -554,7 +558,11 @@ func (s *Service) DisableDaemon(ctx context.Context, accountID, id string) error
 			return err
 		}
 		d.Enabled = false
-		return tx.Save(&d).Error
+		if err := tx.Save(&d).Error; err != nil {
+			return err
+		}
+		return tx.Model(&database.Daemon{}).Where("id = ?", d.ID).
+			Update("disconnected_at", gorm.Expr("NULL")).Error
 	})
 }
 func (s *Service) authenticateDaemon(ctx context.Context, id, secret string) (database.Daemon, error) {
@@ -709,15 +717,123 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}).Error; err != nil {
 		return err
 	}
-	// Alarms are evaluated daemon-side: the daemon reports `daemon.alarm.*`
-	// notifications through CreateNotification when a threshold is exceeded,
-	// so the cloud only stores and forwards them.
-	updates := map[string]any{"last_seen_at": now, "updated_at": now}
+	// Alarms are evaluated daemon-side; this metric only records the
+	// cloud-side heartbeat and clears a prior disconnect state.
+	columns := []string{"last_seen_at", "updated_at"}
+	updates := database.Daemon{LastSeenAt: &now, UpdatedAt: now}
 	if hostID := strings.TrimSpace(input.HostID); hostID != "" && hostID != d.HostID {
-		updates["host_id"] = hostID
+		updates.HostID = hostID
+		columns = append(columns, "host_id")
 	}
-	return s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Updates(updates).Error
+	q := s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).Select(columns).Updates(&updates)
+	if q.Error != nil {
+		return q.Error
+	}
+	result := s.db.WithContext(ctx).Model(&database.Daemon{}).Where("id = ?", d.ID).
+		Update("disconnected_at", gorm.Expr("NULL"))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("clear daemon disconnect state: expected 1 row, updated %d", result.RowsAffected)
+	}
+	return nil
 }
+
+const (
+	DefaultDaemonDisconnectAfter = 5 * time.Minute
+	DefaultAlarmCheckInterval    = time.Minute
+)
+
+// EvaluateDisconnectedDaemons marks enabled daemons disconnected when the
+// cloud has not accepted a metric within disconnectedAfter. A notification is
+// persisted and published only on the transition into the disconnected state.
+// A later metric clears the state, allowing a future outage to alarm again.
+// Daemons that have never sent a metric are left pending rather than reported
+// as disconnected.
+func (s *Service) EvaluateDisconnectedDaemons(ctx context.Context, disconnectedAfter time.Duration, now time.Time) error {
+	if disconnectedAfter <= 0 {
+		disconnectedAfter = DefaultDaemonDisconnectAfter
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	var daemons []database.Daemon
+	if err := s.db.WithContext(ctx).Where("enabled = ?", true).Find(&daemons).Error; err != nil {
+		return err
+	}
+	var firstErr error
+	for _, candidate := range daemons {
+		var notification *database.Notification
+		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var daemon database.Daemon
+			if err := tx.Where("id = ?", candidate.ID).First(&daemon).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+
+			stale := daemon.LastSeenAt != nil && !now.Before(daemon.LastSeenAt.Add(disconnectedAfter))
+			if stale {
+				if daemon.DisconnectedAt != nil {
+					return nil
+				}
+				disconnectedAt := now
+				result := tx.Model(&database.Daemon{}).
+					Where("id = ? AND disconnected_at IS NULL", daemon.ID).
+					Updates(map[string]any{"disconnected_at": disconnectedAt, "updated_at": now})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return nil
+				}
+				age := now.Sub(*daemon.LastSeenAt)
+				metadata, err := json.Marshal(map[string]any{
+					"last_seen_at":      daemon.LastSeenAt.UTC(),
+					"disconnected_at":   disconnectedAt,
+					"threshold_seconds": int64(disconnectedAfter / time.Second),
+					"age_seconds":       int64(age / time.Second),
+				})
+				if err != nil {
+					return err
+				}
+				notification = &database.Notification{
+					ID: uuid.NewString(), AccountID: daemon.AccountID,
+					WorkspaceID: daemon.WorkspaceID, DaemonID: daemon.ID,
+					Kind: "daemon.disconnected", Title: "Daemon disconnected",
+					Body:     fmt.Sprintf("No metrics received for %s; last seen at %s.", age.Round(time.Second), daemon.LastSeenAt.UTC().Format(time.RFC3339)),
+					Metadata: datatypes.JSON(metadata), CreatedAt: now,
+				}
+				return tx.Create(notification).Error
+			}
+			if daemon.DisconnectedAt != nil {
+				return tx.Model(&database.Daemon{}).Where("id = ?", daemon.ID).
+					Update("disconnected_at", gorm.Expr("NULL")).Error
+			}
+			return nil
+		})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if notification != nil {
+			if err := s.publishNotification(ctx, candidate, *notification); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
 func (s *Service) publishNotification(ctx context.Context, daemon database.Daemon, notification database.Notification) error {
 	if s.publisher == nil {
 		return nil

@@ -14,11 +14,12 @@ type Daemon struct {
 	SecretHash  string `gorm:"size:255;not null" json:"-"`
 	// HostID is the stable machine identity the daemon reports with its
 	// metrics; credential scopes can link to it instead of daemon ids.
-	HostID     string `gorm:"size:191;index"`
-	Enabled    bool   `gorm:"not null;index"`
-	LastSeenAt *time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	HostID         string `gorm:"size:191;index"`
+	Enabled        bool   `gorm:"not null;index"`
+	LastSeenAt     *time.Time
+	DisconnectedAt *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type DaemonMetric struct {

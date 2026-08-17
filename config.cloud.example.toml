@@ -32,3 +32,10 @@ url = ""
 # Optional subject namespace for this deployment, e.g. "staging" publishes to
 # "staging.maidcafe.notification.v1" instead of "maidcafe.notification.v1".
 subjectPrefix = ""
+
+[cloud]
+# A daemon with an accepted metric older than this is marked disconnected
+# and emits one daemon.disconnected notification until it reports again.
+daemonDisconnectAfter = "5m"
+# How often the cloud evaluates daemon heartbeat state.
+alarmCheckInterval = "1m"

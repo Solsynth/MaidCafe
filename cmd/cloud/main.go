@@ -105,6 +105,35 @@ func main() {
 			}
 		}
 	}()
+	disconnectAfter := cfg.Cloud.DaemonDisconnectAfter
+	if disconnectAfter <= 0 {
+		disconnectAfter = cloud.DefaultDaemonDisconnectAfter
+	}
+	alarmCheckInterval := cfg.Cloud.AlarmCheckInterval
+	if alarmCheckInterval <= 0 {
+		alarmCheckInterval = cloud.DefaultAlarmCheckInterval
+	}
+	go func() {
+		ticker := time.NewTicker(alarmCheckInterval)
+		defer ticker.Stop()
+		check := func() {
+			if err := svc.EvaluateDisconnectedDaemons(ctx, disconnectAfter, time.Now().UTC()); err != nil {
+				log.Warn().Err(err).Msg("daemon disconnect alarm evaluation")
+			}
+		}
+		check()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				checkAt := now.UTC()
+				if err := svc.EvaluateDisconnectedDaemons(ctx, disconnectAfter, checkAt); err != nil {
+					log.Warn().Err(err).Msg("daemon disconnect alarm evaluation")
+				}
+			}
+		}
+	}()
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
