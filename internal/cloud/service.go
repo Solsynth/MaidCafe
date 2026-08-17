@@ -589,6 +589,25 @@ func (s *Service) GetDaemonQuota(ctx context.Context, id, secret string) (Worksp
 	return WorkspaceQuotaView{WorkspaceID: d.WorkspaceID, Quotas: quotas}, nil
 }
 
+// GetWorkspaceQuota returns the workspace-effective quota map (plan preset +
+// active addon grants) to a confirmed member of the workspace, for user-facing
+// display (GET /api/workspaces/:id/quota). A daemon's quota is its
+// workspace's effective quota, so this is the same view the daemon fetches.
+func (s *Service) GetWorkspaceQuota(ctx context.Context, accountID, workspaceID string) (WorkspaceQuotaView, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return WorkspaceQuotaView{}, fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return WorkspaceQuotaView{}, err
+	}
+	quotas, err := s.workspaceQuota(ctx, workspaceID)
+	if err != nil {
+		return WorkspaceQuotaView{}, err
+	}
+	return WorkspaceQuotaView{WorkspaceID: workspaceID, Quotas: quotas}, nil
+}
+
 // SyncActions replaces the action list the daemon reported for cloud-side
 // listing. Authenticated with the daemon secret, like metric ingest.
 func (s *Service) SyncActions(ctx context.Context, id, secret string, input []ActionInput) error {

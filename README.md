@@ -34,6 +34,10 @@ implemented.
   `maidcafe.notification.v1`.
 - Durable notification listing with unread filtering, daemon filtering, limits,
   cursor pagination, and idempotent read acknowledgement.
+- Workspace quota exposure: the effective plan quota (`max_daemons`,
+  `polling_interval_seconds`, `metrics_retention_days`) is served to workspace
+  members (`GET /api/workspaces/:id/quota`) and to daemons for self-tuning
+  (`GET /api/daemons/:id/quota`).
 - Unauthenticated health endpoint:
 
 ```text

@@ -38,6 +38,7 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
 	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
 	user.GET("/daemons/:id/actions", listActions(svc))
+	user.GET("/workspaces/:id/quota", workspaceQuota(svc))
 	user.POST("/credentials", createCredential(svc))
 	user.GET("/credentials", listCredentials(svc))
 	user.DELETE("/credentials/:id", deleteCredential(svc))
@@ -341,6 +342,20 @@ func daemonQuota(s *cloud.Service) gin.HandlerFunc {
 		out, err := s.GetDaemonQuota(c, c.Param("id"), secret)
 		if err != nil {
 			if errors.Is(err, cloud.ErrUnauthorized) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+func workspaceQuota(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.GetWorkspaceQuota(c, accountID(c), c.Param("id"))
+		if err != nil {
+			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
 				serviceStatus(c, err)
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

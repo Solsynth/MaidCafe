@@ -10,11 +10,21 @@ import (
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
+	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
+	gen "src.solsynth.dev/sosys/go/proto"
 )
 
 type routePublisher struct{}
 
 func (routePublisher) Publish(context.Context, cloud.NotificationEvent) error { return nil }
+
+// routeAuthenticator authenticates every Solar token as account-a, so user
+// routes can be exercised without a live auth service.
+type routeAuthenticator struct{}
+
+func (routeAuthenticator) Authenticate(_ context.Context, _ dyauth.TokenInfo, _ *http.Request) (*dyauth.AuthResult, error) {
+	return &dyauth.AuthResult{Account: &gen.DyAccount{Id: "account-a"}}, nil
+}
 
 // routeWorkspaces grants account-a member access to ws-a only, mirroring the
 // production DyWorkspaceService contract.
@@ -81,5 +91,54 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	router.ServeHTTP(got, metric)
 	if got.Code != http.StatusNoContent {
 		t.Fatalf("daemon metric route %d %s", got.Code, got.Body)
+	}
+}
+
+func TestWorkspaceQuotaUserRoute(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
+	router := NewRouter(nil, svc, routeAuthenticator{})
+
+	unauth := httptest.NewRecorder()
+	router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/workspaces/ws-a/quota", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated quota route %d", unauth.Code)
+	}
+
+	// A user-level API credential authenticates as its account, so no Solar
+	// auth service is needed for the member and non-member cases.
+	cred, err := svc.CreateCredential(context.Background(), "account-a", "ci", nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+cred.Token)
+		got := httptest.NewRecorder()
+		router.ServeHTTP(got, req)
+		return got
+	}
+
+	member := get("/api/workspaces/ws-a/quota")
+	if member.Code != http.StatusOK {
+		t.Fatalf("member quota route %d %s", member.Code, member.Body)
+	}
+	var view cloud.WorkspaceQuotaView
+	if err := json.Unmarshal(member.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.WorkspaceID != "ws-a" || view.Quotas["max_daemons"] != 10 {
+		t.Fatalf("quota view %#v", view)
+	}
+
+	if got := get("/api/workspaces/ws-b/quota"); got.Code != http.StatusForbidden {
+		t.Fatalf("non-member quota route %d", got.Code)
 	}
 }

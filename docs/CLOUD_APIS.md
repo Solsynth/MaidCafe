@@ -337,6 +337,35 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../push-notification \
 | `body` | string | required, `<= 4096` bytes |
 | `metadata` | object | optional, `<= 16 KiB` serialized |
 
+### Workspaces (user routes)
+
+#### `GET /api/workspaces/:id/quota`
+
+Return the workspace's effective quota (plan preset + active addon grants) to
+a member of the workspace. A daemon's quota is its workspace's effective
+quota, so this is the same view the daemon fetches with its own
+daemon-secret-authenticated `GET /api/daemons/:id/quota`. `403` if the caller
+is not a member of the workspace.
+
+`200` returns the quota view:
+
+```json
+{
+  "workspace_id": "5f1c...",
+  "quotas": {
+    "max_daemons": 5,
+    "polling_interval_seconds": 30,
+    "metrics_retention_days": 30
+  }
+}
+```
+
+Dimension keys are served by the workspace service and configurable; MaidCafe
+enforces `max_daemons` (registration limit), `polling_interval_seconds`
+(throttles daemon metric ingest and relay pickup, HTTP `429`), and
+`metrics_retention_days` (prunes stored metrics). A missing or non-positive
+dimension means no enforcement for that quota.
+
 ### Notifications (user routes)
 
 #### `GET /api/notifications?workspace_id=`
@@ -524,6 +553,13 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../notifications \
 
 Same field constraints as `POST /api/daemons/:id/push-notification`. The
 notification is stored under the daemon's workspace.
+
+#### `GET /api/daemons/:id/quota`
+
+Return the daemon's workspace-effective quota so it can self-tune its
+reporting and relay-poll cadence. `200` returns the same
+`{workspace_id, quotas}` view as `GET /api/workspaces/:id/quota`; `401` on a
+bad/disabled daemon secret.
 
 #### `GET /api/daemons/:id/webhook-requests/pending?limit=`
 
