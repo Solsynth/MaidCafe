@@ -17,6 +17,8 @@ var alarmMessages = map[string]map[string]string{
 		"container_down.body":       "Container {name} is {state}.",
 		"disconnected.title":        "Daemon disconnected",
 		"disconnected.body":         "No metrics received for {age}; last seen at {last_seen}.",
+		"reconnected.title":         "Daemon reconnected",
+		"reconnected.body":          "Metrics resumed after {downtime}.",
 	},
 	"zh-cn": {
 		"cpu_percent.title":         "CPU 已超过阈值",
@@ -29,6 +31,8 @@ var alarmMessages = map[string]map[string]string{
 		"container_down.body":       "容器 {name} 当前状态为 {state}。",
 		"disconnected.title":        "守护进程已断开连接",
 		"disconnected.body":         "已有 {age} 未收到指标；最后上报时间为 {last_seen}。",
+		"reconnected.title":         "守护进程已重新连接",
+		"reconnected.body":          "指标已恢复上报，间隔 {downtime}。",
 	},
 	"zh-tw": {
 		"cpu_percent.title":         "CPU 已超過閾值",
@@ -39,6 +43,8 @@ var alarmMessages = map[string]map[string]string{
 		"disk_used_percent.body":    "磁碟使用率達到 {value}%（閾值 {threshold}%）。",
 		"container_down.title":      "容器已停止",
 		"container_down.body":       "容器 {name} 目前狀態為 {state}。",
+		"reconnected.title":         "守護程式已重新連線",
+		"reconnected.body":          "指標已恢復回報，間隔 {downtime}。",
 		"disconnected.title":        "守護程式已中斷連線",
 		"disconnected.body":         "已有 {age} 未收到指標；最後回報時間為 {last_seen}。",
 	},
@@ -67,6 +73,7 @@ func localizeAlarm(language, kind string, metadata map[string]any) (string, stri
 		"state":     fmt.Sprint(metadata["state"]),
 		"age":       fmt.Sprint(metadata["age"]),
 		"last_seen": fmt.Sprint(metadata["last_seen"]),
+		"downtime":  fmt.Sprint(metadata["downtime"]),
 	}
 	for name, value := range args {
 		title = strings.ReplaceAll(title, "{"+name+"}", value)

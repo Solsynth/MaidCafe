@@ -767,22 +767,26 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	if result.RowsAffected == 1 {
 		metadata := map[string]any{"reconnected_at": now, "last_seen_at": now}
 		body := "Metrics received again after the daemon disconnected."
+		downtimeText := "an unknown interval"
 		if d.DisconnectedAt != nil {
 			downtime := now.Sub(d.DisconnectedAt.UTC())
 			if downtime < 0 {
 				downtime = 0
 			}
+			downtimeText = downtime.Round(time.Second).String()
 			metadata["disconnected_at"] = d.DisconnectedAt.UTC()
 			metadata["downtime_seconds"] = int64(downtime / time.Second)
-			body = fmt.Sprintf("Metrics resumed after %s.", downtime.Round(time.Second))
+			body = fmt.Sprintf("Metrics resumed after %s.", downtimeText)
 		}
+		metadata["downtime"] = downtimeText
 		encoded, err := json.Marshal(metadata)
 		if err != nil {
 			return err
 		}
+		title, body := s.localizedAlarm(ctx, d.AccountID, "daemon.reconnected", "Daemon reconnected", body, encoded)
 		notification := database.Notification{
 			ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID,
-			DaemonID: d.ID, Kind: "daemon.reconnected", Title: "Daemon reconnected",
+			DaemonID: d.ID, Kind: "daemon.reconnected", Title: title,
 			Body: body, Metadata: datatypes.JSON(encoded), CreatedAt: now,
 		}
 		if err := s.db.WithContext(ctx).Create(&notification).Error; err != nil {
@@ -1018,7 +1022,7 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	return notificationView(row), nil
 }
 func (s *Service) localizedAlarm(ctx context.Context, accountID, kind, title, body string, metadata []byte) (string, string) {
-	if (kind != "daemon.disconnected" && !strings.HasPrefix(kind, "daemon.alarm.")) || s.accounts == nil {
+	if (kind != "daemon.disconnected" && kind != "daemon.reconnected" && !strings.HasPrefix(kind, "daemon.alarm.")) || s.accounts == nil {
 		return title, body
 	}
 	account, err := s.accounts.GetAccount(ctx, &gen.DyGetAccountRequest{Id: accountID})

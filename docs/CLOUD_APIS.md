@@ -119,9 +119,10 @@ thresholds in `[[daemon.alarms]]` (or one `<kind>.toml` fragment under
 `daemon.alarmsDir`). `container_down` can target a container name or ID.
 The daemon reports `daemon.alarm.<kind>` through
 `POST /api/daemons/:id/notifications`; the cloud stores and forwards it.
-Alarm titles and bodies are localized by the cloud from the owning account's
-`language` preference (`en-*`, `zh-CN`/`zh-Hans`, and `zh-TW` are supported),
-with English fallback when the account service is unavailable.
+Alarm and heartbeat notification titles and bodies are localized by the cloud
+from the owning account's `language` preference (`en-*`, `zh-CN`/`zh-Hans`, and
+`zh-TW` are supported), with English fallback when the account service is
+unavailable.
 
 The cloud independently evaluates the heartbeat: by default, an enabled daemon
 whose last accepted metric is older than five minutes is marked disconnected

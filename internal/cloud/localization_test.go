@@ -50,6 +50,14 @@ func TestLocalizeDisconnectedAlarm(t *testing.T) {
 		t.Fatalf("localized disconnect = %q / %q / %v", title, body, ok)
 	}
 }
+func TestLocalizeReconnectedAlarm(t *testing.T) {
+	title, body, ok := localizeAlarm("zh-CN", "daemon.reconnected", map[string]any{
+		"downtime": "5m0s",
+	})
+	if !ok || title != "守护进程已重新连接" || body != "指标已恢复上报，间隔 5m0s。" {
+		t.Fatalf("localized reconnect = %q / %q / %v", title, body, ok)
+	}
+}
 
 func TestCreateNotificationPersistsAndPublishesLocalizedAlarm(t *testing.T) {
 	svc, db, publisher, _ := testService(t)

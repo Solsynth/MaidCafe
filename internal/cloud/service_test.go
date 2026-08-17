@@ -225,6 +225,7 @@ func TestMetricIngestAndPushRequestPersistence(t *testing.T) {
 
 func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
 	svc, db, publisher, _ := testService(t)
+	svc.accounts = languageAccountClient{language: "zh-TW"}
 	defer db.Close()
 	ctx := context.Background()
 	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
@@ -278,7 +279,9 @@ func TestEvaluateDisconnectedDaemonsTransitionsAndPublishes(t *testing.T) {
 	if row.DisconnectedAt != nil {
 		t.Fatalf("metric did not recover daemon: %+v", row)
 	}
-	if len(publisher.events) != 2 || publisher.events[1].Kind != "daemon.reconnected" {
+	if len(publisher.events) != 2 || publisher.events[1].Kind != "daemon.reconnected" ||
+		publisher.events[1].Title != "守護程式已重新連線" ||
+		!strings.HasPrefix(publisher.events[1].Body, "指標已恢復回報，間隔 ") {
 		t.Fatalf("reconnect notification: %#v", publisher.events)
 	}
 
