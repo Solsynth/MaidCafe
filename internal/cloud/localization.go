@@ -19,6 +19,10 @@ var alarmMessages = map[string]map[string]string{
 		"disconnected.body":         "No metrics received for {age}; last seen at {last_seen}.",
 		"reconnected.title":         "Daemon reconnected",
 		"reconnected.body":          "Metrics resumed after {downtime}.",
+		"webhook.success.title":     "Webhook {name} completed",
+		"webhook.success.body":      "{body}",
+		"webhook.failure.title":     "Webhook {name} failed",
+		"webhook.failure.body":      "{body}",
 	},
 	"zh-cn": {
 		"cpu_percent.title":         "CPU 已超过阈值",
@@ -29,6 +33,10 @@ var alarmMessages = map[string]map[string]string{
 		"disk_used_percent.body":    "磁盘使用率达到 {value}%（阈值 {threshold}%）。",
 		"container_down.title":      "容器已停止",
 		"container_down.body":       "容器 {name} 当前状态为 {state}。",
+		"webhook.success.title":     "Webhook {name} 已完成",
+		"webhook.success.body":      "{body}",
+		"webhook.failure.title":     "Webhook {name} 执行失败",
+		"webhook.failure.body":      "{body}",
 		"disconnected.title":        "守护进程已断开连接",
 		"disconnected.body":         "已有 {age} 未收到指标；最后上报时间为 {last_seen}。",
 		"reconnected.title":         "守护进程已重新连接",
@@ -39,6 +47,10 @@ var alarmMessages = map[string]map[string]string{
 		"cpu_percent.body":          "CPU 使用率達到 {value}%（閾值 {threshold}%）。",
 		"memory_used_percent.title": "記憶體已超過閾值",
 		"memory_used_percent.body":  "記憶體使用率達到 {value}%（閾值 {threshold}%）。",
+		"webhook.success.title":     "Webhook {name} 已完成",
+		"webhook.success.body":      "{body}",
+		"webhook.failure.title":     "Webhook {name} 執行失敗",
+		"webhook.failure.body":      "{body}",
 		"disk_used_percent.title":   "磁碟已超過閾值",
 		"disk_used_percent.body":    "磁碟使用率達到 {value}%（閾值 {threshold}%）。",
 		"container_down.title":      "容器已停止",
@@ -66,14 +78,22 @@ func localizeAlarm(language, kind string, metadata map[string]any) (string, stri
 	if !titleOK || !bodyOK {
 		return "", "", false
 	}
+	name := metadata["container_name"]
+	if name == nil {
+		name = metadata["display_name"]
+	}
+	if name == nil {
+		name = metadata["name"]
+	}
 	args := map[string]string{
 		"value":     formatAlarmValue(metadata["value"]),
 		"threshold": formatAlarmValue(metadata["threshold"]),
-		"name":      fmt.Sprint(metadata["container_name"]),
+		"name":      fmt.Sprint(name),
 		"state":     fmt.Sprint(metadata["state"]),
 		"age":       fmt.Sprint(metadata["age"]),
 		"last_seen": fmt.Sprint(metadata["last_seen"]),
 		"downtime":  fmt.Sprint(metadata["downtime"]),
+		"body":      fmt.Sprint(metadata["body"]),
 	}
 	for name, value := range args {
 		title = strings.ReplaceAll(title, "{"+name+"}", value)

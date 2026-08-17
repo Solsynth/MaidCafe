@@ -546,3 +546,26 @@ func TestRelayExecutesSecretlessActions(t *testing.T) {
 		t.Fatalf("unknown action expected 404, got %d", status)
 	}
 }
+func TestActionCompletionInvokesNotificationHandler(t *testing.T) {
+	script := executable(t, "#!/bin/sh\nprintf '%s' done\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout: time.Second, MaxBodyBytes: 1024, MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name: "cleanup", Command: script, Enabled: true, NotifyOnSuccess: true,
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+	var completed config.WebhookConfig
+	var ok bool
+	executor.SetCompletionHandler(func(hook config.WebhookConfig, success bool, _ int, _ string, _ time.Duration) {
+		completed = hook
+		ok = success
+	})
+	result, requestErr := executor.RunAction(context.Background(), "cleanup", []byte("{}"), "relay", "ci-bot")
+	if requestErr != nil || !result.OK {
+		t.Fatalf("action execution failed: result=%+v error=%v", result, requestErr)
+	}
+	if !ok || completed.Name != "cleanup" || !completed.NotifyOnSuccess {
+		t.Fatalf("action completion callback missing: ok=%v hook=%+v", ok, completed)
+	}
+}

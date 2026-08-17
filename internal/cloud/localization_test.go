@@ -59,6 +59,30 @@ func TestLocalizeReconnectedAlarm(t *testing.T) {
 	}
 }
 
+func TestCreateNotificationLocalizesWebhookActionTitle(t *testing.T) {
+	svc, db, publisher, _ := testService(t)
+	defer db.Close()
+	svc.accounts = languageAccountClient{language: "zh-CN"}
+	created, err := svc.CreateDaemon(context.Background(), "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := svc.CreateNotification(context.Background(), created.ID, created.Secret, NotificationInput{
+		Kind:  "webhook.success",
+		Title: "Webhook Cleanup completed",
+		Body:  "done",
+		Metadata: []byte(`{"name":"cleanup","display_name":"Cleanup",` +
+			`"exit_code":0,"duration_ms":12}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Title != "Webhook Cleanup 已完成" || view.Body != "done" ||
+		len(publisher.events) != 1 || publisher.events[0].Title != view.Title ||
+		publisher.events[0].Subtitle != "来自 host" {
+		t.Fatalf("localized action notification = %#v / %#v", view, publisher.events)
+	}
+}
 func TestCreateNotificationPersistsAndPublishesLocalizedAlarm(t *testing.T) {
 	svc, db, publisher, _ := testService(t)
 	defer db.Close()

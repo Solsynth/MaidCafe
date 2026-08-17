@@ -291,7 +291,9 @@ secret and body integrity only.
   `relay`), `invoked_by`, `ok`, `exit_code`, `duration_ms`, and a truncated
   failure reason. Rotated at 1 MiB, one generation kept.
 - `notifyOnSuccess` / `notifyOnFailure` publish `webhook.success` /
-  `webhook.failure` notifications to the cloud for that hook.
+  `webhook.failure` notifications to the cloud for that hook. The cloud
+  localizes the generated title using the account language; command output in
+  the body remains unchanged.
 - The daemon also reports its configured actions to the cloud
   (`POST /api/daemons/:id/actions` on every metrics tick), so
   `GET /api/daemons/:id/actions` lists what a workspace member may invoke.

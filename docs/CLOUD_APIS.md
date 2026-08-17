@@ -135,8 +135,8 @@ A subsequent accepted metric clears `disconnected_at` and emits one
 `daemon.reconnected` notification. A later outage can emit another disconnect
 notification after the cooldown.
 For push delivery, the cloud prefixes the daemon name in the subtitle as
-`From <daemon name>`. If a notification already has a subtitle, it is retained
-after the source prefix.
+`From <daemon name>` (or the localized equivalent). If a notification already
+has a subtitle, it is retained after the source prefix.
 
 ### Notification
 

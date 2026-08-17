@@ -956,7 +956,7 @@ func (s *Service) publishNotification(ctx context.Context, daemon database.Daemo
 		NotificationID: notification.ID,
 		Kind:           notification.Kind,
 		Title:          notification.Title,
-		Subtitle:       notificationSubtitle(daemon.Name, notification.Subtitle),
+		Subtitle:       notificationSubtitle(daemon.Name, notification.Subtitle, s.notificationSourcePrefix(ctx, notification.AccountID)),
 		Body:           notification.Body,
 		Metadata:       merged,
 	}
@@ -970,8 +970,26 @@ func (s *Service) publishNotification(ctx context.Context, daemon database.Daemo
 	return nil
 }
 
-func notificationSubtitle(daemonName, subtitle string) string {
-	source := "From " + strings.TrimSpace(daemonName)
+func (s *Service) notificationSourcePrefix(ctx context.Context, accountID string) string {
+	if s.accounts == nil {
+		return "From"
+	}
+	account, err := s.accounts.GetAccount(ctx, &gen.DyGetAccountRequest{Id: accountID})
+	if err != nil || account == nil {
+		return "From"
+	}
+	switch normalizeAlarmLocale(account.GetLanguage()) {
+	case "zh-cn":
+		return "来自"
+	case "zh-tw":
+		return "來自"
+	default:
+		return "From"
+	}
+}
+
+func notificationSubtitle(daemonName, subtitle, sourcePrefix string) string {
+	source := strings.TrimSpace(sourcePrefix) + " " + strings.TrimSpace(daemonName)
 	subtitle = strings.TrimSpace(subtitle)
 	if subtitle == "" {
 		return source
@@ -1022,7 +1040,7 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	return notificationView(row), nil
 }
 func (s *Service) localizedAlarm(ctx context.Context, accountID, kind, title, body string, metadata []byte) (string, string) {
-	if (kind != "daemon.disconnected" && kind != "daemon.reconnected" && !strings.HasPrefix(kind, "daemon.alarm.")) || s.accounts == nil {
+	if !localizableNotificationKind(kind) || s.accounts == nil {
 		return title, body
 	}
 	account, err := s.accounts.GetAccount(ctx, &gen.DyGetAccountRequest{Id: accountID})
@@ -1036,11 +1054,19 @@ func (s *Service) localizedAlarm(ctx context.Context, accountID, kind, title, bo
 	if err := json.Unmarshal(metadata, &values); err != nil {
 		return title, body
 	}
+	values["body"] = body
 	localizedTitle, localizedBody, ok := localizeAlarm(account.GetLanguage(), kind, values)
 	if !ok {
 		return title, body
 	}
 	return localizedTitle, localizedBody
+}
+func localizableNotificationKind(kind string) bool {
+	return kind == "daemon.disconnected" ||
+		kind == "daemon.reconnected" ||
+		kind == "webhook.success" ||
+		kind == "webhook.failure" ||
+		strings.HasPrefix(kind, "daemon.alarm.")
 }
 
 func bound(value string, max int) (string, error) {

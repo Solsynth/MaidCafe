@@ -93,7 +93,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		if len(body) > 4096 {
 			body = body[:4096]
 		}
-		publisher.PublishNotification(context.Background(), notificationPayload{Kind: kind, Title: title, Body: body, Metadata: map[string]any{"name": hook.Name, "exit_code": exitCode, "duration_ms": duration.Milliseconds()}})
+		publisher.PublishNotification(context.Background(), notificationPayload{Kind: kind, Title: title, Body: body, Metadata: map[string]any{"name": hook.Name, "display_name": hook.Label(), "exit_code": exitCode, "duration_ms": duration.Milliseconds()}})
 	})
 
 	if strings.EqualFold(strings.TrimSpace(cfg.Transport), "stdio") {
