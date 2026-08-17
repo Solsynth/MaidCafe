@@ -144,6 +144,29 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 		t.Fatalf("non-member listing expected forbidden, got %v", err)
 	}
 }
+func TestNotificationNullMetadataDoesNotPanic(t *testing.T) {
+	svc, db, publisher, _ := testService(t)
+	defer db.Close()
+	daemon, err := svc.CreateDaemon(context.Background(), "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateNotification(context.Background(), daemon.ID, daemon.Secret, NotificationInput{
+		Kind: "maintenance", Title: "Maintenance", Body: "done", Metadata: json.RawMessage("null"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("null metadata notification was not published: %#v", publisher.events)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(publisher.events[0].Metadata, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["daemon_id"] != daemon.ID || metadata["daemon_name"] != "host" {
+		t.Fatalf("identity metadata missing after null input: %#v", metadata)
+	}
+}
 func TestMetricHistoryIsOwnedAndOrdered(t *testing.T) {
 	svc, db, _, _ := testService(t)
 	defer db.Close()

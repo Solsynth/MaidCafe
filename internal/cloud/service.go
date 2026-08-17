@@ -938,6 +938,9 @@ func (s *Service) publishNotification(ctx context.Context, daemon database.Daemo
 			meta = map[string]any{}
 		}
 	}
+	if meta == nil {
+		meta = map[string]any{}
+	}
 	meta["daemon_id"] = daemon.ID
 	meta["daemon_name"] = daemon.Name
 	if daemon.HostID != "" {
@@ -1053,6 +1056,9 @@ func (s *Service) localizedAlarm(ctx context.Context, accountID, kind, title, bo
 	var values map[string]any
 	if err := json.Unmarshal(metadata, &values); err != nil {
 		return title, body
+	}
+	if values == nil {
+		values = map[string]any{}
 	}
 	values["body"] = body
 	localizedTitle, localizedBody, ok := localizeAlarm(account.GetLanguage(), kind, values)
