@@ -108,6 +108,23 @@ func (p *CloudPublisher) PublishMetrics(ctx context.Context, payload MetricsPayl
 	}
 }
 
+// WorkspaceQuota returns the connected workspace's effective quota map (plan
+// preset + active addon grants) served by the cloud at GET /api/daemons/:id/quota,
+// so the daemon can self-tune its polling and reporting cadence.
+func (p *CloudPublisher) WorkspaceQuota(ctx context.Context) (map[string]int64, error) {
+	if p == nil {
+		return nil, fmt.Errorf("cloud publisher is not configured")
+	}
+	var out struct {
+		WorkspaceID string           `json:"workspace_id"`
+		Quotas      map[string]int64 `json:"quotas"`
+	}
+	if err := p.request(ctx, "GET", "/quota", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Quotas, nil
+}
+
 // actionReportPayload is the wire shape of one configured action the daemon
 // reports to the cloud for listing; invocation happens through the webhook
 // relay, so no script body or secret ever leaves the host.

@@ -568,6 +568,27 @@ func (s *Service) authenticateDaemon(ctx context.Context, id, secret string) (da
 	return d, nil
 }
 
+// WorkspaceQuotaView is the workspace-effective quota served to a daemon so it
+// can self-tune (polling interval, metrics retention, daemon slots, ...).
+type WorkspaceQuotaView struct {
+	WorkspaceID string           `json:"workspace_id"`
+	Quotas      map[string]int64 `json:"quotas"`
+}
+
+// GetDaemonQuota returns the connected workspace's effective quota for a
+// daemon-authenticated caller (GET /api/daemons/:id/quota).
+func (s *Service) GetDaemonQuota(ctx context.Context, id, secret string) (WorkspaceQuotaView, error) {
+	d, err := s.authenticateDaemon(ctx, id, secret)
+	if err != nil {
+		return WorkspaceQuotaView{}, ErrUnauthorized
+	}
+	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
+	if err != nil {
+		return WorkspaceQuotaView{}, err
+	}
+	return WorkspaceQuotaView{WorkspaceID: d.WorkspaceID, Quotas: quotas}, nil
+}
+
 // SyncActions replaces the action list the daemon reported for cloud-side
 // listing. Authenticated with the daemon secret, like metric ingest.
 func (s *Service) SyncActions(ctx context.Context, id, secret string, input []ActionInput) error {

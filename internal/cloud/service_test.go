@@ -566,6 +566,40 @@ func TestPruneMetricsPerWorkspaceRetention(t *testing.T) {
 	}
 }
 
+func TestDaemonQuotaEndpoint(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{
+		"ws-a": {"max_daemons": 5, "polling_interval_seconds": 30, "metrics_retention_days": 30},
+	}
+
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := svc.GetDaemonQuota(ctx, created.ID, created.Secret)
+	if err != nil {
+		t.Fatalf("daemon quota should be served: %v", err)
+	}
+	if view.WorkspaceID != "ws-a" {
+		t.Fatalf("expected workspace ws-a, got %s", view.WorkspaceID)
+	}
+	want := map[string]int64{"max_daemons": 5, "polling_interval_seconds": 30, "metrics_retention_days": 30}
+	if len(view.Quotas) != len(want) {
+		t.Fatalf("expected quotas %v, got %v", want, view.Quotas)
+	}
+	for k, v := range want {
+		if view.Quotas[k] != v {
+			t.Fatalf("expected quotas[%s] = %d, got %d", k, v, view.Quotas[k])
+		}
+	}
+
+	if _, err := svc.GetDaemonQuota(ctx, created.ID, "wrong-secret"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized for bad secret, got %v", err)
+	}
+}
+
 func TestCredentialLifecycleAndScopes(t *testing.T) {
 	svc, db, _, _ := testService(t)
 	defer db.Close()

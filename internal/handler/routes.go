@@ -47,6 +47,7 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	daemon.POST("/notifications", createNotification(svc))
 	daemon.GET("/webhook-requests/pending", listPendingWebhooks(svc))
 	daemon.POST("/webhook-requests/:request_id/result", completeWebhook(svc))
+	daemon.GET("/quota", daemonQuota(svc))
 }
 
 func requireUser() gin.HandlerFunc {
@@ -328,6 +329,25 @@ func ingestMetric(s *cloud.Service) gin.HandlerFunc {
 			return
 		}
 		c.Status(http.StatusNoContent)
+	}
+}
+func daemonQuota(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		secret, ok := daemonSecret(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		out, err := s.GetDaemonQuota(c, c.Param("id"), secret)
+		if err != nil {
+			if errors.Is(err, cloud.ErrUnauthorized) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, out)
 	}
 }
 func listActions(s *cloud.Service) gin.HandlerFunc {
