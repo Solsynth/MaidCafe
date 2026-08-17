@@ -69,6 +69,12 @@ func (r *WebhookRelay) Run(ctx context.Context) {
 }
 
 func (r *WebhookRelay) pollOnce(ctx context.Context) {
+	// Metric ingest and relay pickup share the cloud's per-daemon throttle
+	// bucket; skip the poll while the workspace poll interval is open instead
+	// of burning a guaranteed 429. The next tick retries.
+	if !r.publisher.pacedOK(ctx) {
+		return
+	}
 	var pending relayPendingResponse
 	if err := r.publisher.request(ctx, "GET", "/webhook-requests/pending", nil, &pending); err != nil {
 		r.logger.Warn("webhook relay poll failed", "error", err)

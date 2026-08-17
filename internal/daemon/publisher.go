@@ -9,10 +9,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
+
+// quotaRefreshInterval is how often the daemon re-fetches the workspace quota
+// (GET /api/daemons/:id/quota) to re-tune its cloud traffic pacing. The quota
+// GET itself is not throttled by the cloud.
+const quotaRefreshInterval = 5 * time.Minute
+
+// quotaRetryInterval is the backoff after a failed quota refresh, so a broken
+// quota endpoint does not turn every paced request into a quota GET.
+const quotaRetryInterval = time.Minute
 
 type notificationPayload struct {
 	Kind     string         `json:"kind"`
@@ -33,6 +43,16 @@ type CloudPublisher struct {
 	client   *http.Client
 	timeout  time.Duration
 	logger   *slog.Logger
+
+	// Workspace quota pacing: the cloud throttles daemon-initiated metric
+	// ingest and webhook-relay pickup to at most one request per
+	// polling_interval_seconds per daemon (HTTP 429 otherwise). The daemon
+	// paces exactly those two paths itself, sharing one slot like the cloud's
+	// per-daemon bucket. A zero pollInterval disables pacing.
+	paceMu         sync.Mutex
+	pollInterval   time.Duration
+	lastQuotaFetch time.Time
+	lastPaced      time.Time
 }
 
 func NewCloudPublisher(cfg config.DaemonConfig, logger *slog.Logger) (*CloudPublisher, error) {
@@ -102,10 +122,63 @@ func (p *CloudPublisher) post(ctx context.Context, suffix string, payload any) {
 	}
 }
 
-func (p *CloudPublisher) PublishMetrics(ctx context.Context, payload MetricsPayload) {
-	if p != nil {
-		p.post(ctx, "/metrics", payload)
+// pacedOK reports whether a cloud-throttled request may be sent now. It
+// refreshes the workspace polling interval quota when stale and returns false
+// while inside the interval window, so callers skip the request instead of
+// sending one the cloud will 429. The window check and slot recording are
+// atomic: metric ingest and relay pickup must not both pass the gate inside
+// one window.
+func (p *CloudPublisher) pacedOK(ctx context.Context) bool {
+	p.refreshQuota(ctx)
+	p.paceMu.Lock()
+	defer p.paceMu.Unlock()
+	if p.pollInterval <= 0 {
+		return true
 	}
+	now := time.Now()
+	if now.Sub(p.lastPaced) < p.pollInterval {
+		return false
+	}
+	p.lastPaced = now
+	return true
+}
+
+// refreshQuota pulls the workspace quota and applies the
+// polling_interval_seconds dimension. A missing or non-positive dimension
+// disables pacing, mirroring the cloud's enforcePollInterval. Failures keep
+// the previous interval and retry after quotaRetryInterval.
+func (p *CloudPublisher) refreshQuota(ctx context.Context) {
+	p.paceMu.Lock()
+	defer p.paceMu.Unlock()
+	if !p.lastQuotaFetch.IsZero() && time.Since(p.lastQuotaFetch) < quotaRefreshInterval {
+		return
+	}
+	quotas, err := p.WorkspaceQuota(ctx)
+	if err != nil {
+		p.logger.Warn("cloud quota refresh failed; keeping previous poll interval", "error", err)
+		p.lastQuotaFetch = time.Now().Add(-(quotaRefreshInterval - quotaRetryInterval))
+		return
+	}
+	p.lastQuotaFetch = time.Now()
+	var interval time.Duration
+	if secs := quotas["polling_interval_seconds"]; secs > 0 {
+		interval = time.Duration(secs) * time.Second
+	}
+	p.pollInterval = interval
+	if interval > 0 {
+		p.logger.Debug("daemon cloud traffic paced by workspace quota", "interval", interval)
+	}
+}
+
+func (p *CloudPublisher) PublishMetrics(ctx context.Context, payload MetricsPayload) {
+	if p == nil {
+		return
+	}
+	if !p.pacedOK(ctx) {
+		p.logger.Debug("metric publish skipped: inside workspace poll interval")
+		return
+	}
+	p.post(ctx, "/metrics", payload)
 }
 
 // WorkspaceQuota returns the connected workspace's effective quota map (plan
