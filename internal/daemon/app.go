@@ -503,6 +503,25 @@ func (a *App) Run(ctx context.Context) error {
 				for _, notification := range a.alarms.evaluate(a.cfg.Alarms, metrics, now) {
 					a.publisher.PublishNotification(context.Background(), notification)
 				}
+				for _, alarm := range a.cfg.Alarms {
+					if alarm.Kind != "container_down" || alarm.Enabled != nil && !*alarm.Enabled {
+						continue
+					}
+					data, err := a.containers.snapshot(context.Background())
+					if err != nil {
+						a.logger.Warn("container alarm evaluation failed", "error", err)
+						break
+					}
+					var sample containersPayload
+					if err := json.Unmarshal(data, &sample); err != nil {
+						a.logger.Warn("container alarm payload invalid", "error", err)
+						break
+					}
+					for _, notification := range a.alarms.evaluateContainers(a.cfg.Alarms, sample, now) {
+						a.publisher.PublishNotification(context.Background(), notification)
+					}
+					break
+				}
 			}
 		}
 	}

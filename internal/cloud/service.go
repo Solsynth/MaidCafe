@@ -49,6 +49,31 @@ var ErrMetricOutOfRetention = errors.New("metric outside retention window")
 // Owner=100, Admin=75, Member=50, Viewer=25.
 const workspaceMemberRole int32 = 50
 
+// AccountClient is the account identity subset needed to select notification
+// language. The account service shares the auth gRPC endpoint.
+type AccountClient interface {
+	GetAccount(context.Context, *gen.DyGetAccountRequest, ...grpc.CallOption) (*gen.DyAccount, error)
+}
+
+// NewAccountClient dials the account service hosted alongside authentication.
+func NewAccountClient(cfg config.AuthConfig) (AccountClient, *grpc.ClientConn, error) {
+	target, useTLS := dyauth.NormalizeAuthGRPCTarget(cfg.Target, cfg.UseTLS)
+	if strings.TrimSpace(target) == "" {
+		return nil, nil, errors.New("account gRPC target is empty")
+	}
+	var transportCredentials credentials.TransportCredentials
+	if useTLS {
+		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSSkipVerify})
+	} else {
+		transportCredentials = insecure.NewCredentials()
+	}
+	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(transportCredentials))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial account service: %w", err)
+	}
+	return gen.NewDyAccountServiceClient(conn), conn, nil
+}
+
 // WorkspaceClient is the small slice of the DyWorkspaceService gRPC surface
 // MaidCafe needs. Keeping it an interface lets the service run against a fake
 // in tests while the production implementation talks to the workspace service
@@ -276,6 +301,7 @@ type Service struct {
 	db         *database.DB
 	publisher  PushPublisher
 	workspaces WorkspaceClient
+	accounts   AccountClient
 	logger     *slog.Logger
 
 	// pollHit tracks the last accepted daemon-initiated request (metric ingest,
@@ -294,6 +320,10 @@ func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceCl
 		logger:     slog.Default(),
 		pollHit:    make(map[string]time.Time),
 	}
+}
+
+func (s *Service) SetAccountClient(accounts AccountClient) {
+	s.accounts = accounts
 }
 
 type DaemonView struct {
@@ -798,6 +828,8 @@ func (s *Service) EvaluateDisconnectedDaemons(ctx context.Context, disconnectedA
 					"disconnected_at":   disconnectedAt,
 					"threshold_seconds": int64(disconnectedAfter / time.Second),
 					"age_seconds":       int64(age / time.Second),
+					"age":               age.Round(time.Second).String(),
+					"last_seen":         daemon.LastSeenAt.UTC().Format(time.RFC3339),
 				})
 				if err != nil {
 					return err
@@ -824,6 +856,18 @@ func (s *Service) EvaluateDisconnectedDaemons(ctx context.Context, disconnectedA
 			continue
 		}
 		if notification != nil {
+			title, body := s.localizedAlarm(ctx, notification.AccountID, notification.Kind, notification.Title, notification.Body, notification.Metadata)
+			if title != notification.Title || body != notification.Body {
+				notification.Title, notification.Body = title, body
+				if err := s.db.WithContext(ctx).Model(&database.Notification{}).
+					Where("id = ?", notification.ID).
+					Updates(map[string]any{"title": title, "body": body}).Error; err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+			}
 			if err := s.publishNotification(ctx, candidate, *notification); err != nil {
 				if firstErr == nil {
 					firstErr = err
@@ -911,6 +955,7 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err != nil || len(normalized) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
+	title, body = s.localizedAlarm(ctx, accountID, kind, title, body, normalized)
 	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemonID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
@@ -920,6 +965,28 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	}
 	return notificationView(row), nil
 }
+func (s *Service) localizedAlarm(ctx context.Context, accountID, kind, title, body string, metadata []byte) (string, string) {
+	if (kind != "daemon.disconnected" && !strings.HasPrefix(kind, "daemon.alarm.")) || s.accounts == nil {
+		return title, body
+	}
+	account, err := s.accounts.GetAccount(ctx, &gen.DyGetAccountRequest{Id: accountID})
+	if err != nil || account == nil {
+		if err != nil {
+			s.logger.Warn("alarm localization skipped", "account_id", accountID, "error", err)
+		}
+		return title, body
+	}
+	var values map[string]any
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		return title, body
+	}
+	localizedTitle, localizedBody, ok := localizeAlarm(account.GetLanguage(), kind, values)
+	if !ok {
+		return title, body
+	}
+	return localizedTitle, localizedBody
+}
+
 func bound(value string, max int) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > max || !utf8.ValidString(value) {
@@ -963,6 +1030,7 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err != nil || len(metadata) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
+	title, body = s.localizedAlarm(ctx, d.AccountID, kind, title, body, metadata)
 	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID, DaemonID: d.ID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err

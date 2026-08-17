@@ -12,6 +12,10 @@ metricsInterval = "1m"
 # evaluated locally against each metric sample; the daemon reports a
 # daemon.alarm.<kind> notification to the cloud when a threshold is exceeded.
 alarmsDir = "/etc/maidcafe/alarms"
+
+# Alarm fragments can use cpu_percent, memory_used_percent, or
+# disk_used_percent with threshold (percentage). container_down accepts an
+# optional target container name or ID and does not need a threshold.
 # Every action/webhook execution is appended here as JSONL (rotated at 1 MiB,
 # one generation kept). Empty disables auditing.
 auditPath = "/var/lib/maidcafe/audit.jsonl"

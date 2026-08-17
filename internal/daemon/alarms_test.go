@@ -90,4 +90,42 @@ func TestAlarmEvaluatorSkipsDisabledAlarms(t *testing.T) {
 	}
 }
 
+func TestAlarmEvaluatorFiresForDiskUsage(t *testing.T) {
+	e := newAlarmEvaluator()
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	out := e.evaluate([]config.AlarmConfig{alarmConfig("disk_used_percent", 80, true, 300)}, MetricsPayload{
+		DiskTotalKb: 1000, DiskAvailableKb: 150,
+	}, now)
+	if len(out) != 1 || out[0].Kind != "daemon.alarm.disk_used_percent" {
+		t.Fatalf("expected disk alarm, got %#v", out)
+	}
+	if out[0].Metadata["value"] != 85.0 {
+		t.Fatalf("disk metadata = %#v", out[0].Metadata)
+	}
+}
+
+func TestAlarmEvaluatorFiresForStoppedTargetContainer(t *testing.T) {
+	e := newAlarmEvaluator()
+	enabled := true
+	out := e.evaluateContainers([]config.AlarmConfig{{
+		Kind: "container_down", Target: "worker", Enabled: &enabled, CooldownSeconds: 300,
+	}}, containersPayload{Runtimes: []containersRuntimePayload{{
+		Runtime: "docker", Available: true,
+		Containers: []containerEntry{{ID: "abc", Name: "worker", State: "exited"}},
+	}}}, time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	if len(out) != 1 || out[0].Metadata["container_name"] != "worker" {
+		t.Fatalf("expected container alarm, got %#v", out)
+	}
+}
+
+func TestAlarmEvaluatorIgnoresUnavailableContainerRuntime(t *testing.T) {
+	e := newAlarmEvaluator()
+	out := e.evaluateContainers([]config.AlarmConfig{{Kind: "container_down", CooldownSeconds: 300}}, containersPayload{
+		Runtimes: []containersRuntimePayload{{Runtime: "docker", Available: true, Error: strPtr("permission denied")}},
+	}, time.Now())
+	if len(out) != 0 {
+		t.Fatalf("unavailable runtime should not alarm, got %#v", out)
+	}
+}
+
 func boolPtr(value bool) *bool { return &value }

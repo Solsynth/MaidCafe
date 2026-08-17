@@ -636,7 +636,7 @@ func TestDaemonRejectsInvalidAlarms(t *testing.T) {
 		name  string
 		alarm AlarmConfig
 	}{
-		{"unknown kind", AlarmConfig{Kind: "disk_used_percent", Threshold: 80}},
+		{"unknown kind", AlarmConfig{Kind: "filesystem_health", Threshold: 80}},
 		{"zero threshold", AlarmConfig{Kind: "cpu_percent", Threshold: 0}},
 		{"threshold above 100", AlarmConfig{Kind: "cpu_percent", Threshold: 120}},
 	}

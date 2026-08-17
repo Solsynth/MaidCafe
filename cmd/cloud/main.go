@@ -48,6 +48,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize auth")
 	}
+	accounts, accountConn, err := cloud.NewAccountClient(cfg.Auth)
+	if err != nil {
+		log.Fatal().Err(err).Msg("initialize account client")
+	}
+	defer accountConn.Close()
 
 	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(cfg.Workspace)
 	if err != nil {
@@ -81,6 +86,7 @@ func main() {
 		publisher = publishers
 	}
 	svc := cloud.NewService(db, publisher, workspaces)
+	svc.SetAccountClient(accounts)
 	router := server.NewRouter(cfg, svc, authenticator)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

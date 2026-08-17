@@ -121,15 +121,20 @@ type DaemonConfig struct {
 // `daemon.alarm.<kind>` notification to the cloud when the threshold is
 // exceeded, so the cloud only stores and forwards the resulting notification
 // and never needs to reach back into the daemon.
+// AlarmConfig declares one daemon metric or container threshold. Evaluation is
+// intentionally daemon-side: the daemon reports a `daemon.alarm.<kind>`
+// notification to the cloud when the condition is met.
 type AlarmConfig struct {
 	Kind string `mapstructure:"kind"`
-	// Threshold is the percentage (0..100] at or above which the alarm fires.
+	// Threshold is the percentage (0..100] for percentage alarms.
 	Threshold float64 `mapstructure:"threshold"`
+	// Target identifies the container name or ID for container_down alarms.
+	// An empty target reports any down container.
+	Target string `mapstructure:"target"`
 	// Enabled defaults to true when absent.
 	Enabled *bool `mapstructure:"enabled"`
 	// CooldownSeconds is the minimum gap between two triggers of the same
-	// alarm; it defaults to 300 when absent. It is evaluated in memory, so a
-	// daemon restart may re-fire once while the metric stays over threshold.
+	// alarm; it defaults to 300 when absent.
 	CooldownSeconds int `mapstructure:"cooldownSeconds"`
 }
 type WebhookConfig struct {
@@ -608,16 +613,25 @@ func (c *Config) ValidateDaemon() error {
 	for i := range c.Daemon.Alarms {
 		alarm := &c.Daemon.Alarms[i]
 		alarm.Kind = strings.TrimSpace(alarm.Kind)
-		if alarm.Kind != "cpu_percent" && alarm.Kind != "memory_used_percent" {
-			return fmt.Errorf("daemon.alarms[%d].kind must be cpu_percent or memory_used_percent", i)
+		alarm.Target = strings.TrimSpace(alarm.Target)
+		switch alarm.Kind {
+		case "cpu_percent", "memory_used_percent", "disk_used_percent":
+			if alarm.Threshold <= 0 || alarm.Threshold > 100 {
+				return fmt.Errorf("daemon.alarms[%d].threshold must be between 0 and 100", i)
+			}
+			if alarm.Target != "" {
+				return fmt.Errorf("daemon.alarms[%d].target is only supported for container_down", i)
+			}
+		case "container_down":
+			// Empty targets intentionally match any down container.
+		default:
+			return fmt.Errorf("daemon.alarms[%d].kind must be cpu_percent, memory_used_percent, disk_used_percent, or container_down", i)
 		}
-		if _, ok := alarmKinds[alarm.Kind]; ok {
-			return fmt.Errorf("daemon.alarms[%d].kind %q is duplicated", i, alarm.Kind)
+		key := alarm.Kind + "\x00" + alarm.Target
+		if _, ok := alarmKinds[key]; ok {
+			return fmt.Errorf("daemon.alarms[%d].kind %q with target %q is duplicated", i, alarm.Kind, alarm.Target)
 		}
-		alarmKinds[alarm.Kind] = struct{}{}
-		if alarm.Threshold <= 0 || alarm.Threshold > 100 {
-			return fmt.Errorf("daemon.alarms[%d].threshold must be between 0 and 100", i)
-		}
+		alarmKinds[key] = struct{}{}
 		if alarm.CooldownSeconds <= 0 {
 			alarm.CooldownSeconds = 300
 		}

@@ -113,21 +113,23 @@ network extras) every `metricsInterval`; the cloud stores it, stamps
 `last_seen_at` on the daemon, and clears a prior `disconnected_at` state.
 
 ### Alarm
-Alarms are evaluated **daemon-side** for metric thresholds: the daemon declares
-its thresholds in its own config (`[[daemon.alarms]]`, or one `<kind>.toml`
-fragment under `daemon.alarmsDir`) and reports a notification of kind
-`daemon.alarm.<kind>` through `POST /api/daemons/:id/notifications` when a
-sample crosses a threshold. The cloud stores and forwards that notification;
-it does not store daemon-side threshold configuration or reach back into the
-daemon.
+Alarms are evaluated **daemon-side** for metric and container conditions. The
+daemon declares `cpu_percent`, `memory_used_percent`, or `disk_used_percent`
+thresholds in `[[daemon.alarms]]` (or one `<kind>.toml` fragment under
+`daemon.alarmsDir`). `container_down` can target a container name or ID.
+The daemon reports `daemon.alarm.<kind>` through
+`POST /api/daemons/:id/notifications`; the cloud stores and forwards it.
+Alarm titles and bodies are localized by the cloud from the owning account's
+`language` preference (`en-*`, `zh-CN`/`zh-Hans`, and `zh-TW` are supported),
+with English fallback when the account service is unavailable.
 
-The cloud also evaluates the heartbeat independently. By default, an enabled
-daemon whose last accepted metric is older than five minutes is marked
-disconnected and emits one `daemon.disconnected` notification through the
-configured push publishers. `cloud.daemonDisconnectAfter` changes the
-threshold and `cloud.alarmCheckInterval` changes the evaluation cadence.
-Daemons with no accepted metric are not alarmed. A subsequent accepted metric
-clears `disconnected_at`; a later outage can emit another notification.
+The cloud independently evaluates the heartbeat: by default, an enabled daemon
+whose last accepted metric is older than five minutes is marked disconnected
+and emits one `daemon.disconnected` notification through the configured push
+publishers. `cloud.daemonDisconnectAfter` changes the threshold and
+`cloud.alarmCheckInterval` changes the evaluation cadence. Daemons with no
+accepted metric are not alarmed. A subsequent accepted metric clears
+`disconnected_at`; a later outage can emit another notification.
 
 ### Notification
 
