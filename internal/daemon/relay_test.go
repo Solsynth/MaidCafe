@@ -41,6 +41,10 @@ func (relayWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accountI
 	return workspaceID == "ws-a" && accountID == "account-a", nil
 }
 
+func (relayWorkspaces) GetPlanQuota(_ context.Context, workspaceID string) (map[string]int64, error) {
+	return map[string]int64{"max_daemons": 10}, nil
+}
+
 func relayDaemonConfig(id, cloudURL, cloudSecret, command string) config.DaemonConfig {
 	return config.DaemonConfig{
 		ID:                id,

@@ -19,9 +19,11 @@ func (f *fakePublisher) Publish(_ context.Context, event NotificationEvent) erro
 	return nil
 }
 
-// fakeWorkspaces grants membership to the accounts listed for each workspace.
+// fakeWorkspaces grants membership to the accounts listed for each workspace
+// and serves per-workspace quota maps (defaulting to a generous daemon limit).
 type fakeWorkspaces struct {
 	members map[string][]string
+	quotas  map[string]map[string]int64
 	err     error
 }
 
@@ -35,6 +37,16 @@ func (f *fakeWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accoun
 		}
 	}
 	return false, nil
+}
+
+func (f *fakeWorkspaces) GetPlanQuota(_ context.Context, workspaceID string) (map[string]int64, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if quota, ok := f.quotas[workspaceID]; ok {
+		return quota, nil
+	}
+	return map[string]int64{"max_daemons": 10}, nil
 }
 
 func testService(t *testing.T) (*Service, *database.DB, *fakePublisher, *fakeWorkspaces) {
@@ -418,6 +430,27 @@ func TestCreateDaemonRequiresWorkspace(t *testing.T) {
 	ctx := context.Background()
 	if _, err := svc.CreateDaemon(ctx, "account-a", "", "host"); err == nil {
 		t.Fatal("daemon created without workspace_id")
+	}
+}
+
+func TestCreateDaemonEnforcesQuotaLimit(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 1}}
+
+	if _, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "first"); err != nil {
+		t.Fatalf("first daemon should be created: %v", err)
+	}
+	if _, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "second"); err == nil {
+		t.Fatal("second daemon created past the quota limit")
+	} else if !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// A different workspace with a higher limit is unaffected.
+	if _, err := svc.CreateDaemon(ctx, "account-a", "ws-b", "host"); err != nil {
+		t.Fatalf("ws-b should be unaffected by ws-a's limit: %v", err)
 	}
 }
 

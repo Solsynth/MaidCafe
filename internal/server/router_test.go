@@ -24,6 +24,10 @@ func (routeWorkspaces) IsMemberWithRole(_ context.Context, workspaceID, accountI
 	return workspaceID == "ws-a" && accountID == "account-a", nil
 }
 
+func (routeWorkspaces) GetPlanQuota(_ context.Context, workspaceID string) (map[string]int64, error) {
+	return map[string]int64{"max_daemons": 10}, nil
+}
+
 func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	db, err := database.NewSQLite()
 	if err != nil {

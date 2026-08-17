@@ -46,6 +46,11 @@ const workspaceMemberRole int32 = 50
 // through the DysonGo SDK (src.solsynth.dev/sosys/go/proto).
 type WorkspaceClient interface {
 	IsMemberWithRole(ctx context.Context, workspaceID, accountID string, requiredRoles []int32) (bool, error)
+
+	// GetPlanQuota returns the workspace-effective quota map (plan preset +
+	// active addon grants) from the workspace service. Dimension keys are
+	// configurable; MaidCafe enforces "max_daemons".
+	GetPlanQuota(ctx context.Context, workspaceID string) (map[string]int64, error)
 }
 
 // GrpcWorkspaceClient adapts the generated DyWorkspaceServiceClient to
@@ -67,6 +72,17 @@ func (c GrpcWorkspaceClient) IsMemberWithRole(ctx context.Context, workspaceID, 
 		return false, err
 	}
 	return resp.GetValue(), nil
+}
+
+func (c GrpcWorkspaceClient) GetPlanQuota(ctx context.Context, workspaceID string) (map[string]int64, error) {
+	if c.client == nil {
+		return nil, errors.New("workspace client is not configured")
+	}
+	resp, err := c.client.GetPlanQuota(ctx, &gen.DyGetPlanQuotaRequest{WorkspaceId: workspaceID})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetQuotas(), nil
 }
 
 // NewWorkspaceClient dials the DyWorkspaceService gRPC endpoint hosted by the
@@ -297,6 +313,21 @@ func (s *Service) CreateDaemon(ctx context.Context, accountID, workspaceID, name
 	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
 		return Credential{}, err
 	}
+
+	// Enforce the workspace-effective daemon quota (plan preset + addon grants).
+	quotas, err := s.workspaces.GetPlanQuota(ctx, workspaceID)
+	if err != nil {
+		return Credential{}, fmt.Errorf("resolve workspace quota: %w", err)
+	}
+	maxDaemons := quotas["max_daemons"]
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&database.Daemon{}).Where("workspace_id = ?", workspaceID).Count(&count).Error; err != nil {
+		return Credential{}, err
+	}
+	if count >= maxDaemons {
+		return Credential{}, fmt.Errorf("workspace daemon limit reached (%d of %d)", count, maxDaemons)
+	}
+
 	secret, err := generateSecret()
 	if err != nil {
 		return Credential{}, err
