@@ -144,6 +144,47 @@ func TestNotificationPersistenceAndEventPublication(t *testing.T) {
 		t.Fatalf("non-member listing expected forbidden, got %v", err)
 	}
 }
+func TestNotificationPreferencesControlHistoryAndPush(t *testing.T) {
+	svc, db, publisher, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.SetNotificationPreference(ctx, "account-a", "ws-a", "", "maintenance", int(NotificationPreferenceSilent)); err != nil {
+		t.Fatal(err)
+	}
+	silent, err := svc.CreateNotification(ctx, daemon.ID, daemon.Secret, NotificationInput{
+		Kind: "maintenance", Title: "Maintenance", Body: "silent",
+	})
+	if err != nil || silent.ID == "" {
+		t.Fatalf("silent notification: %v %#v", err, silent)
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("silent notification was pushed: %#v", publisher.events)
+	}
+
+	if err := svc.SetNotificationPreference(ctx, "account-a", "ws-a", daemon.ID, "maintenance", int(NotificationPreferenceReject)); err != nil {
+		t.Fatal(err)
+	}
+	rejected, err := svc.CreateNotification(ctx, daemon.ID, daemon.Secret, NotificationInput{
+		Kind: "maintenance", Title: "Maintenance", Body: "rejected",
+	})
+	if err != nil || rejected.ID != "" {
+		t.Fatalf("rejected notification: %v %#v", err, rejected)
+	}
+	history, err := svc.ListNotifications(ctx, "account-a", "ws-a", false, "", 50, nil)
+	if err != nil || len(history) != 1 || history[0].Body != "silent" {
+		t.Fatalf("preference history: %v %#v", err, history)
+	}
+	preferences, err := svc.ListNotificationPreferences(ctx, "account-a", "ws-a", "")
+	if err != nil || len(preferences) != 2 {
+		t.Fatalf("preference list: %v %#v", err, preferences)
+	}
+}
+
 func TestNotificationNullMetadataDoesNotPanic(t *testing.T) {
 	svc, db, publisher, _ := testService(t)
 	defer db.Close()

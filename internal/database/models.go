@@ -74,6 +74,19 @@ type Notification struct {
 	CreatedAt   time.Time
 }
 
+// NotificationPreference stores an account's delivery policy for one topic.
+// An empty DaemonID is the account-wide default; a daemon ID overrides it.
+type NotificationPreference struct {
+	ID          string `gorm:"type:char(36);primaryKey"`
+	AccountID   string `gorm:"size:191;not null;uniqueIndex:idx_notification_preferences_scope"`
+	WorkspaceID string `gorm:"size:191;not null;index"`
+	DaemonID    string `gorm:"size:191;not null;uniqueIndex:idx_notification_preferences_scope"`
+	Topic       string `gorm:"size:128;not null;uniqueIndex:idx_notification_preferences_scope"`
+	Preference  int    `gorm:"not null"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 // WebhookRequest is a webhook invocation queued through the MaidKit cloud
 // relay. The daemon polls for pending requests, verifies the HMAC signature
 // against its own config, executes the webhook and stores the result here.

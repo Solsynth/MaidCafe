@@ -354,6 +354,34 @@ type NotificationView struct {
 	ReadAt      *time.Time     `json:"read_at"`
 	CreatedAt   time.Time      `json:"created_at"`
 }
+type NotificationPreferenceLevel int
+
+const (
+	NotificationPreferenceNormal NotificationPreferenceLevel = iota
+	NotificationPreferenceSilent
+	NotificationPreferenceReject
+)
+
+type NotificationPreferenceView struct {
+	ID          string                      `json:"id"`
+	AccountID   string                      `json:"account_id"`
+	WorkspaceID string                      `json:"workspace_id"`
+	DaemonID    string                      `json:"daemon_id"`
+	Topic       string                      `json:"topic"`
+	Preference  NotificationPreferenceLevel `json:"preference"`
+	CreatedAt   time.Time                   `json:"created_at"`
+	UpdatedAt   time.Time                   `json:"updated_at"`
+}
+
+type NotificationTopicView struct {
+	Topic       string `json:"topic"`
+	Description string `json:"description"`
+}
+
+type NotificationPreferenceInput struct {
+	Preference int `json:"preference"`
+}
+
 type MetricInput struct {
 	SentAt             time.Time `json:"sent_at"`
 	HostID             string    `json:"host_id,omitempty"`
@@ -834,6 +862,15 @@ func (s *Service) EvaluateDisconnectedDaemonsWithCooldown(ctx context.Context, d
 	}
 	var firstErr error
 	for _, candidate := range daemons {
+		preference, preferenceErr := s.notificationPreference(ctx, candidate.AccountID, candidate.WorkspaceID, candidate.ID, "daemon.disconnected")
+		if preferenceErr != nil {
+			if firstErr == nil {
+				firstErr = preferenceErr
+			}
+			continue
+		}
+		storeNotification := preference != NotificationPreferenceReject
+		publishNotification := preference == NotificationPreferenceNormal
 		var notification *database.Notification
 		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var daemon database.Daemon
@@ -881,6 +918,9 @@ func (s *Service) EvaluateDisconnectedDaemonsWithCooldown(ctx context.Context, d
 				if err != nil {
 					return err
 				}
+				if !storeNotification {
+					return nil
+				}
 				notification = &database.Notification{
 					ID: uuid.NewString(), AccountID: daemon.AccountID,
 					WorkspaceID: daemon.WorkspaceID, DaemonID: daemon.ID,
@@ -915,9 +955,11 @@ func (s *Service) EvaluateDisconnectedDaemonsWithCooldown(ctx context.Context, d
 					continue
 				}
 			}
-			if err := s.publishNotification(ctx, candidate, *notification); err != nil {
-				if firstErr == nil {
-					firstErr = err
+			if publishNotification {
+				if err := s.publishNotification(ctx, candidate, *notification); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
 				}
 			}
 		}
@@ -999,6 +1041,232 @@ func notificationSubtitle(daemonName, subtitle, sourcePrefix string) string {
 	}
 	return source + ": " + subtitle
 }
+func (s *Service) ListNotificationPreferences(ctx context.Context, accountID, workspaceID, daemonID string) ([]NotificationPreferenceView, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return nil, err
+	}
+	query := s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ?",
+		accountID,
+		workspaceID,
+	)
+	if daemonID != "" {
+		query = query.Where("daemon_id = ?", daemonID)
+	}
+	var rows []database.NotificationPreference
+	if err := query.Order("daemon_id asc, topic asc").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]NotificationPreferenceView, len(rows))
+	for i, row := range rows {
+		out[i] = notificationPreferenceView(row)
+	}
+	return out, nil
+}
+
+func (s *Service) ListNotificationTopics(ctx context.Context, accountID, workspaceID string) ([]NotificationTopicView, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return nil, err
+	}
+	topics := map[string]string{
+		"daemon.alarm.container_down":      "Container down alarms",
+		"daemon.alarm.cpu_percent":         "CPU alarms",
+		"daemon.alarm.disk_used_percent":   "Disk alarms",
+		"daemon.alarm.memory_used_percent": "Memory alarms",
+		"daemon.disconnected":              "Daemon disconnected",
+		"daemon.reconnected":               "Daemon reconnected",
+		"daemon.notification":              "Daemon notifications",
+		"test.notification":                "Test notifications",
+		"user.request":                     "User requests",
+		"webhook.failure":                  "Webhook failures",
+		"webhook.success":                  "Webhook successes",
+	}
+	var kinds []string
+	if err := s.db.WithContext(ctx).Model(&database.Notification{}).
+		Where("workspace_id = ?", workspaceID).Distinct("kind").Pluck("kind", &kinds).Error; err != nil {
+		return nil, err
+	}
+	for _, kind := range kinds {
+		if _, ok := topics[kind]; !ok {
+			topics[kind] = notificationTopicDescription(kind)
+		}
+	}
+	var preferences []database.NotificationPreference
+	if err := s.db.WithContext(ctx).
+		Where("account_id = ? AND workspace_id = ?", accountID, workspaceID).
+		Find(&preferences).Error; err != nil {
+		return nil, err
+	}
+	for _, preference := range preferences {
+		if _, ok := topics[preference.Topic]; !ok {
+			topics[preference.Topic] = notificationTopicDescription(preference.Topic)
+		}
+	}
+	names := make([]string, 0, len(topics))
+	for topic := range topics {
+		names = append(names, topic)
+	}
+	slices.Sort(names)
+	out := make([]NotificationTopicView, 0, len(names))
+	for _, topic := range names {
+		out = append(out, NotificationTopicView{Topic: topic, Description: topics[topic]})
+	}
+	return out, nil
+}
+
+func (s *Service) SetNotificationPreference(ctx context.Context, accountID, workspaceID, daemonID, topic string, preference int) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("workspace_id is required")
+	}
+	if err := validateNotificationPreference(preference); err != nil {
+		return err
+	}
+	topic, err := bound(topic, 128)
+	if err != nil {
+		return fmt.Errorf("topic: %w", err)
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return err
+	}
+	if daemonID != "" {
+		daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
+		if err != nil {
+			return err
+		}
+		if daemon.WorkspaceID != workspaceID {
+			return ErrForbidden
+		}
+	}
+	var row database.NotificationPreference
+	query := s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ? AND daemon_id = ? AND topic = ?",
+		accountID,
+		workspaceID,
+		daemonID,
+		topic,
+	)
+	err = query.First(&row).Error
+	now := time.Now().UTC()
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return s.db.WithContext(ctx).Create(&database.NotificationPreference{
+			ID: uuid.NewString(), AccountID: accountID, WorkspaceID: workspaceID,
+			DaemonID: daemonID, Topic: topic, Preference: preference,
+			CreatedAt: now, UpdatedAt: now,
+		}).Error
+	case err != nil:
+		return err
+	default:
+		return s.db.WithContext(ctx).Model(&row).Updates(map[string]any{
+			"preference": preference,
+			"updated_at": now,
+		}).Error
+	}
+}
+
+func (s *Service) DeleteNotificationPreference(ctx context.Context, accountID, workspaceID, daemonID, topic string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("workspace_id is required")
+	}
+	topic, err := bound(topic, 128)
+	if err != nil {
+		return fmt.Errorf("topic: %w", err)
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return err
+	}
+	if daemonID != "" {
+		daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
+		if err != nil {
+			return err
+		}
+		if daemon.WorkspaceID != workspaceID {
+			return ErrForbidden
+		}
+	}
+	return s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ? AND daemon_id = ? AND topic = ?",
+		accountID,
+		workspaceID,
+		daemonID,
+		topic,
+	).Delete(&database.NotificationPreference{}).Error
+}
+
+func (s *Service) notificationPreference(ctx context.Context, accountID, workspaceID, daemonID, topic string) (NotificationPreferenceLevel, error) {
+	var row database.NotificationPreference
+	err := s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ? AND daemon_id = ? AND topic = ?",
+		accountID, workspaceID, daemonID, topic,
+	).First(&row).Error
+	if err == nil {
+		return normalizeNotificationPreference(row.Preference), nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return NotificationPreferenceNormal, err
+	}
+	err = s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ? AND daemon_id = ? AND topic = ?",
+		accountID, workspaceID, "", topic,
+	).First(&row).Error
+	if err == nil {
+		return normalizeNotificationPreference(row.Preference), nil
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return NotificationPreferenceNormal, nil
+	}
+	return NotificationPreferenceNormal, err
+}
+
+func notificationPreferenceView(row database.NotificationPreference) NotificationPreferenceView {
+	return NotificationPreferenceView{
+		ID: row.ID, AccountID: row.AccountID, WorkspaceID: row.WorkspaceID,
+		DaemonID: row.DaemonID, Topic: row.Topic,
+		Preference: normalizeNotificationPreference(row.Preference),
+		CreatedAt:  row.CreatedAt, UpdatedAt: row.UpdatedAt,
+	}
+}
+
+func validateNotificationPreference(value int) error {
+	if value < int(NotificationPreferenceNormal) || value > int(NotificationPreferenceReject) {
+		return fmt.Errorf("preference must be 0 (normal), 1 (silent), or 2 (reject)")
+	}
+	return nil
+}
+
+func normalizeNotificationPreference(value int) NotificationPreferenceLevel {
+	if value < int(NotificationPreferenceNormal) || value > int(NotificationPreferenceReject) {
+		return NotificationPreferenceNormal
+	}
+	return NotificationPreferenceLevel(value)
+}
+
+func notificationTopicDescription(topic string) string {
+	words := strings.FieldsFunc(topic, func(r rune) bool {
+		return r == '.' || r == '_' || r == '-'
+	})
+	if len(words) == 0 {
+		return "Notifications"
+	}
+	for i, word := range words {
+		if word == "" {
+			continue
+		}
+		words[i] = strings.ToUpper(word[:1]) + word[1:]
+	}
+	return strings.Join(words, " ")
+}
+
 func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonID string, input NotificationInput) (NotificationView, error) {
 	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
 	if err != nil {
@@ -1032,13 +1300,22 @@ func (s *Service) CreatePushNotification(ctx context.Context, accountID, daemonI
 	if err != nil || len(normalized) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
+	preference, err := s.notificationPreference(ctx, accountID, daemon.WorkspaceID, daemonID, kind)
+	if err != nil {
+		return NotificationView{}, err
+	}
+	if preference == NotificationPreferenceReject {
+		return NotificationView{}, nil
+	}
 	title, body = s.localizedAlarm(ctx, accountID, kind, title, body, normalized)
 	row := database.Notification{ID: uuid.NewString(), AccountID: accountID, WorkspaceID: daemon.WorkspaceID, DaemonID: daemonID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(normalized), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return NotificationView{}, err
 	}
-	if err := s.publishNotification(ctx, daemon, row); err != nil {
-		return NotificationView{}, err
+	if preference == NotificationPreferenceNormal {
+		if err := s.publishNotification(ctx, daemon, row); err != nil {
+			return NotificationView{}, err
+		}
 	}
 	return notificationView(row), nil
 }
@@ -1118,13 +1395,22 @@ func (s *Service) CreateNotification(ctx context.Context, id, secret string, inp
 	if err != nil || len(metadata) > 16*1024 {
 		return NotificationView{}, fmt.Errorf("metadata exceeds bounds")
 	}
+	preference, err := s.notificationPreference(ctx, d.AccountID, d.WorkspaceID, d.ID, kind)
+	if err != nil {
+		return NotificationView{}, err
+	}
+	if preference == NotificationPreferenceReject {
+		return NotificationView{}, nil
+	}
 	title, body = s.localizedAlarm(ctx, d.AccountID, kind, title, body, metadata)
 	n := database.Notification{ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID, DaemonID: d.ID, Kind: kind, Title: title, Subtitle: subtitle, Body: body, Metadata: datatypes.JSON(metadata), CreatedAt: time.Now().UTC()}
 	if err := s.db.WithContext(ctx).Create(&n).Error; err != nil {
 		return NotificationView{}, err
 	}
-	if err := s.publishNotification(ctx, d, n); err != nil {
-		return NotificationView{}, err
+	if preference == NotificationPreferenceNormal {
+		if err := s.publishNotification(ctx, d, n); err != nil {
+			return NotificationView{}, err
+		}
 	}
 	return notificationView(n), nil
 }
@@ -1183,6 +1469,19 @@ func (s *Service) MarkNotificationRead(ctx context.Context, accountID, id string
 		}
 	}
 	return nil
+}
+func (s *Service) MarkAllNotificationsRead(ctx context.Context, accountID, workspaceID string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Model(&database.Notification{}).
+		Where("workspace_id = ? AND read_at IS NULL", workspaceID).
+		Update("read_at", now).Error
 }
 
 // Webhook relay: clients enqueue signed webhook invocations through the

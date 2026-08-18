@@ -34,6 +34,13 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons/:id/rotate-secret", rotateSecret(svc))
 	user.DELETE("/daemons/:id", disableDaemon(svc))
 	user.GET("/notifications", listNotifications(svc))
+	user.GET("/notification-preferences", listNotificationPreferences(svc))
+	user.PUT("/notification-preferences/:topic", setGlobalNotificationPreference(svc))
+	user.DELETE("/notification-preferences/:topic", deleteGlobalNotificationPreference(svc))
+	user.GET("/notification-topics", listNotificationTopics(svc))
+	user.PUT("/daemons/:id/notification-preferences/:topic", setDaemonNotificationPreference(svc))
+	user.DELETE("/daemons/:id/notification-preferences/:topic", deleteDaemonNotificationPreference(svc))
+	user.POST("/notifications/all/read", markAllRead(svc))
 	user.POST("/notifications/:id/read", markRead(svc))
 	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
 	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
@@ -230,6 +237,88 @@ func listMetrics(s *cloud.Service) gin.HandlerFunc {
 		c.JSON(http.StatusOK, out)
 	}
 }
+func listNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.ListNotificationPreferences(
+			c,
+			accountID(c),
+			c.Query("workspace_id"),
+			c.Query("daemon_id"),
+		)
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+
+func listNotificationTopics(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.ListNotificationTopics(c, accountID(c), c.Query("workspace_id"))
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+
+func setGlobalNotificationPreference(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var input cloud.NotificationPreferenceInput
+		if !parseJSON(c, &input) {
+			return
+		}
+		workspaceID := c.Query("workspace_id")
+		if workspaceID == "" {
+			workspaceID = c.GetString("workspace_id")
+		}
+		if err := s.SetNotificationPreference(c, accountID(c), workspaceID, "", c.Param("topic"), input.Preference); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func deleteGlobalNotificationPreference(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.DeleteNotificationPreference(c, accountID(c), c.Query("workspace_id"), "", c.Param("topic")); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func setDaemonNotificationPreference(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var input struct {
+			WorkspaceID string `json:"workspace_id"`
+			Preference  int    `json:"preference"`
+		}
+		if !parseJSON(c, &input) {
+			return
+		}
+		if err := s.SetNotificationPreference(c, accountID(c), input.WorkspaceID, c.Param("id"), c.Param("topic"), input.Preference); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func deleteDaemonNotificationPreference(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.DeleteNotificationPreference(c, accountID(c), c.Query("workspace_id"), c.Param("id"), c.Param("topic")); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
 func requestPushNotification(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var input cloud.NotificationInput
@@ -245,6 +334,10 @@ func requestPushNotification(s *cloud.Service) gin.HandlerFunc {
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			}
+			return
+		}
+		if out.ID == "" {
+			c.Status(http.StatusNoContent)
 			return
 		}
 		c.JSON(http.StatusAccepted, out)
@@ -417,6 +510,10 @@ func createNotification(s *cloud.Service) gin.HandlerFunc {
 			}
 			return
 		}
+		if out.ID == "" {
+			c.Status(http.StatusNoContent)
+			return
+		}
 		c.JSON(http.StatusCreated, gin.H{"id": out.ID, "created_at": out.CreatedAt})
 	}
 }
@@ -465,6 +562,16 @@ func markRead(s *cloud.Service) gin.HandlerFunc {
 		c.Status(http.StatusNoContent)
 	}
 }
+func markAllRead(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.MarkAllNotificationsRead(c, accountID(c), c.Query("workspace_id")); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
 func enqueueWebhook(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var in struct {
