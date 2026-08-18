@@ -932,11 +932,33 @@ func (j *jdkProbeState) probePathSnapshot(ctx context.Context) (jpsPath, jstatPa
 // daemon-side watched processes alongside. Groups follow the configured
 // runtime order; a group with no matching process carries available:false.
 type RuntimesCollector struct {
+	mu       sync.Mutex
 	limit    int
 	jdk      *jdkProbeState
 	runtimes []string
 	watched  *watchedProcessStore
 	history  *processHistoryStore
+}
+
+// SetRuntimes replaces the runtime group list (hot reload).
+func (r *RuntimesCollector) SetRuntimes(runtimes []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.runtimes = append([]string(nil), runtimes...)
+}
+
+// SetLimit replaces the per-group process cap (hot reload).
+func (r *RuntimesCollector) SetLimit(limit int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.limit = limit
+}
+
+// settings returns a consistent snapshot of the reloadable fields.
+func (r *RuntimesCollector) settings() ([]string, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.runtimes...), r.limit
 }
 
 func (r *RuntimesCollector) readProcessTable(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
@@ -959,11 +981,11 @@ func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtimeNames := r.runtimes
+	runtimeNames, limit := r.settings()
 	if len(runtimeNames) == 0 {
 		runtimeNames = []string{"java", "dotnet", "python"}
 	}
-	groups := groupRuntimeProcesses(entries, r.limit, runtimeNames)
+	groups := groupRuntimeProcesses(entries, limit, runtimeNames)
 	// The java key is present only when a java process exists.
 	for i := range groups {
 		if groups[i].Runtime == "java" && len(groups[i].Processes) > 0 {
@@ -973,7 +995,7 @@ func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 	}
 	var watched []watchedProcessGroup
 	if r.watched != nil {
-		watched = groupWatchedProcesses(entries, r.limit, r.watched.List())
+		watched = groupWatchedProcesses(entries, limit, r.watched.List())
 	} else {
 		watched = []watchedProcessGroup{}
 	}
@@ -993,7 +1015,8 @@ func (r *RuntimesCollector) recordHistory(ctx context.Context) {
 		return
 	}
 	now := time.Now()
-	for _, group := range groupWatchedProcesses(entries, r.limit, r.watched.List()) {
+	_, limit := r.settings()
+	for _, group := range groupWatchedProcesses(entries, limit, r.watched.List()) {
 		var cpu float64
 		var rss int64
 		var threads int64

@@ -32,8 +32,21 @@ func main() {
 		slog.Error("create daemon", "error", err)
 		os.Exit(1)
 	}
+	// Hot reload (file watcher, config API, `systemctl reload`/SIGHUP) needs
+	// the config path to re-read on demand.
+	app.SetConfigPath(*configPath)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			slog.Info("SIGHUP received; reloading configuration")
+			if err := app.Reload(); err != nil {
+				slog.Error("config reload failed; previous configuration stays active", "error", err)
+			}
+		}
+	}()
 	if err := app.Run(ctx); err != nil {
 		slog.Error("daemon stopped", "error", err)
 		os.Exit(1)

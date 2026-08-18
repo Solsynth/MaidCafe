@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,7 +25,7 @@ type App struct {
 	executor        *WebhookExecutor
 	ops             *nativeOpRunner
 	metrics         *MetricsCollector
-	publisher       *CloudPublisher
+	publisher       *atomic.Pointer[CloudPublisher]
 	relay           *WebhookRelay
 	hub             *StreamHub
 	alarms          *alarmEvaluator
@@ -34,11 +35,29 @@ type App struct {
 	systemd         *SystemdCollector
 	runtimes        *RuntimesCollector
 	databaseMetrics *DatabaseMetricsCollector
+	logs            *LogsCollector
 	watched         *watchedProcessStore
+	jobs            *jobRunner
 	server          *http.Server
 	listenerMu      sync.RWMutex
 	listener        net.Listener
 	logger          *slog.Logger
+	// configPath is the TOML file the daemon was started with; empty means
+	// environment-only configuration (hot reload and the config API are
+	// disabled then).
+	configPath string
+	// rt holds the reloadable configuration slice; readers load it once per
+	// request or tick, so a swap never tears a run in half.
+	rt atomic.Pointer[reloadableConfig]
+}
+
+// publish returns the current cloud publisher, or nil when cloud publishing
+// is not configured.
+func (a *App) publish() *CloudPublisher {
+	if a.publisher == nil {
+		return nil
+	}
+	return a.publisher.Load()
 }
 
 func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
@@ -50,9 +69,13 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	executor := NewWebhookExecutor(cfg)
 	executor.SetAuditLogger(NewAuditLogger(cfg.AuditPath, logger))
+	publisherBox := &atomic.Pointer[CloudPublisher]{}
 	publisher, err := NewCloudPublisher(cfg, logger)
 	if err != nil {
 		return nil, err
+	}
+	if publisher != nil {
+		publisherBox.Store(publisher)
 	}
 	metrics, err := NewMetricsCollector(cfg, executor)
 	if err != nil {
@@ -60,22 +83,24 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	runtimeProbe := &runtimeProbeState{}
 	ops := &nativeOpRunner{
-		executor:      executor,
-		runtimes:      probeContainerRuntimes,
-		scriptTimeout: cfg.ScriptTimeout,
+		executor: executor,
+		runtimes: probeContainerRuntimes,
 	}
+	ops.SetScriptTimeout(cfg.ScriptTimeout)
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
 	historyDir := ""
 	if strings.TrimSpace(cfg.MetricsHistoryPath) != "" {
 		historyDir = filepath.Join(cfg.MetricsHistoryPath, "process-history")
 	}
 	historyStore := newProcessHistoryStore(historyDir, cfg.MetricsRetentionDays)
+	logStore := newContainerLogStore(cfg.LogsDir, cfg.MetricsRetentionDays)
+	jobs := newJobRunner(executor, ops, publisherBox, logger)
 	app := &App{
 		cfg:             cfg,
 		executor:        executor,
 		ops:             ops,
 		metrics:         metrics,
-		publisher:       publisher,
+		publisher:       publisherBox,
 		hub:             NewStreamHub(),
 		alarms:          newAlarmEvaluator(),
 		containers:      &ContainersCollector{probe: runtimeProbe},
@@ -84,12 +109,16 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		systemd:         &SystemdCollector{},
 		runtimes:        &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
 		databaseMetrics: &DatabaseMetricsCollector{},
+		logs:            &LogsCollector{probe: runtimeProbe, store: logStore, logger: logger},
 		watched:         watchedStore,
+		jobs:            jobs,
 		logger:          logger,
 	}
-	app.relay = NewWebhookRelay(publisher, executor, ops, logger)
+	app.rt.Store(newReloadableConfig(cfg))
+	app.relay = NewWebhookRelay(publisherBox, executor, ops, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
-		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
+		p := publisherBox.Load()
+		if p == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
 			return
 		}
 		kind, title := "webhook.failure", "Webhook "+hook.Label()+" failed"
@@ -100,7 +129,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		if len(body) > 4096 {
 			body = body[:4096]
 		}
-		publisher.PublishNotification(context.Background(), notificationPayload{Kind: kind, Title: title, Body: body, Metadata: map[string]any{"name": hook.Name, "display_name": hook.Label(), "exit_code": exitCode, "duration_ms": duration.Milliseconds()}})
+		p.PublishNotification(context.Background(), notificationPayload{Kind: kind, Title: title, Body: body, Metadata: map[string]any{"name": hook.Name, "display_name": hook.Label(), "exit_code": exitCode, "duration_ms": duration.Milliseconds()}})
 	})
 
 	if strings.EqualFold(strings.TrimSpace(cfg.Transport), "stdio") {
@@ -141,7 +170,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, app.metrics.Collect())
 	})
 	router.GET("/api/v1/stream", authorizeMetrics, func(c *gin.Context) {
-		handleStream(c, app.hub, cfg)
+		handleStream(c, app.hub, app.rt.Load())
 	})
 	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
 		parseTime := func(name string) (*time.Time, error) {
@@ -256,12 +285,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, gin.H{"processes": app.watched.List()})
 	})
 	router.POST("/api/v1/watched-processes", authorizeMetrics, func(c *gin.Context) {
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, app.rt.Load().maxBodyBytes+1))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
 			return
 		}
-		if int64(len(body)) > cfg.MaxBodyBytes {
+		if int64(len(body)) > app.rt.Load().maxBodyBytes {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
 			return
 		}
@@ -334,12 +363,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		c.JSON(http.StatusOK, gin.H{"name": name, "samples": samples})
 	})
 	router.POST("/api/v1/actions/:name", authorizeMetrics, func(c *gin.Context) {
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodyBytes+1))
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, app.rt.Load().maxBodyBytes+1))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
 			return
 		}
-		if int64(len(body)) > cfg.MaxBodyBytes {
+		if int64(len(body)) > app.rt.Load().maxBodyBytes {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
 			return
 		}
@@ -391,6 +420,25 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			p.directory = directory
 		}
 	}))
+	// Config introspection and safe-subset patching: the daemon edits its own
+	// config.toml (preserving everything it does not model) and hot-reloads,
+	// so interval/limit/cloud changes apply without a restart.
+	router.GET("/api/v1/config", authorizeMetrics, app.handleGetConfig)
+	router.PATCH("/api/v1/config", authorizeMetrics, app.handlePatchConfig)
+	// Captured container logs (disk-backed, pruned by retention): the tail
+	// window for one container, oldest first.
+	router.GET("/api/v1/containers/:id/logs", authorizeMetrics, func(c *gin.Context) {
+		lines := 200
+		if raw := strings.TrimSpace(c.Query("lines")); raw != "" {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || parsed < 1 || parsed > containerLogRingLines {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": fmt.Sprintf("lines must be between 1 and %d", containerLogRingLines)})
+				return
+			}
+			lines = parsed
+		}
+		c.JSON(http.StatusOK, gin.H{"container": c.Param("id"), "lines": app.logs.store.Snapshot(c.Param("id"), lines)})
+	})
 	router.GET("/api/v1/audit", authorizeMetrics, func(c *gin.Context) {
 		limit := 50
 		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
@@ -415,11 +463,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// test notification to the cloud (which forwards it to Ring/Metoer), so
 	// the whole daemon -> cloud -> feed path can be verified on demand.
 	router.POST("/api/v1/notifications/test", authorizeMetrics, func(c *gin.Context) {
-		if app.publisher == nil {
+		pub := app.publish()
+		if pub == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "cloud relay is not configured"})
 			return
 		}
-		app.publisher.PublishNotification(context.Background(), notificationPayload{
+		pub.PublishNotification(context.Background(), notificationPayload{
 			Kind:  "test.notification",
 			Title: "Test notification",
 			Body:  "This is a test notification from the MaidCafe daemon.",
@@ -430,7 +479,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// send a fully customized title/subtitle/body payload through the daemon
 	// to the cloud and on to the user's Metoer feed.
 	router.POST("/api/v1/notifications", authorizeMetrics, func(c *gin.Context) {
-		if app.publisher == nil {
+		if app.publish() == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "cloud relay is not configured"})
 			return
 		}
@@ -459,7 +508,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "body must be at most 4096 bytes"})
 			return
 		}
-		app.publisher.PublishNotification(context.Background(), notificationPayload{
+		app.publish().PublishNotification(context.Background(), notificationPayload{
 			Kind:     kind,
 			Title:    title,
 			Subtitle: strings.TrimSpace(in.Subtitle),
@@ -494,12 +543,12 @@ func (a *App) nativeOpHandler(
 	decorate func(values map[string]any, p *opParams),
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, a.cfg.MaxBodyBytes+1))
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, a.rt.Load().maxBodyBytes+1))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
 			return
 		}
-		if int64(len(body)) > a.cfg.MaxBodyBytes {
+		if int64(len(body)) > a.rt.Load().maxBodyBytes {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
 			return
 		}
@@ -564,13 +613,18 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Start(); err != nil {
 		return err
 	}
-	ticker := time.NewTicker(a.cfg.MetricsInterval)
-	defer ticker.Stop()
 	a.metrics.Record()
 	if a.relay != nil {
 		go a.relay.Run(ctx)
 	}
 	a.startStreamCollectors(ctx)
+	go a.jobs.Run(ctx)
+	go a.watchConfig(ctx)
+	// The metrics cadence is reloadable, so a fixed ticker cannot capture it;
+	// a 1s base tick checks the current interval instead.
+	base := time.NewTicker(time.Second)
+	defer base.Stop()
+	var lastMetrics time.Time
 	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -580,16 +634,21 @@ func (a *App) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return shutdown()
-		case <-ticker.C:
+		case now := <-base.C:
+			interval := a.rt.Load().intervals.metrics
+			if interval <= 0 || now.Sub(lastMetrics) < interval {
+				continue
+			}
+			lastMetrics = now
 			metrics := a.metrics.Record()
-			if a.publisher != nil {
-				a.publisher.PublishMetrics(context.Background(), metrics)
-				a.publisher.PublishActions(context.Background(), append(nativeOpReport(), a.cfg.Actions...))
-				now := time.Now()
-				for _, notification := range a.alarms.evaluate(a.cfg.Alarms, metrics, now) {
-					a.publisher.PublishNotification(context.Background(), notification)
+			rt := a.rt.Load()
+			if pub := a.publish(); pub != nil {
+				pub.PublishMetrics(context.Background(), metrics)
+				pub.PublishActions(context.Background(), append(nativeOpReport(), rt.actions...))
+				for _, notification := range a.alarms.evaluate(rt.alarms, metrics, now) {
+					pub.PublishNotification(context.Background(), notification)
 				}
-				for _, alarm := range a.cfg.Alarms {
+				for _, alarm := range rt.alarms {
 					if alarm.Kind != "container_down" || alarm.Enabled != nil && !*alarm.Enabled {
 						continue
 					}
@@ -603,8 +662,8 @@ func (a *App) Run(ctx context.Context) error {
 						a.logger.Warn("container alarm payload invalid", "error", err)
 						break
 					}
-					for _, notification := range a.alarms.evaluateContainers(a.cfg.Alarms, sample, now) {
-						a.publisher.PublishNotification(context.Background(), notification)
+					for _, notification := range a.alarms.evaluateContainers(rt.alarms, sample, now) {
+						pub.PublishNotification(context.Background(), notification)
 					}
 					break
 				}
@@ -623,54 +682,70 @@ func (a *App) Shutdown(ctx context.Context) error {
 // startStreamCollectors launches one ticker goroutine per enabled stream event
 // type (HTTP transport only). Each collector runs only while at least one SSE
 // subscriber wants its type; the metric collector reuses MetricsCollector.
-// Collect (no persistence), never Record.
+// Collect (no persistence), never Record. Intervals are read from the
+// reloadable state on every tick, so a config reload applies immediately.
 func (a *App) startStreamCollectors(ctx context.Context) {
-	a.runStreamCollector(ctx, "metric", a.cfg.StreamInterval, func(ctx context.Context) ([]byte, error) {
+	a.runStreamCollector(ctx, "metric", func(rt *reloadableConfig) time.Duration { return rt.intervals.stream }, func(ctx context.Context) ([]byte, error) {
 		return json.Marshal(a.metrics.Collect())
 	})
-	a.runStreamCollector(ctx, "containers", a.cfg.ContainersInterval, a.containers.collect)
-	a.runStreamCollector(ctx, "images", a.cfg.ImagesInterval, a.images.collect)
-	a.runProcessesStreamCollector(ctx, a.cfg.ProcessesInterval)
-	a.runStreamCollector(ctx, "systemd", a.cfg.SystemdInterval, a.systemd.collect)
-	a.runStreamCollector(ctx, "runtimes", a.cfg.RuntimesInterval, a.runtimes.collect)
-	a.runStreamCollector(ctx, "databaseMetrics", a.cfg.DatabaseMetricsInterval, a.databaseMetrics.collect)
+	a.runStreamCollector(ctx, "containers", func(rt *reloadableConfig) time.Duration { return rt.intervals.containers }, a.containers.collect)
+	a.runStreamCollector(ctx, "images", func(rt *reloadableConfig) time.Duration { return rt.intervals.images }, a.images.collect)
+	a.runProcessesStreamCollector(ctx, func(rt *reloadableConfig) time.Duration { return rt.intervals.processes })
+	a.runStreamCollector(ctx, "systemd", func(rt *reloadableConfig) time.Duration { return rt.intervals.systemd }, a.systemd.collect)
+	a.runStreamCollector(ctx, "runtimes", func(rt *reloadableConfig) time.Duration { return rt.intervals.runtimes }, a.runtimes.collect)
+	a.runStreamCollector(ctx, "databaseMetrics", func(rt *reloadableConfig) time.Duration { return rt.intervals.database }, a.databaseMetrics.collect)
 	// Process history accumulates regardless of SSE subscribers so charts
 	// show usage even while no client is connected.
-	a.runHistoryCollector(ctx, a.cfg.RuntimesInterval, a.runtimes.recordHistory)
+	a.runHistoryCollector(ctx, func(rt *reloadableConfig) time.Duration { return rt.intervals.runtimes }, a.runtimes.recordHistory)
+	a.runLogsCollector(ctx)
 }
 
 // runHistoryCollector ticks a recording callback at interval without the
 // subscriber gate stream collectors use. Disabled when interval <= 0.
-func (a *App) runHistoryCollector(ctx context.Context, interval time.Duration, record func(context.Context)) {
-	if interval <= 0 {
-		return
-	}
+func (a *App) runHistoryCollector(ctx context.Context, interval func(*reloadableConfig) time.Duration, record func(context.Context)) {
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		var last time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case now := <-ticker.C:
+				rt := a.rt.Load()
+				if rt == nil {
+					continue
+				}
+				i := interval(rt)
+				if i <= 0 || now.Sub(last) < i {
+					continue
+				}
+				last = now
 				record(ctx)
 			}
 		}
 	}()
 }
 
-func (a *App) runStreamCollector(ctx context.Context, event string, interval time.Duration, collect func(context.Context) ([]byte, error)) {
-	if interval <= 0 {
-		return
-	}
+func (a *App) runStreamCollector(ctx context.Context, event string, interval func(*reloadableConfig) time.Duration, collect func(context.Context) ([]byte, error)) {
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		var last time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case now := <-ticker.C:
+				rt := a.rt.Load()
+				if rt == nil {
+					continue
+				}
+				i := interval(rt)
+				if i <= 0 || now.Sub(last) < i {
+					continue
+				}
+				last = now
 				// Per-type gating: zero subscribers means zero collection work.
 				if a.hub.Subscribers(event) == 0 {
 					continue
@@ -693,18 +768,25 @@ func (a *App) runStreamCollector(ctx context.Context, event string, interval tim
 // process table is collected once and sliced per subscriber inside
 // StreamHub.BroadcastProcesses, so subscribers with different caps share a
 // single ps run.
-func (a *App) runProcessesStreamCollector(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
-	}
+func (a *App) runProcessesStreamCollector(ctx context.Context, interval func(*reloadableConfig) time.Duration) {
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		var last time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case now := <-ticker.C:
+				rt := a.rt.Load()
+				if rt == nil {
+					continue
+				}
+				i := interval(rt)
+				if i <= 0 || now.Sub(last) < i {
+					continue
+				}
+				last = now
 				if a.hub.Subscribers("processes") == 0 {
 					continue
 				}
@@ -714,6 +796,61 @@ func (a *App) runProcessesStreamCollector(ctx context.Context, interval time.Dur
 					continue
 				}
 				a.hub.BroadcastProcesses(entries)
+			}
+		}
+	}()
+}
+
+// runLogsCollector captures container logs on the logs cadence regardless of
+// subscribers (the disk store is the durable record), broadcasting the delta
+// to `logs` subscribers when any are connected. Disabled when logsInterval
+// is 0.
+func (a *App) runLogsCollector(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var last time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				rt := a.rt.Load()
+				if rt == nil {
+					continue
+				}
+				interval := rt.intervals.logs
+				if interval <= 0 || now.Sub(last) < interval {
+					continue
+				}
+				last = now
+				data, err := a.containers.snapshot(ctx)
+				if err != nil {
+					a.logger.Debug("logs collector: container snapshot failed", "error", err)
+					continue
+				}
+				var payload containersPayload
+				if err := json.Unmarshal(data, &payload); err != nil {
+					continue
+				}
+				runtimes := make(map[string][]containerEntry, len(payload.Runtimes))
+				for _, runtime := range payload.Runtimes {
+					runtimes[runtime.Runtime] = runtime.Containers
+				}
+				collected, err := a.logs.collect(ctx, runtimes)
+				if err != nil {
+					a.logger.Debug("logs collector failed", "error", err)
+					continue
+				}
+				if len(collected) > 0 && a.hub.Subscribers("logs") > 0 {
+					for id, lines := range collected {
+						frame, marshalErr := json.Marshal(logsFramePayload{Container: id, Lines: lines})
+						if marshalErr != nil {
+							continue
+						}
+						a.hub.Broadcast("logs", frame)
+					}
+				}
 			}
 		}
 	}()

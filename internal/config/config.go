@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 )
 
@@ -90,7 +91,16 @@ type DaemonConfig struct {
 	// AlarmsDir holds one `<kind>.toml` fragment per configured alarm. The
 	// fragments are merged into Alarms at load, so alarm changes never touch
 	// the main config file either.
-	AlarmsDir               string        `mapstructure:"alarmsDir"`
+	AlarmsDir string `mapstructure:"alarmsDir"`
+	// JobsDir holds one `<slug>.toml` fragment per scheduled job. The
+	// fragments are merged into Jobs at load, mirroring the action and alarm
+	// fragment behavior.
+	JobsDir string `mapstructure:"jobsDir"`
+	// LogsDir is where the daemon persists captured container logs (one JSONL
+	// file per container, rotated at 1 MiB with one generation, pruned by
+	// metricsRetentionDays). Empty disables disk persistence but keeps the
+	// in-memory tail.
+	LogsDir                 string        `mapstructure:"logsDir"`
 	CloudURL                string        `mapstructure:"cloudUrl"`
 	CloudSecret             string        `mapstructure:"cloudSecret"`
 	MetricsInterval         time.Duration `mapstructure:"metricsInterval"`
@@ -101,6 +111,11 @@ type DaemonConfig struct {
 	SystemdInterval         time.Duration `mapstructure:"systemdInterval"`
 	RuntimesInterval        time.Duration `mapstructure:"runtimesInterval"`
 	DatabaseMetricsInterval time.Duration `mapstructure:"databaseMetricsInterval"`
+	// LogsInterval is the container log capture cadence. The collector tails
+	// every running container with `logs --since <cursor>` and appends the
+	// new lines to the disk store and the SSE stream. 0 disables log
+	// tracking.
+	LogsInterval time.Duration `mapstructure:"logsInterval"`
 	// Runtimes is the ordered list of runtime groups the runtimes collector
 	// reports, in wire order. Unknown entries are skipped by old clients.
 	Runtimes []string `mapstructure:"runtimes"`
@@ -117,6 +132,7 @@ type DaemonConfig struct {
 	Webhooks             []WebhookConfig `mapstructure:"webhooks"`
 	Actions              []WebhookConfig `mapstructure:"actions"`
 	Alarms               []AlarmConfig   `mapstructure:"alarms"`
+	Jobs                 []JobConfig     `mapstructure:"jobs"`
 }
 
 // AlarmConfig declares one metric threshold the daemon evaluates against its
@@ -172,6 +188,33 @@ type WebhookConfig struct {
 	// Timeout overrides the daemon-wide scriptTimeout for this hook (e.g.
 	// "2m"); zero or absent uses the daemon-wide value.
 	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// JobConfig declares one scheduled job: a recurring execution of a configured
+// action or native operation. Jobs live as `<slug>.toml` fragments under
+// daemon.jobsDir (or inline [[daemon.jobs]] entries) and run through the same
+// executor as everything else, so runs land in the audit log, respect the
+// concurrency limit and per-run timeout, and can notify on failure.
+type JobConfig struct {
+	// Name is the API slug (unique across jobs; jobs may share targets).
+	Name string `mapstructure:"name"`
+	// Schedule is a cron expression ("*/10 * * * *", five fields) or a
+	// robfig/cron descriptor such as "@every 30s", "@hourly" or "@daily".
+	Schedule string `mapstructure:"schedule"`
+	// Action is the target: a configured action name or a native operation
+	// slug (container.restart, process.kill, ...).
+	Action string `mapstructure:"action"`
+	// Body is the JSON object passed to the action on every run (template
+	// variables for script actions, identity parameters for native ops).
+	Body map[string]any `mapstructure:"body"`
+	// Enabled defaults to true when absent.
+	Enabled *bool `mapstructure:"enabled"`
+	// Timeout overrides the daemon-wide scriptTimeout for this job; zero uses
+	// the daemon-wide value (native compose ops keep their own 5m bound).
+	Timeout time.Duration `mapstructure:"timeout"`
+	// NotifyOnFailure publishes a job.failure notification when a run exits
+	// non-zero or fails to start.
+	NotifyOnFailure bool `mapstructure:"notifyOnFailure"`
 }
 
 var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
@@ -276,6 +319,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.auditPath", "/var/lib/maidcafe/audit.jsonl")
 	viper.SetDefault("daemon.actionsDir", "/etc/maidcafe/actions")
 	viper.SetDefault("daemon.alarmsDir", "/etc/maidcafe/alarms")
+	viper.SetDefault("daemon.jobsDir", "/etc/maidcafe/jobs")
+	viper.SetDefault("daemon.logsDir", "/var/lib/maidcafe/logs")
+	viper.SetDefault("daemon.logsInterval", 10*time.Second)
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -312,6 +358,9 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.loadAlarmFragments(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadJobFragments(); err != nil {
 		return nil, err
 	}
 	// The stable host identity is written by the install flow, not derived
@@ -465,6 +514,74 @@ func loadAlarmFragment(path string) (AlarmConfig, error) {
 	return alarm, nil
 }
 
+// loadJobFragments merges every `<slug>.toml` under daemon.jobsDir into
+// Daemon.Jobs, sorted by file name for deterministic ordering. A missing or
+// unreadable directory is not an error (a fresh host has no jobs yet); a
+// fragment that fails to parse or validate is. Each fragment is a flat TOML
+// file holding one job's fields — the same shape as an entry of
+// [[daemon.jobs]] — and a fragment covering an inline job wins, mirroring the
+// action and alarm fragment behavior.
+func (c *Config) loadJobFragments() error {
+	dir := strings.TrimSpace(c.Daemon.JobsDir)
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read jobs dir %s: %w", dir, err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".toml") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	fragments := make([]JobConfig, 0, len(paths))
+	names := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		job, err := loadJobFragment(path)
+		if err != nil {
+			return err
+		}
+		names[job.Name] = struct{}{}
+		fragments = append(fragments, job)
+	}
+	inline := c.Daemon.Jobs
+	c.Daemon.Jobs = make([]JobConfig, 0, len(inline)+len(fragments))
+	for _, job := range inline {
+		if _, covered := names[job.Name]; covered {
+			continue
+		}
+		c.Daemon.Jobs = append(c.Daemon.Jobs, job)
+	}
+	c.Daemon.Jobs = append(c.Daemon.Jobs, fragments...)
+	return nil
+}
+
+func loadJobFragment(path string) (JobConfig, error) {
+	v := viper.New()
+	v.SetConfigType("toml")
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return JobConfig{}, fmt.Errorf("read job fragment %s: %w", path, err)
+	}
+	var job JobConfig
+	if err := v.Unmarshal(&job); err != nil {
+		return JobConfig{}, fmt.Errorf("parse job fragment %s: %w", path, err)
+	}
+	if strings.TrimSpace(job.Name) == "" {
+		return JobConfig{}, fmt.Errorf("job fragment %s has no name", path)
+	}
+	return job, nil
+}
+
 func applyEnvAliases() {
 	aliases := map[string]string{
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
@@ -479,6 +596,9 @@ func applyEnvAliases() {
 		"DAEMON_AUDIT_PATH":             "daemon.auditPath",
 		"DAEMON_ACTIONS_DIR":            "daemon.actionsDir",
 		"DAEMON_ALARMS_DIR":             "daemon.alarmsDir",
+		"DAEMON_JOBS_DIR":               "daemon.jobsDir",
+		"DAEMON_LOGS_DIR":               "daemon.logsDir",
+		"DAEMON_LOGS_INTERVAL":          "daemon.logsInterval",
 		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
@@ -555,6 +675,9 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.SystemdInterval < 0 {
 		return fmt.Errorf("daemon.systemdInterval must not be negative")
+	}
+	if c.Daemon.LogsInterval < 0 {
+		return fmt.Errorf("daemon.logsInterval must not be negative")
 	}
 	if c.Daemon.RuntimesInterval < 0 {
 		return fmt.Errorf("daemon.runtimesInterval must not be negative")
@@ -648,6 +771,33 @@ func (c *Config) ValidateDaemon() error {
 			return err
 		}
 	}
+	jobNames := make(map[string]struct{}, len(c.Daemon.Jobs))
+	for i, job := range c.Daemon.Jobs {
+		job.Name = strings.TrimSpace(job.Name)
+		if job.Name == "" || !webhookNamePattern.MatchString(job.Name) {
+			return fmt.Errorf("daemon.jobs[%d].name must match [A-Za-z0-9._-]+", i)
+		}
+		if _, ok := jobNames[job.Name]; ok {
+			return fmt.Errorf("daemon.jobs[%d].name %q is duplicated", i, job.Name)
+		}
+		jobNames[job.Name] = struct{}{}
+		if strings.TrimSpace(job.Schedule) == "" {
+			return fmt.Errorf("daemon.jobs[%d].schedule is required", i)
+		}
+		if _, err := cron.ParseStandard(job.Schedule); err != nil {
+			return fmt.Errorf("daemon.jobs[%d].schedule %q is not a valid cron expression or descriptor: %w", i, job.Schedule, err)
+		}
+		if strings.TrimSpace(job.Action) == "" {
+			return fmt.Errorf("daemon.jobs[%d].action is required", i)
+		}
+		if job.Timeout < 0 {
+			return fmt.Errorf("daemon.jobs[%d].timeout must not be negative", i)
+		}
+		if job.Enabled == nil {
+			enabled := true
+			c.Daemon.Jobs[i].Enabled = &enabled
+		}
+	}
 	alarmKinds := make(map[string]struct{}, len(c.Daemon.Alarms))
 	for i := range c.Daemon.Alarms {
 		alarm := &c.Daemon.Alarms[i]
@@ -681,11 +831,22 @@ func (c *Config) ValidateDaemon() error {
 			alarm.Enabled = &enabled
 		}
 	}
-	if strings.TrimSpace(c.Daemon.CloudURL) != "" {
-		u, err := url.Parse(c.Daemon.CloudURL)
-		if err != nil || u.Host == "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost"))) {
-			return fmt.Errorf("daemon.cloudUrl must be HTTPS, or HTTP to localhost")
-		}
+	if err := ValidateCloudURL(c.Daemon.CloudURL); err != nil {
+		return fmt.Errorf("daemon.cloudUrl %w", err)
+	}
+	return nil
+}
+
+// ValidateCloudURL checks a cloud endpoint: HTTPS, or HTTP to a loopback
+// host (development). Empty URLs are allowed (publishing disabled).
+func ValidateCloudURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost"))) {
+		return fmt.Errorf("must be HTTPS, or HTTP to localhost")
 	}
 	return nil
 }

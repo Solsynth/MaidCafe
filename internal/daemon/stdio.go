@@ -271,9 +271,9 @@ func (a *App) runStdio(ctx context.Context) error {
 			}
 		case <-ticker.C:
 			metrics := a.metrics.Record()
-			if a.publisher != nil {
-				a.publisher.PublishMetrics(context.Background(), metrics)
-				a.publisher.PublishActions(context.Background(), append(nativeOpReport(), a.cfg.Actions...))
+			if pub := a.publish(); pub != nil {
+				pub.PublishMetrics(context.Background(), metrics)
+				pub.PublishActions(context.Background(), append(nativeOpReport(), a.rt.Load().actions...))
 			}
 			if err := write(stdioEvent{Type: "event", Event: "metrics", Data: metrics}); err != nil {
 				return err

@@ -12,6 +12,14 @@ metricsInterval = "1m"
 # evaluated locally against each metric sample; the daemon reports a
 # daemon.alarm.<kind> notification to the cloud when a threshold is exceeded.
 alarmsDir = "/etc/maidcafe/alarms"
+# One <slug>.toml fragment per scheduled job, merged at load. Each fragment
+# holds one job's fields (the same shape as a [[daemon.jobs]] entry).
+jobsDir = "/etc/maidcafe/jobs"
+# Captured container logs (JSONL per container, rotated at 512 KiB, pruned by
+# metricsRetentionDays). 0 disables log tracking.
+logsDir = "/var/lib/maidcafe/logs"
+# Container log capture cadence. 0 disables the collector.
+logsInterval = "10s"
 
 # Alarm fragments can use cpu_percent, memory_used_percent, or
 # disk_used_percent with threshold (percentage). container_down accepts an
@@ -72,3 +80,20 @@ cwd = "/srv/myapp"
 user = "deploy"
 env = ["CI_BUILD=42", "NODE_ENV=production"]
 enabled = true
+
+# Scheduled jobs: a cron expression or an @every descriptor targeting a
+# configured action or a native operation slug. Runs land in the audit log
+# with source "job" and can notify on failure.
+[[daemon.jobs]]
+name = "nightly-backup"
+schedule = "0 3 * * *"
+action = "backup"
+body = { job = "incremental" }
+enabled = true
+notifyOnFailure = true
+
+[[daemon.jobs]]
+name = "hourly-container-restart"
+schedule = "@every 1h"
+action = "container.restart"
+body = { id = "web" }

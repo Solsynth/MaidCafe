@@ -37,6 +37,7 @@ type notificationPayload struct {
 // with the daemon cloud secret and run over HTTPS (or localhost HTTP in
 // development).
 type CloudPublisher struct {
+	mu       sync.RWMutex
 	baseURL  string
 	daemonID string
 	secret   string
@@ -80,10 +81,31 @@ func NewCloudPublisher(cfg config.DaemonConfig, logger *slog.Logger) (*CloudPubl
 	}, nil
 }
 
+// Reload swaps the cloud URL and secret (hot reload). The pacing state is
+// kept: a re-pointed daemon keeps its quota discipline. An empty URL or
+// secret disables publishing (requests then fail fast with a clear error).
+func (p *CloudPublisher) Reload(cloudURL, cloudSecret string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(cloudURL), "/"))
+	if err != nil || parsed.Host == "" {
+		p.baseURL, p.secret = "", ""
+		p.logger.Warn("cloud publisher reloaded with invalid cloudUrl; publishing disabled")
+		return
+	}
+	p.baseURL = parsed.String()
+	p.secret = strings.TrimSpace(cloudSecret)
+}
+
 func (p *CloudPublisher) request(ctx context.Context, method, suffix string, payload any, dst any) error {
 	if p == nil {
 		return fmt.Errorf("cloud publisher is not configured")
 	}
+	p.mu.RLock()
+	baseURL := p.baseURL
+	secret := p.secret
+	timeout := p.timeout
+	p.mu.RUnlock()
 	var body []byte
 	var err error
 	if payload != nil {
@@ -92,13 +114,13 @@ func (p *CloudPublisher) request(ctx context.Context, method, suffix string, pay
 			return err
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, p.baseURL+"/api/daemons/"+p.daemonID+suffix, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+"/api/daemons/"+p.daemonID+suffix, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.secret)
+	req.Header.Set("Authorization", "Bearer "+secret)
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

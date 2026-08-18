@@ -724,3 +724,98 @@ alarmsDir = "`+filepath.ToSlash(filepath.Join(t.TempDir(), "missing"))+`"
 		t.Fatal(err)
 	}
 }
+
+func TestDaemonValidatesJobs(t *testing.T) {
+	base := DaemonConfig{
+		ID:                "host-1",
+		Transport:         "stdio",
+		MetricsInterval:   time.Minute,
+		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
+		ProcessesLimit:    50,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+	}
+	// A cron expression and an @every descriptor both validate.
+	cfg := Config{Daemon: base}
+	cfg.Daemon.Jobs = []JobConfig{
+		{Name: "nightly", Schedule: "0 3 * * *", Action: "backup"},
+		{Name: "cleanup", Schedule: "@every 30s", Action: "process.kill", Body: map[string]any{"pid": 42}},
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatalf("valid jobs rejected: %v", err)
+	}
+	if cfg.Daemon.Jobs[0].Enabled == nil || !*cfg.Daemon.Jobs[0].Enabled {
+		t.Fatal("enabled should default to true")
+	}
+	bad := []struct {
+		name string
+		job  JobConfig
+	}{
+		{"empty name", JobConfig{Schedule: "0 3 * * *", Action: "backup"}},
+		{"bad name", JobConfig{Name: "bad;name", Schedule: "0 3 * * *", Action: "backup"}},
+		{"missing schedule", JobConfig{Name: "j", Action: "backup"}},
+		{"bad schedule", JobConfig{Name: "j", Schedule: "not a cron", Action: "backup"}},
+		{"missing action", JobConfig{Name: "j", Schedule: "0 3 * * *"}},
+		{"duplicate", JobConfig{Name: "j", Schedule: "0 3 * * *", Action: "a"}},
+	}
+	for _, tc := range bad {
+		cfg := Config{Daemon: base}
+		cfg.Daemon.Jobs = []JobConfig{{Name: "j", Schedule: "0 3 * * *", Action: "a"}, tc.job}
+		err := cfg.ValidateDaemon()
+		if err == nil {
+			t.Errorf("%s: expected validation error", tc.name)
+		}
+	}
+	// Duplicate name is rejected even without the filler.
+	cfg = Config{Daemon: base}
+	cfg.Daemon.Jobs = []JobConfig{
+		{Name: "dup", Schedule: "@every 1m", Action: "a"},
+		{Name: "dup", Schedule: "@every 2m", Action: "b"},
+	}
+	if err := cfg.ValidateDaemon(); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("duplicate job name: err=%v", err)
+	}
+}
+
+func TestLoadJobFragments(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFragment := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name+".toml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfigFragment("nightly", "name = \"nightly\"\nschedule = \"0 3 * * *\"\naction = \"backup\"\n")
+	writeConfigFragment("cleanup", "name = \"cleanup\"\nschedule = \"@every 30s\"\naction = \"process.kill\"\nbody = { pid = 42 }\n")
+	path := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "s"
+jobsDir = "`+filepath.ToSlash(dir)+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Daemon.Jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(cfg.Daemon.Jobs))
+	}
+	if cfg.Daemon.Jobs[0].Name != "cleanup" || cfg.Daemon.Jobs[1].Name != "nightly" {
+		t.Fatalf("jobs not sorted by fragment name: %+v", cfg.Daemon.Jobs)
+	}
+	pid, ok := cfg.Daemon.Jobs[0].Body["pid"]
+	if !ok {
+		t.Fatalf("job body not parsed: %+v", cfg.Daemon.Jobs[0].Body)
+	}
+	switch n := pid.(type) {
+	case int, int64, float64:
+		// TOML integers surface as int/int64/float64 depending on the
+		// decoder; any numeric 42 is the point of this test.
+		_ = n
+	default:
+		t.Fatalf("job body pid has unexpected type %T: %+v", pid, cfg.Daemon.Jobs[0].Body)
+	}
+}

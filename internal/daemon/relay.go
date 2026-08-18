@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,16 +39,17 @@ type relayResultPayload struct {
 // enqueued through the cloud relay, executes them locally with the same
 // signature verification as the HTTP endpoint, and reports the results back.
 // Built-in native operations (container/systemd/compose/process slugs) are
-// dispatched to the ops runner instead of the hook table.
+// dispatched to the ops runner instead of the hook table. The publisher box
+// is shared with the App so a config reload re-points the relay too.
 type WebhookRelay struct {
-	publisher *CloudPublisher
+	publisher *atomic.Pointer[CloudPublisher]
 	executor  *WebhookExecutor
 	ops       *nativeOpRunner
 	logger    *slog.Logger
 }
 
 // NewWebhookRelay returns nil when the cloud relay is not configured.
-func NewWebhookRelay(publisher *CloudPublisher, executor *WebhookExecutor, ops *nativeOpRunner, logger *slog.Logger) *WebhookRelay {
+func NewWebhookRelay(publisher *atomic.Pointer[CloudPublisher], executor *WebhookExecutor, ops *nativeOpRunner, logger *slog.Logger) *WebhookRelay {
 	if publisher == nil || executor == nil {
 		return nil
 	}
@@ -76,11 +78,12 @@ func (r *WebhookRelay) pollOnce(ctx context.Context) {
 	// Metric ingest and relay pickup share the cloud's per-daemon throttle
 	// bucket; skip the poll while the workspace poll interval is open instead
 	// of burning a guaranteed 429. The next tick retries.
-	if !r.publisher.pacedOK(ctx) {
+	publisher := r.publisher.Load()
+	if publisher == nil || !publisher.pacedOK(ctx) {
 		return
 	}
 	var pending relayPendingResponse
-	if err := r.publisher.request(ctx, "GET", "/webhook-requests/pending", nil, &pending); err != nil {
+	if err := publisher.request(ctx, "GET", "/webhook-requests/pending", nil, &pending); err != nil {
 		r.logger.Warn("webhook relay poll failed", "error", err)
 		return
 	}
@@ -130,7 +133,11 @@ func (r *WebhookRelay) process(ctx context.Context, request relayWebhookRequest)
 }
 
 func (r *WebhookRelay) report(ctx context.Context, id string, result relayResultPayload) {
-	if err := r.publisher.request(ctx, "POST", "/webhook-requests/"+id+"/result", result, nil); err != nil {
+	publisher := r.publisher.Load()
+	if publisher == nil {
+		return
+	}
+	if err := publisher.request(ctx, "POST", "/webhook-requests/"+id+"/result", result, nil); err != nil {
 		r.logger.Warn("webhook relay result failed", "request", id, "error", err)
 	}
 }

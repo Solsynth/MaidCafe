@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,7 +98,9 @@ func TestCloudPublisherPacesThrottledTrafficByWorkspaceQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewWebhookRelay(publisher, NewWebhookExecutor(cfg), nil, logger)
+	publisherBox := &atomic.Pointer[CloudPublisher]{}
+	publisherBox.Store(publisher)
+	relay := NewWebhookRelay(publisherBox, NewWebhookExecutor(cfg), nil, logger)
 
 	var mu sync.Mutex
 	metricPosts, pendingGets, notificationPosts := 0, 0, 0

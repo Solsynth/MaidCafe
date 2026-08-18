@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,11 +41,12 @@ func newTestOpsRunner(t *testing.T, runtimes map[string]string) *nativeOpRunner 
 		ScriptTimeout:     time.Second,
 		MaxConcurrentRuns: 2,
 	})
-	return &nativeOpRunner{
-		executor:      executor,
-		runtimes:      stubRuntimes(runtimes),
-		scriptTimeout: time.Second,
+	runner := &nativeOpRunner{
+		executor: executor,
+		runtimes: stubRuntimes(runtimes),
 	}
+	runner.SetScriptTimeout(time.Second)
+	return runner
 }
 
 func TestNativeOpValidation(t *testing.T) {
@@ -251,10 +253,10 @@ func TestRelayDispatchesNativeOp(t *testing.T) {
 		MaxConcurrentRuns: 1,
 	})
 	runner := &nativeOpRunner{
-		executor:      executor,
-		runtimes:      stubRuntimes(map[string]string{"podman": podman}),
-		scriptTimeout: time.Second,
+		executor: executor,
+		runtimes: stubRuntimes(map[string]string{"podman": podman}),
 	}
+	runner.SetScriptTimeout(time.Second)
 	publisher, err := NewCloudPublisher(config.DaemonConfig{
 		ID:             "host-1",
 		CloudURL:       cloud.URL,
@@ -264,7 +266,9 @@ func TestRelayDispatchesNativeOp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewWebhookRelay(publisher, executor, runner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	publisherBox := &atomic.Pointer[CloudPublisher]{}
+	publisherBox.Store(publisher)
+	relay := NewWebhookRelay(publisherBox, executor, runner, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	relay.process(context.Background(), relayWebhookRequest{
 		ID:        "r1",
 		Name:      "container.restart",

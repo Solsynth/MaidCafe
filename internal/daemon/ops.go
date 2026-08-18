@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
@@ -176,7 +177,12 @@ type opAttempt struct {
 type nativeOpRunner struct {
 	executor      *WebhookExecutor
 	runtimes      func(ctx context.Context) map[string]string
-	scriptTimeout time.Duration
+	scriptTimeout atomic.Int64 // nanoseconds
+}
+
+// SetScriptTimeout updates the daemon-wide op timeout (hot reload).
+func (r *nativeOpRunner) SetScriptTimeout(timeout time.Duration) {
+	r.scriptTimeout.Store(int64(timeout))
 }
 
 // dispatch validates [slug] and [params], builds the command attempts and
@@ -191,7 +197,7 @@ func (r *nativeOpRunner) dispatch(
 	invokedBy string,
 ) (executionResponse, int, *requestError) {
 	var attempts []opAttempt
-	timeout := r.scriptTimeout
+	timeout := time.Duration(r.scriptTimeout.Load())
 	bad := func(message string) (executionResponse, int, *requestError) {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: message}
 	}

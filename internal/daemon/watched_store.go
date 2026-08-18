@@ -56,6 +56,21 @@ func normalizeWatchedNames(names []string) []string {
 	return out
 }
 
+// Reseed replaces the config-seeded names when no persisted file exists yet
+// (hot reload). The persisted file stays authoritative once present, so
+// dynamic API additions are never clobbered by a config reload.
+func (s *watchedProcessStore) Reseed(seeded []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := os.Stat(s.path); err == nil {
+		return
+	}
+	s.names = normalizeWatchedNames(seeded)
+	if s.path != "" && len(s.names) > 0 {
+		_ = s.saveLocked()
+	}
+}
+
 // List returns a copy of the watched names, sorted.
 func (s *watchedProcessStore) List() []string {
 	s.mu.Lock()

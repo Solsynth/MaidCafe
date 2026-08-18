@@ -8,6 +8,9 @@ Type=simple
 User=maidcafe
 Group=maidcafe
 ExecStart=/usr/local/bin/maidcafe-daemon --config /etc/maidcafe/config.toml
+# `systemctl reload` sends SIGHUP; the daemon re-reads its configuration and
+# fragments and swaps every reloadable component without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
@@ -17,16 +20,12 @@ ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-# User-switching actions ([[daemon.actions]] user = "...") are executed
-# through sudo and render their substituted scripts under
-# /etc/maidcafe/actions/run. When any configured action uses a run-as user,
-# drop NoNewPrivileges (sudo needs its setuid bit) and allow the daemon to
-# write the runtime scripts:
-#   NoNewPrivileges=false
-#   ReadWritePaths=/etc/maidcafe/actions
-# The container/image collectors' root-visibility retry (`sudo -n`) needs
-# the same NoNewPrivileges relaxation (plus a passwordless sudoers rule for
-# the maidcafe user) when root-owned containers must be listed.
+# /etc/maidcafe must be writable for the config API (PATCH /api/v1/config
+# writes config.toml) and for user-switching action scripts (rendered under
+# /etc/maidcafe/actions/run). User-switching actions and the root-visibility
+# sudo -n retries additionally need NoNewPrivileges=false plus a
+# passwordless sudoers rule for the maidcafe user.
+ReadWritePaths=/etc/maidcafe
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 LockPersonality=true

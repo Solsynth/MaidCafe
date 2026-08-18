@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
 
 // subscriberBufferSize is the per-subscriber frame queue. Broadcasts drop the
@@ -24,7 +23,7 @@ const sseHeartbeatInterval = 15 * time.Second
 
 // streamEventTypes is the whitelist of subscribable event names for
 // GET /api/v1/stream. hello is not subscribable: it is always sent first.
-var streamEventTypes = []string{"metric", "containers", "images", "processes", "systemd", "runtimes", "databaseMetrics"}
+var streamEventTypes = []string{"metric", "containers", "images", "processes", "systemd", "runtimes", "databaseMetrics", "logs"}
 
 // Subscriber is one SSE client's handle on a StreamHub. C delivers complete
 // SSE frames (event/data/blank line) for the requested types.
@@ -280,7 +279,9 @@ func parseProcessesLimit(raw string, defaultLimit int) (int, error) {
 // handleStream serves GET /api/v1/stream. It clears the server-level write
 // deadline (the 10s WriteTimeout would otherwise kill the stream), sends the
 // hello frame first, then fans subscribed frames out with a 15s heartbeat.
-func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
+// Intervals come from the reloadable state so the hello reflects the current
+// configuration after a reload.
+func handleStream(c *gin.Context, hub *StreamHub, rt *reloadableConfig) {
 	types, err := parseEventsParam(c.Query("events"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
@@ -289,7 +290,7 @@ func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
 	if len(types) == 0 {
 		types = append([]string(nil), streamEventTypes...)
 	}
-	processesLimit, err := parseProcessesLimit(c.Query("processesLimit"), cfg.ProcessesLimit)
+	processesLimit, err := parseProcessesLimit(c.Query("processesLimit"), rt.processesLimit)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
 		return
@@ -313,15 +314,16 @@ func handleStream(c *gin.Context, hub *StreamHub, cfg config.DaemonConfig) {
 
 	hello := gin.H{
 		"stream":  "v1",
-		"version": cfg.Version,
+		"version": rt.version,
 		"intervals": gin.H{
-			"metric":          int(cfg.StreamInterval.Seconds()),
-			"containers":      int(cfg.ContainersInterval.Seconds()),
-			"images":          int(cfg.ImagesInterval.Seconds()),
-			"processes":       int(cfg.ProcessesInterval.Seconds()),
-			"systemd":         int(cfg.SystemdInterval.Seconds()),
-			"runtimes":        int(cfg.RuntimesInterval.Seconds()),
-			"databaseMetrics": int(cfg.DatabaseMetricsInterval.Seconds()),
+			"metric":          int(rt.intervals.stream.Seconds()),
+			"containers":      int(rt.intervals.containers.Seconds()),
+			"images":          int(rt.intervals.images.Seconds()),
+			"processes":       int(rt.intervals.processes.Seconds()),
+			"systemd":         int(rt.intervals.systemd.Seconds()),
+			"runtimes":        int(rt.intervals.runtimes.Seconds()),
+			"databaseMetrics": int(rt.intervals.database.Seconds()),
+			"logs":            int(rt.intervals.logs.Seconds()),
 		},
 	}
 	helloData, err := json.Marshal(hello)

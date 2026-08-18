@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -97,10 +98,12 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (b *limitedBuffer) String() string { return b.buf.String() }
 
 type WebhookExecutor struct {
+	hooksMu       sync.RWMutex
 	hooks         map[string]config.WebhookConfig
 	actions       map[string]config.WebhookConfig
-	scriptTimeout time.Duration
-	maxBodyBytes  int64
+	scriptTimeout atomic.Int64 // nanoseconds
+	maxBodyBytes  atomic.Int64
+	slotsMu       sync.Mutex
 	slots         chan struct{}
 	counts        counters
 	audit         *AuditLogger
@@ -108,22 +111,80 @@ type WebhookExecutor struct {
 }
 
 func NewWebhookExecutor(cfg config.DaemonConfig) *WebhookExecutor {
-	hooks := make(map[string]config.WebhookConfig, len(cfg.Webhooks)+len(cfg.Actions))
-	actions := make(map[string]config.WebhookConfig, len(cfg.Actions))
-	for _, h := range cfg.Webhooks {
-		hooks[h.Name] = h
+	executor := &WebhookExecutor{
+		slots: make(chan struct{}, cfg.MaxConcurrentRuns),
 	}
-	for _, action := range cfg.Actions {
-		hooks[action.Name] = action
-		actions[action.Name] = action
+	executor.scriptTimeout.Store(int64(cfg.ScriptTimeout))
+	executor.maxBodyBytes.Store(cfg.MaxBodyBytes)
+	executor.SetHooks(cfg.Webhooks, cfg.Actions)
+	return executor
+}
+
+// SetHooks replaces the webhook/action tables atomically. Used by the hot
+// reload path (config file, PATCH API, SIGHUP); in-flight runs keep the hook
+// value they already read.
+func (e *WebhookExecutor) SetHooks(webhooks, actions []config.WebhookConfig) {
+	e.hooksMu.Lock()
+	defer e.hooksMu.Unlock()
+	e.hooks = make(map[string]config.WebhookConfig, len(webhooks)+len(actions))
+	for _, hook := range webhooks {
+		e.hooks[hook.Name] = hook
 	}
-	return &WebhookExecutor{
-		hooks:         hooks,
-		actions:       actions,
-		scriptTimeout: cfg.ScriptTimeout,
-		maxBodyBytes:  cfg.MaxBodyBytes,
-		slots:         make(chan struct{}, cfg.MaxConcurrentRuns),
+	e.actions = make(map[string]config.WebhookConfig, len(actions))
+	for _, action := range actions {
+		e.hooks[action.Name] = action
+		e.actions[action.Name] = action
 	}
+}
+
+func (e *WebhookExecutor) hook(name string) (config.WebhookConfig, bool) {
+	e.hooksMu.RLock()
+	defer e.hooksMu.RUnlock()
+	hook, ok := e.hooks[name]
+	return hook, ok
+}
+
+func (e *WebhookExecutor) action(name string) (config.WebhookConfig, bool) {
+	e.hooksMu.RLock()
+	defer e.hooksMu.RUnlock()
+	action, ok := e.actions[name]
+	return action, ok
+}
+
+// SetScriptTimeout updates the daemon-wide per-run timeout (hot reload).
+func (e *WebhookExecutor) SetScriptTimeout(timeout time.Duration) {
+	e.scriptTimeout.Store(int64(timeout))
+}
+
+// SetMaxBodyBytes updates the request body limit (hot reload).
+func (e *WebhookExecutor) SetMaxBodyBytes(limit int64) {
+	e.maxBodyBytes.Store(limit)
+}
+
+// SetMaxConcurrentRuns replaces the concurrency slot pool (hot reload).
+// acquireSlot/releaseSlot pair the taken and released channels, so a swap
+// mid-run can never strand or double-release a token.
+func (e *WebhookExecutor) SetMaxConcurrentRuns(n int) {
+	e.slotsMu.Lock()
+	defer e.slotsMu.Unlock()
+	e.slots = make(chan struct{}, n)
+}
+
+func (e *WebhookExecutor) acquireSlot() bool {
+	e.slotsMu.Lock()
+	defer e.slotsMu.Unlock()
+	select {
+	case e.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *WebhookExecutor) releaseSlot() {
+	e.slotsMu.Lock()
+	defer e.slotsMu.Unlock()
+	<-e.slots
 }
 func (e *WebhookExecutor) SetCompletionHandler(handler func(config.WebhookConfig, bool, int, string, time.Duration)) {
 	e.onComplete = handler
@@ -181,16 +242,16 @@ type requestError struct {
 }
 
 func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, int, *requestError) {
-	hook, exists := e.hooks[name]
+	hook, exists := e.hook(name)
 	if !exists || !hook.Enabled {
 		return executionResponse{}, 0, &requestError{status: http.StatusNotFound, message: "not found"}
 	}
 	ctx := r.Context()
-	body, err := io.ReadAll(io.LimitReader(r.Body, e.maxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, e.maxBodyBytes.Load()+1))
 	if err != nil {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: "read request body"}
 	}
-	if int64(len(body)) > e.maxBodyBytes {
+	if int64(len(body)) > e.maxBodyBytes.Load() {
 		return executionResponse{}, 0, &requestError{status: http.StatusRequestEntityTooLarge, message: "request body too large"}
 	}
 	// The signature is the only credential a webhook needs: it proves the
@@ -216,7 +277,7 @@ func (e *WebhookExecutor) run(name string, r *http.Request) (executionResponse, 
 // credential. The local HTTP endpoint keeps requiring a signature for every
 // hook.
 func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature string, source string, invokedBy string) (executionResponse, int) {
-	hook, exists := e.hooks[name]
+	hook, exists := e.hook(name)
 	if !exists || !hook.Enabled {
 		return executionResponse{}, http.StatusNotFound
 	}
@@ -365,12 +426,10 @@ func (e *WebhookExecutor) execute(
 	source string,
 	invokedBy string,
 ) (response executionResponse, status int) {
-	select {
-	case e.slots <- struct{}{}:
-		defer func() { <-e.slots }()
-	default:
+	if !e.acquireSlot() {
 		return executionResponse{}, http.StatusTooManyRequests
 	}
+	defer e.releaseSlot()
 	started := time.Now()
 	defer func() {
 		if e.audit == nil {
@@ -390,7 +449,7 @@ func (e *WebhookExecutor) execute(
 			Error:       auditErrorTail(response),
 		})
 	}()
-	timeout := e.scriptTimeout
+	timeout := time.Duration(e.scriptTimeout.Load())
 	if hook.Timeout > 0 {
 		// Per-hook override; the daemon-wide scriptTimeout stays the default.
 		timeout = hook.Timeout
@@ -474,13 +533,13 @@ func (e *WebhookExecutor) RunAction(
 	source string,
 	invokedBy string,
 ) (executionResponse, *requestError) {
-	if int64(len(body)) > e.maxBodyBytes {
+	if int64(len(body)) > e.maxBodyBytes.Load() {
 		return executionResponse{}, &requestError{
 			status:  http.StatusRequestEntityTooLarge,
 			message: "request body too large",
 		}
 	}
-	hook, exists := e.actions[name]
+	hook, exists := e.action(name)
 	if !exists || !hook.Enabled {
 		return executionResponse{}, &requestError{
 			status:  http.StatusNotFound,

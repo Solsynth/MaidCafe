@@ -84,6 +84,22 @@ GET /health
 - Non-zero exit handling with `502` responses.
 - Bounded stdout/stderr capture in JSON responses.
 - Atomic success/failure execution counters.
+- Scheduled jobs (`daemon.jobsDir` fragments): cron expressions or `@every`
+  descriptors targeting any configured action or native operation, run
+  through the same executor (audit, concurrency, timeout) with optional
+  `job.failure` notifications.
+- Container log tracking: running containers are tailed incrementally
+  (`logs --since`) on the logs cadence, appended to per-container JSONL files
+  (rotated at 512 KiB, one generation, pruned by `metricsRetentionDays`) and
+  pushed to SSE `logs` subscribers; `GET /api/v1/containers/:id/logs` returns
+  the tail window.
+- Hot reload: the daemon watches its config file and the action/alarm/job
+  fragment directories, `systemctl reload`/SIGHUP re-reads them, and
+  `PATCH /api/v1/config` patches a safe subset of `[daemon]` keys — in every
+  case the reloadable components (hooks, jobs, alarms, runtimes, watched
+  processes, intervals, limits, cloud endpoint) swap without a restart.
+  Transport, listen address, storage paths and the metrics secret remain
+  restart-required.
 - Public health endpoint that exposes only daemon mode and ID:
 
 ```text
@@ -326,6 +342,73 @@ identity in the body: `{"id": "…"}`, `{"pid": 123}`, `{"unit": "…"}`,
 metrics tick, so the cloud page lists them as invocable, and the slugs are
 reserved — a webhook or action may not use one, keeping the relay name space
 unambiguous.
+
+### Scheduled jobs
+
+Jobs run a configured action or native operation on a schedule. Each job is a
+`<slug>.toml` fragment under `daemon.jobsDir` (default
+`/etc/maidcafe/jobs`), merged at load like action and alarm fragments, or an
+inline `[[daemon.jobs]]` entry:
+
+```toml
+name = "nightly-backup"
+schedule = "0 3 * * *"     # five-field cron, or "@every 30s", "@hourly"...
+action = "backup"          # a configured action name or native op slug
+body = { job = "incremental" }
+enabled = true
+notifyOnFailure = true
+```
+
+- `schedule` accepts standard five-field cron expressions and robfig/cron
+  descriptors (`@every 30s`, `@hourly`, `@daily`).
+- `action` targets a configured action or a native operation slug
+  (`container.restart`, `process.kill`, …); `body` is the JSON object passed
+  to it (script template variables or native-op identity parameters).
+- Runs go through the same executor as manual invocations: audit log entries
+  with `source: "job"` and `invoked_by: "job:<name>"`, the shared concurrency
+  slot and per-run timeout. Overlapping runs are skipped, never stacked.
+- `notifyOnFailure` publishes a `job.failure` notification when a run fails.
+
+### Container logs
+
+The daemon tails every running container on `daemon.logsInterval` (default
+`10s`, `0` disables) with `<runtime> logs --since <cursor> --timestamps <id>`
+(initial run backfills the last 200 lines), reusing the runtime probe and
+`sudo -n` retry. New lines are:
+
+- appended to per-container JSONL files under `daemon.logsDir` (default
+  `/var/lib/maidcafe/logs`), rotated at 512 KiB with one generation and
+  pruned by `metricsRetentionDays`;
+- pushed to SSE `logs` subscribers as `{"container": "<id>", "lines":
+  [{"ts": ..., "line": ...}]}` frames;
+- served by `GET /api/v1/containers/:id/logs?lines=N` (1–1000, default 200)
+  as the tail window, oldest first.
+
+### Hot reload and the config API
+
+Three triggers re-read the configuration: file changes (the config file and
+the action/alarm/job fragment directories are watched, debounced), SIGHUP
+(`systemctl reload maidcafe-daemon` — the shipped unit carries
+`ExecReload=/bin/kill -HUP $MAINPID`), and the config API. A reload validates
+the result and swaps the reloadable components atomically: webhook/action
+tables, jobs, alarms, runtime groups, watched processes, collector intervals,
+timeouts, body limits, concurrency, and the cloud endpoint. A failed load or
+validation keeps the previous state; the daemon never restarts itself.
+
+`GET /api/v1/config` returns the merged configuration with secrets redacted
+(metrics/cloud secrets and webhook secrets are never exposed) plus the
+fragment contents. `PATCH /api/v1/config` patches a safe subset of `[daemon]`
+keys — intervals, `processesLimit`, `scriptTimeout`, `maxBodyBytes`,
+`maxConcurrentRuns`, `runtimes`, `watchedProcesses`, `cloudUrl`,
+`cloudSecret` — into `config.toml` (preserving every other line verbatim),
+then hot-reloads; a failed reload restores the previous file. Unsupported or
+invalid keys are rejected with `400` before any write.
+
+Restart-required settings — `transport`, `listen`, `metricsSecret`, storage
+paths, audit path — are read-only over the API, and patching them is
+rejected. The daemon writes its own config file, so the systemd unit grants
+it `ReadWritePaths=/etc/maidcafe`; the config API needs the daemon user to be
+able to write that directory (a hand-rolled install must allow it too).
 
 Example response:
 
