@@ -184,6 +184,46 @@ func TestNotificationPreferencesControlHistoryAndPush(t *testing.T) {
 		t.Fatalf("preference list: %v %#v", err, preferences)
 	}
 }
+func TestBatchNotificationPreferencesForDaemon(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.SetAllDaemonNotificationPreferences(
+		ctx,
+		"account-a",
+		"ws-a",
+		daemon.ID,
+		int(NotificationPreferenceSilent),
+	); err != nil {
+		t.Fatal(err)
+	}
+	topics, err := svc.ListNotificationTopics(ctx, "account-a", "ws-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences, err := svc.ListNotificationPreferences(ctx, "account-a", "ws-a", daemon.ID)
+	if err != nil || len(preferences) != len(topics) {
+		t.Fatalf("batch preference count: %v got %d want %d", err, len(preferences), len(topics))
+	}
+	for _, preference := range preferences {
+		if preference.Preference != NotificationPreferenceSilent {
+			t.Fatalf("batch preference: %#v", preference)
+		}
+	}
+
+	if err := svc.DeleteAllDaemonNotificationPreferences(ctx, "account-a", "ws-a", daemon.ID); err != nil {
+		t.Fatal(err)
+	}
+	preferences, err = svc.ListNotificationPreferences(ctx, "account-a", "ws-a", daemon.ID)
+	if err != nil || len(preferences) != 0 {
+		t.Fatalf("batch preference reset: %v %#v", err, preferences)
+	}
+}
 
 func TestNotificationNullMetadataDoesNotPanic(t *testing.T) {
 	svc, db, publisher, _ := testService(t)

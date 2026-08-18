@@ -38,6 +38,8 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.PUT("/notification-preferences/:topic", setGlobalNotificationPreference(svc))
 	user.DELETE("/notification-preferences/:topic", deleteGlobalNotificationPreference(svc))
 	user.GET("/notification-topics", listNotificationTopics(svc))
+	user.PUT("/daemons/:id/notification-preferences", setAllDaemonNotificationPreferences(svc))
+	user.DELETE("/daemons/:id/notification-preferences", deleteAllDaemonNotificationPreferences(svc))
 	user.PUT("/daemons/:id/notification-preferences/:topic", setDaemonNotificationPreference(svc))
 	user.DELETE("/daemons/:id/notification-preferences/:topic", deleteDaemonNotificationPreference(svc))
 	user.POST("/notifications/all/read", markAllRead(svc))
@@ -302,6 +304,33 @@ func setDaemonNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 			return
 		}
 		if err := s.SetNotificationPreference(c, accountID(c), input.WorkspaceID, c.Param("id"), c.Param("topic"), input.Preference); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func setAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var input struct {
+			WorkspaceID string `json:"workspace_id"`
+			Preference  int    `json:"preference"`
+		}
+		if !parseJSON(c, &input) {
+			return
+		}
+		if err := s.SetAllDaemonNotificationPreferences(c, accountID(c), input.WorkspaceID, c.Param("id"), input.Preference); err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func deleteAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.DeleteAllDaemonNotificationPreferences(c, accountID(c), c.Query("workspace_id"), c.Param("id")); err != nil {
 			serviceStatus(c, err)
 			return
 		}

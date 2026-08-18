@@ -1173,6 +1173,92 @@ func (s *Service) SetNotificationPreference(ctx context.Context, accountID, work
 	}
 }
 
+// SetAllDaemonNotificationPreferences applies one delivery policy to every
+// topic currently known in the workspace for a daemon. The operation is
+// transactional so a batch never leaves a partially updated daemon scope.
+func (s *Service) SetAllDaemonNotificationPreferences(ctx context.Context, accountID, workspaceID, daemonID string, preference int) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("workspace_id is required")
+	}
+	if err := validateNotificationPreference(preference); err != nil {
+		return err
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return err
+	}
+	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
+	if err != nil {
+		return err
+	}
+	if daemon.WorkspaceID != workspaceID {
+		return ErrForbidden
+	}
+	topics, err := s.ListNotificationTopics(ctx, accountID, workspaceID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, topic := range topics {
+			var row database.NotificationPreference
+			query := tx.Where(
+				"account_id = ? AND workspace_id = ? AND daemon_id = ? AND topic = ?",
+				accountID,
+				workspaceID,
+				daemonID,
+				topic.Topic,
+			)
+			err := query.First(&row).Error
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				if err := tx.Create(&database.NotificationPreference{
+					ID: uuid.NewString(), AccountID: accountID, WorkspaceID: workspaceID,
+					DaemonID: daemonID, Topic: topic.Topic, Preference: preference,
+					CreatedAt: now, UpdatedAt: now,
+				}).Error; err != nil {
+					return err
+				}
+			case err != nil:
+				return err
+			default:
+				if err := tx.Model(&row).Updates(map[string]any{
+					"preference": preference,
+					"updated_at": now,
+				}).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// DeleteAllDaemonNotificationPreferences removes every daemon-specific
+// override, restoring the account-wide policy for all topics.
+func (s *Service) DeleteAllDaemonNotificationPreferences(ctx context.Context, accountID, workspaceID, daemonID string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("workspace_id is required")
+	}
+	if err := s.authorizeWorkspace(ctx, accountID, workspaceID); err != nil {
+		return err
+	}
+	daemon, err := s.daemonForAccount(ctx, accountID, daemonID)
+	if err != nil {
+		return err
+	}
+	if daemon.WorkspaceID != workspaceID {
+		return ErrForbidden
+	}
+	return s.db.WithContext(ctx).Where(
+		"account_id = ? AND workspace_id = ? AND daemon_id = ?",
+		accountID,
+		workspaceID,
+		daemonID,
+	).Delete(&database.NotificationPreference{}).Error
+}
+
 func (s *Service) DeleteNotificationPreference(ctx context.Context, accountID, workspaceID, daemonID, topic string) error {
 	workspaceID = strings.TrimSpace(workspaceID)
 	if workspaceID == "" {
