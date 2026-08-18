@@ -189,6 +189,18 @@ func ValidWatchedProcessName(name string) bool {
 	return watchedProcessNamePattern.MatchString(name)
 }
 
+// IsNativeOpName reports whether [name] collides with a built-in native
+// operation slug. Shared by config validation (reserved names are rejected)
+// and the daemon's relay dispatch.
+func IsNativeOpName(name string) bool {
+	for _, slug := range NativeOpNames {
+		if slug == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Label returns the human-readable name for display in notifications and
 // clients, falling back to the API slug when no display name is configured.
 func (h WebhookConfig) Label() string {
@@ -219,6 +231,20 @@ func validateHookExecution(hook WebhookConfig, kind string, index int) error {
 }
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// NativeOpNames lists the built-in operations the daemon executes natively
+// (container lifecycle, process kill, systemd unit actions, compose project
+// actions). These slugs are reserved: webhooks and actions may not reuse
+// them, so the cloud relay — which dispatches by name — stays unambiguous
+// and credential action-name scopes mean the same thing for both kinds.
+var NativeOpNames = []string{
+	"container.start", "container.stop", "container.restart",
+	"container.pause", "container.unpause", "container.kill", "container.remove",
+	"process.kill",
+	"systemd.start", "systemd.stop", "systemd.restart", "systemd.reload",
+	"systemd.enable", "systemd.disable",
+	"compose.up", "compose.stop", "compose.restart", "compose.pull", "compose.recreate",
+}
 
 func Load(configPath string) (*Config, error) {
 	viper.Reset()
@@ -583,6 +609,9 @@ func (c *Config) ValidateDaemon() error {
 			return fmt.Errorf("daemon.webhooks[%d].name %q is duplicated", i, hook.Name)
 		}
 		hookNames[hook.Name] = struct{}{}
+		if IsNativeOpName(hook.Name) {
+			return fmt.Errorf("daemon.webhooks[%d].name %q is reserved for a built-in operation", i, hook.Name)
+		}
 		if strings.TrimSpace(hook.Secret) == "" {
 			return fmt.Errorf("daemon.webhooks[%d].secret is required", i)
 		}
@@ -609,6 +638,9 @@ func (c *Config) ValidateDaemon() error {
 			return fmt.Errorf("daemon.actions[%d].name %q is duplicated", i, action.Name)
 		}
 		actionNames[action.Name] = struct{}{}
+		if IsNativeOpName(action.Name) {
+			return fmt.Errorf("daemon.actions[%d].name %q is reserved for a built-in operation", i, action.Name)
+		}
 		if !filepath.IsAbs(action.Command) {
 			return fmt.Errorf("daemon.actions[%d].command must be an absolute path", i)
 		}

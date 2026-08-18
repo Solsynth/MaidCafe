@@ -288,6 +288,44 @@ Webhook secrets are separate from the metrics secret. The daemon does not
 provide an HTTP configuration API; MaidKit updates the managed TOML
 configuration over SSH and restarts the service when needed.
 
+### Native host operations
+
+The daemon also executes typed mutations directly — container lifecycle,
+process kill, systemd unit actions and compose project actions — mirroring
+what MaidKit's SSH layer can do, so a managed host can be operated through the
+daemon (locally over HTTP, over the SSH stdio pipe, or remotely through the
+cloud relay) without a workstation SSH session. Unlike script actions, native
+ops never interpolate caller input into a shell: targets are validated against
+the same patterns MaidKit enforces client-side, and commands run directly with
+`exec.CommandContext` (no `sh -c`). Root-owned resources are reached with a
+`sudo -n` retry mirroring the collectors; under the shipped systemd unit's
+`NoNewPrivileges` that retry is inert, so such ops fail with a clear error and
+MaidKit falls back to SSH.
+
+```text
+POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove
+POST /api/v1/processes/:pid/kill
+POST /api/v1/systemd/:unit/:action    action = start|stop|restart|reload|enable|disable
+POST /api/v1/compose/:project/:action action = up|stop|restart|pull|recreate
+```
+
+All four are authenticated with the metrics secret and a body signature, like
+the actions route. `POST /api/v1/containers/:id/remove` accepts `{"force":
+true}` (mapped to `rm -f`); `POST /api/v1/compose/:project/:action` requires
+`{"directory": "<absolute path>"}` — compose resolves its file from the
+working directory, so the path must hold the compose file. Container ops
+resolve the runtime with the shared probe (podman first) and fall back to the
+other runtime when the container is not found there. Every run is appended to
+the audit log under its slug (`container.restart`, `process.kill`, …).
+
+The slugs are also valid through the cloud relay (`POST
+/api/daemons/:id/webhook-requests` with `name: container.restart` and the
+identity in the body: `{"id": "…"}`, `{"pid": 123}`, `{"unit": "…"}`,
+`{"project": "…", "directory": "…"}`) and over the SSH stdio pipe (request
+`action` = the slug, same body). They are reported to the cloud on every
+metrics tick, so the cloud page lists them as invocable, and the slugs are
+reserved — a webhook or action may not use one, keeping the relay name space
+unambiguous.
 
 Example response:
 

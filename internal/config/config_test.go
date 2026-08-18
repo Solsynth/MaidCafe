@@ -428,6 +428,34 @@ cwd = "/srv/myapp"
 	}
 }
 
+func TestDaemonRejectsReservedNativeOpNames(t *testing.T) {
+	cfg := Config{Daemon: DaemonConfig{
+		ID:                "host-1",
+		Transport:         "http",
+		Listen:            "127.0.0.1:8747",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Minute,
+		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
+		ProcessesLimit:    50,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1,
+		MaxConcurrentRuns: 1,
+		Actions: []WebhookConfig{{
+			Name:    "container.restart",
+			Command: "/etc/maidcafe/actions/container-restart.sh",
+		}},
+	}}
+	err := cfg.ValidateDaemon()
+	if err == nil {
+		t.Fatal("expected reserved native op name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "reserved for a built-in operation") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDaemonRejectsActionWebhookNameCollision(t *testing.T) {
 	cfg := Config{Daemon: DaemonConfig{
 		ID:                "host-1",

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -36,21 +37,24 @@ type relayResultPayload struct {
 // WebhookRelay polls the MaidKit cloud for webhook invocations the client
 // enqueued through the cloud relay, executes them locally with the same
 // signature verification as the HTTP endpoint, and reports the results back.
+// Built-in native operations (container/systemd/compose/process slugs) are
+// dispatched to the ops runner instead of the hook table.
 type WebhookRelay struct {
 	publisher *CloudPublisher
 	executor  *WebhookExecutor
+	ops       *nativeOpRunner
 	logger    *slog.Logger
 }
 
 // NewWebhookRelay returns nil when the cloud relay is not configured.
-func NewWebhookRelay(publisher *CloudPublisher, executor *WebhookExecutor, logger *slog.Logger) *WebhookRelay {
+func NewWebhookRelay(publisher *CloudPublisher, executor *WebhookExecutor, ops *nativeOpRunner, logger *slog.Logger) *WebhookRelay {
 	if publisher == nil || executor == nil {
 		return nil
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &WebhookRelay{publisher: publisher, executor: executor, logger: logger}
+	return &WebhookRelay{publisher: publisher, executor: executor, ops: ops, logger: logger}
 }
 
 // Run polls until ctx is cancelled, starting with an immediate poll.
@@ -91,7 +95,29 @@ func (r *WebhookRelay) process(ctx context.Context, request relayWebhookRequest)
 		r.report(ctx, request.ID, relayResultPayload{Error: "invalid request body encoding"})
 		return
 	}
-	response, status := r.executor.ExecuteWebhook(request.Name, body, request.Signature, "relay", request.InvokedBy)
+	var response executionResponse
+	var status int
+	var requestErr *requestError
+	if r.ops != nil && isNativeOpSlug(request.Name) {
+		// A native operation: the body carries the identity (id, pid, unit,
+		// project+directory) as JSON and there is no signature — the request
+		// arrived through the daemon's own cloud-authenticated poll, like a
+		// configured action.
+		var params opParams
+		if len(body) > 0 {
+			var values map[string]any
+			if json.Unmarshal(body, &values) == nil {
+				params = nativeParamsFromValues(request.Name, values)
+			}
+		}
+		response, status, requestErr = r.ops.dispatch(ctx, request.Name, params, "relay", request.InvokedBy)
+	} else {
+		response, status = r.executor.ExecuteWebhook(request.Name, body, request.Signature, "relay", request.InvokedBy)
+	}
+	if requestErr != nil {
+		r.report(ctx, request.ID, relayResultPayload{Code: requestErr.status, Error: requestErr.message})
+		return
+	}
 	result := relayResultPayload{Code: status}
 	if response.OK {
 		result.Body = base64.StdEncoding.EncodeToString([]byte(response.Stdout))

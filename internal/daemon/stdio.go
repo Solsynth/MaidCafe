@@ -92,7 +92,33 @@ func (a *App) runStdio(ctx context.Context) error {
 				}
 				continue
 			}
-			switch strings.ToLower(strings.TrimSpace(request.Action)) {
+			action := strings.ToLower(strings.TrimSpace(request.Action))
+			// Native operations arrive as their slug (container.restart,
+			// process.kill, systemd.restart, compose.up) with the identity in
+			// the body; the transport is the SSH pipe, so no signature is
+			// needed, mirroring configured actions.
+			if isNativeOpSlug(action) {
+				body, err := stdioBody(request.Body)
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				go func(request stdioRequest, body []byte) {
+					var params opParams
+					if len(body) > 0 {
+						var values map[string]any
+						if json.Unmarshal(body, &values) == nil {
+							params = nativeParamsFromValues(action, values)
+						}
+					}
+					result, _, requestErr := a.ops.dispatch(ctx, action, params, "stdio", "stdio")
+					results <- stdioActionResult{request: request, result: result, err: requestErr}
+				}(request, body)
+				continue
+			}
+			switch action {
 			case "health":
 				if err := write(stdioResponse{Type: "response", ID: request.ID, OK: true, Result: map[string]any{
 					"id":        a.cfg.ID,
@@ -247,7 +273,7 @@ func (a *App) runStdio(ctx context.Context) error {
 			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
-				a.publisher.PublishActions(context.Background(), a.cfg.Actions)
+				a.publisher.PublishActions(context.Background(), append(nativeOpReport(), a.cfg.Actions...))
 			}
 			if err := write(stdioEvent{Type: "event", Event: "metrics", Data: metrics}); err != nil {
 				return err

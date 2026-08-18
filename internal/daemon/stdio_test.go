@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,4 +104,90 @@ func TestStdioActionProtocol(t *testing.T) {
 		t.Fatal("stdio daemon did not stop")
 	}
 
+}
+
+func TestStdioNativeOpProtocol(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	fakeCommand(t, "podman", "#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+out+"\n")
+	cfg := config.DaemonConfig{
+		ID:                "host-stdio",
+		Transport:         "stdio",
+		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Second,
+		Runtimes:          []string{"java", "dotnet", "python"},
+		ProcessesLimit:    50,
+		RequestTimeout:    time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+	}
+
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdin, originalStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinReader, stdoutWriter
+	defer func() {
+		os.Stdin, os.Stdout = originalStdin, originalStdout
+		_ = stdinReader.Close()
+		_ = stdinWriter.Close()
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+	}()
+
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- app.Run(ctx) }()
+
+	responses := bufio.NewScanner(stdoutReader)
+	if !responses.Scan() {
+		t.Fatalf("missing ready event: %v", responses.Err())
+	}
+
+	if _, err := fmt.Fprintln(stdinWriter, `{"type":"request","id":"1","action":"container.restart","body":{"id":"web"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if !responses.Scan() {
+		t.Fatalf("missing native op response: %v", responses.Err())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(responses.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ok"] != true {
+		t.Fatalf("native op failed: %#v", response)
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok || result["ok"] != true {
+		t.Fatalf("unexpected native op result: %#v", response)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "restart\nweb" {
+		t.Fatalf("recorded args %q, want %q", got, "restart\nweb")
+	}
+
+	if _, err := fmt.Fprintln(stdinWriter, `{"type":"request","id":"2","action":"shutdown"}`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-runErr:
+		if err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stdio daemon did not stop")
+	}
 }

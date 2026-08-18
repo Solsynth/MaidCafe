@@ -22,6 +22,7 @@ import (
 type App struct {
 	cfg             config.DaemonConfig
 	executor        *WebhookExecutor
+	ops             *nativeOpRunner
 	metrics         *MetricsCollector
 	publisher       *CloudPublisher
 	relay           *WebhookRelay
@@ -58,6 +59,11 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
 	runtimeProbe := &runtimeProbeState{}
+	ops := &nativeOpRunner{
+		executor:      executor,
+		runtimes:      probeContainerRuntimes,
+		scriptTimeout: cfg.ScriptTimeout,
+	}
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
 	historyDir := ""
 	if strings.TrimSpace(cfg.MetricsHistoryPath) != "" {
@@ -67,6 +73,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	app := &App{
 		cfg:             cfg,
 		executor:        executor,
+		ops:             ops,
 		metrics:         metrics,
 		publisher:       publisher,
 		hub:             NewStreamHub(),
@@ -80,7 +87,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		watched:         watchedStore,
 		logger:          logger,
 	}
-	app.relay = NewWebhookRelay(publisher, executor, logger)
+	app.relay = NewWebhookRelay(publisher, executor, ops, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		if publisher == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
 			return
@@ -358,6 +365,32 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		}
 		c.JSON(http.StatusOK, response)
 	})
+	// Native operations: typed container/systemd/compose/process mutations
+	// with the same authentication as actions (metrics secret + body
+	// signature). Targets are validated daemon-side; runtimes resolve through
+	// the shared probe with sudo -n retry, so no shell or scripts are
+	// involved.
+	router.POST("/api/v1/containers/:id/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		return "container." + c.Param("action"), opParams{target: c.Param("id")}
+	}, func(values map[string]any, p *opParams) {
+		if force, ok := values["force"].(bool); ok {
+			p.force = force
+		}
+	}))
+	router.POST("/api/v1/processes/:pid/kill", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		pid, _ := strconv.Atoi(c.Param("pid"))
+		return "process.kill", opParams{pid: pid}
+	}, nil))
+	router.POST("/api/v1/systemd/:unit/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		return "systemd." + c.Param("action"), opParams{target: c.Param("unit")}
+	}, nil))
+	router.POST("/api/v1/compose/:project/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		return "compose." + c.Param("action"), opParams{target: c.Param("project")}
+	}, func(values map[string]any, p *opParams) {
+		if directory, ok := values["directory"].(string); ok {
+			p.directory = directory
+		}
+	}))
 	router.GET("/api/v1/audit", authorizeMetrics, func(c *gin.Context) {
 		limit := 50
 		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
@@ -440,11 +473,64 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		Handler:           router,
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,
-		WriteTimeout:      cfg.RequestTimeout,
-		IdleTimeout:       cfg.RequestTimeout,
+		// No WriteTimeout: responses are small JSON written after the handler
+		// finishes, and executions are bounded by the executor's per-run
+		// timeout. A write deadline equal to RequestTimeout would kill every
+		// execution longer than that — configured actions, and native ops
+		// like compose pull — on the loopback HTTP path.
+		IdleTimeout: cfg.RequestTimeout,
 	}
 	return app, nil
 }
+
+// nativeOpHandler serves one native operation route. [identity] builds the
+// operation slug and path-derived params from the request; [decorate] merges
+// JSON body fields (e.g. `force` for container remove, `directory` for
+// compose) into the params. Authentication mirrors the actions route: the
+// metrics secret bearer plus a body signature.
+func (a *App) nativeOpHandler(
+	ops *nativeOpRunner,
+	identity func(c *gin.Context) (string, opParams),
+	decorate func(values map[string]any, p *opParams),
+) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, a.cfg.MaxBodyBytes+1))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+			return
+		}
+		if int64(len(body)) > a.cfg.MaxBodyBytes {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
+			return
+		}
+		if !signatureValid(a.cfg.MetricsSecret, body, c.GetHeader("X-MaidCafe-Signature")) {
+			c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "unauthorized"})
+			return
+		}
+		slug, params := identity(c)
+		if decorate != nil && len(body) > 0 {
+			var values map[string]any
+			if err := json.Unmarshal(body, &values); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid JSON body"})
+				return
+			}
+			decorate(values, &params)
+		}
+		response, status, requestErr := ops.dispatch(
+			c.Request.Context(),
+			slug,
+			params,
+			"http",
+			c.GetHeader("X-MaidCafe-Invoked-By"),
+		)
+		if requestErr != nil {
+			c.JSON(requestErr.status, gin.H{"ok": false, "error": requestErr.message})
+			return
+		}
+		c.JSON(status, response)
+	}
+}
+
 func (a *App) Start() error {
 	listener, err := net.Listen("tcp", a.cfg.Listen)
 	if err != nil {
@@ -498,7 +584,7 @@ func (a *App) Run(ctx context.Context) error {
 			metrics := a.metrics.Record()
 			if a.publisher != nil {
 				a.publisher.PublishMetrics(context.Background(), metrics)
-				a.publisher.PublishActions(context.Background(), a.cfg.Actions)
+				a.publisher.PublishActions(context.Background(), append(nativeOpReport(), a.cfg.Actions...))
 				now := time.Now()
 				for _, notification := range a.alarms.evaluate(a.cfg.Alarms, metrics, now) {
 					a.publisher.PublishNotification(context.Background(), notification)

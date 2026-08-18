@@ -85,7 +85,7 @@ func TestWebhookRelayExecutesAndReportsThroughCloud(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewWebhookRelay(publisher, executor, nil)
+	relay := NewWebhookRelay(publisher, executor, nil, nil)
 	relay.pollOnce(ctx)
 
 	got, err := os.ReadFile(output)
@@ -133,7 +133,7 @@ func TestWebhookRelayRejectsBadSignatureWithoutExecuting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewWebhookRelay(publisher, executor, nil)
+	relay := NewWebhookRelay(publisher, executor, nil, nil)
 	relay.pollOnce(ctx)
 
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
