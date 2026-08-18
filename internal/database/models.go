@@ -60,6 +60,17 @@ type DaemonAction struct {
 	UpdatedAt       time.Time
 }
 
+// DaemonLog is one bounded container log line uploaded by a daemon. Logs are
+// scoped to the daemon/workspace for retention and user-facing queries.
+type DaemonLog struct {
+	ID          string    `gorm:"type:char(36);primaryKey"`
+	DaemonID    string    `gorm:"size:191;index;not null"`
+	ContainerID string    `gorm:"size:128;index;not null"`
+	Timestamp   time.Time `gorm:"index;not null"`
+	ReceivedAt  time.Time `gorm:"index;not null"`
+	Line        string    `gorm:"type:text;not null"`
+}
+
 type Notification struct {
 	ID          string         `gorm:"type:char(36);primaryKey"`
 	AccountID   string         `gorm:"size:191;index;not null"`

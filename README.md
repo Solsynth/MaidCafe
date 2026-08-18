@@ -127,17 +127,19 @@ lets the user define those action presets.
 
 ### Optional cloud publishing from the daemon
 
-When both `daemon.cloudUrl` and `daemon.cloudSecret` are configured, the daemon:
-
 - Publishes metrics on every `metricsInterval` tick.
-- Publishes webhook success notifications when `notifyOnSuccess = true`.
-- Publishes webhook failure notifications when `notifyOnFailure = true`.
-- Uses `Authorization: Bearer <daemon-secret>`.
+- Publishes configured action metadata on every metrics tick.
+- When `logsUploadEnabled = true`, batches captured container log lines to
+  `POST /api/daemons/:id/logs`; failed uploads remain in a bounded daemon-local
+  buffer and workspace `metrics_retention_days` prunes cloud rows.
+- Publishes daemon-side log alert notifications through the same notification
+  pipeline as metric alarms.
 - Uses request deadlines and disables cross-host redirect following.
-- Drops failed publishing attempts without failing local webhook execution.
+- Drops failed publishing attempts without failing local execution.
 - Does not retain an unbounded retry queue.
 
-Cloud publishing is disabled when either setting is empty. HTTPS is required,
+Cloud publishing is disabled when either setting is empty. Log upload is
+separately opt-in even when cloud publishing is configured. HTTPS is required,
 except for HTTP development URLs using `localhost` or `127.0.0.1`.
 
 ## Cloud API
@@ -156,6 +158,7 @@ registered daemon secret instead; a daemon secret cannot access user routes.
 | `POST` | `/api/daemons/:id/rotate-secret` | Rotate the one-time secret |
 | `DELETE` | `/api/daemons/:id` | Disable daemon and delete its metrics |
 | `POST` | `/api/daemons/:id/metrics` | Ingest daemon metrics |
+| `POST` | `/api/daemons/:id/logs` | Ingest a bounded batch of container log lines |
 | `POST` | `/api/daemons/:id/notifications` | Create a daemon notification |
 
 Create a daemon inside a workspace you belong to:
@@ -171,10 +174,16 @@ The response contains `id`, `workspace_id`, `name`, and `secret`. Store the
 secret in the managed host configuration. It is not returned by list or read
 endpoints.
 
-### Notifications
+### Uploaded logs
 
 | Method | Route | Purpose |
 | --- | --- | --- |
+| `GET` | `/api/daemons/:id/logs?container_id=&limit=` | List uploaded logs for workspace members |
+
+Uploaded rows follow the workspace's `metrics_retention_days` quota and are
+bounded to 500 lines per request, with each line capped at 4096 bytes.
+
+### Notifications
 | `GET` | `/api/notifications?workspace_id=` | List workspace notifications |
 | `POST` | `/api/notifications/:id/read` | Mark a workspace notification read |
 
@@ -382,7 +391,30 @@ The daemon tails every running container on `daemon.logsInterval` (default
 - pushed to SSE `logs` subscribers as `{"container": "<id>", "lines":
   [{"ts": ..., "line": ...}]}` frames;
 - served by `GET /api/v1/containers/:id/logs?lines=N` (1–1000, default 200)
-  as the tail window, oldest first.
+  as the tail window, oldest first;
+- uploaded to the cloud only when `logsUploadEnabled = true`, batched every
+  `logsUploadInterval` (default `30s`) up to `logsUploadBatchLines` (default
+  100), through the daemon-secret endpoint `POST
+  /api/daemons/:id/logs`. Failed uploads remain queued in a bounded local
+  buffer and retry; old cloud rows follow the workspace
+  `metrics_retention_days` quota.
+
+Log alerts are daemon-side regex fragments under `daemon.logAlertsDir`
+(default `/etc/maidcafe/log-alerts`):
+
+```toml
+name = "errors"
+pattern = "(?i)\\berror\\b|\\bfail(ed|ure)?\\b"
+container = "web"       # omit to match every container
+title = "Web container error"
+cooldownSeconds = 300
+enabled = true
+```
+
+Each matching line publishes `daemon.log_alert` through the existing cloud
+notification pipeline. Alerts are local and regex-based; the raw line is
+included as the bounded notification body, with alert/container/timestamp
+metadata. Cooldowns are tracked independently per alert and container.
 
 ### Hot reload and the config API
 

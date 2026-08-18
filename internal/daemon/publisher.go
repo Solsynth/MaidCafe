@@ -259,6 +259,23 @@ func (p *CloudPublisher) PublishActions(ctx context.Context, actions []config.We
 	}
 	p.post(ctx, "/actions", payload)
 }
+
+// LogUploadEntry is one container log line sent to the cloud. Uploading is
+// opt-in at daemon config level because logs may contain sensitive data.
+type LogUploadEntry struct {
+	ContainerID string    `json:"container_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	Line        string    `json:"line"`
+}
+
+// PublishLogs uploads one bounded batch. The caller owns batching/retry so a
+// failed request can remain queued locally without being silently lost.
+func (p *CloudPublisher) PublishLogs(ctx context.Context, entries []LogUploadEntry) error {
+	if p == nil || len(entries) == 0 {
+		return nil
+	}
+	return p.request(ctx, http.MethodPost, "/logs", map[string]any{"entries": entries}, nil)
+}
 func (p *CloudPublisher) PublishNotification(ctx context.Context, payload notificationPayload) {
 	if p != nil {
 		p.post(ctx, "/notifications", payload)

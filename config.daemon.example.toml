@@ -18,8 +18,14 @@ jobsDir = "/etc/maidcafe/jobs"
 # Captured container logs (JSONL per container, rotated at 512 KiB, pruned by
 # metricsRetentionDays). 0 disables log tracking.
 logsDir = "/var/lib/maidcafe/logs"
-# Container log capture cadence. 0 disables the collector.
 logsInterval = "10s"
+# Upload is opt-in because logs may contain credentials or user data. The
+# daemon batches lines and sends them to POST /api/daemons/:id/logs.
+logsUploadEnabled = false
+logsUploadInterval = "30s"
+logsUploadBatchLines = 100
+# One <slug>.toml fragment per regex log alert.
+logAlertsDir = "/etc/maidcafe/log-alerts"
 
 # Alarm fragments can use cpu_percent, memory_used_percent, or
 # disk_used_percent with threshold (percentage). container_down accepts an
@@ -91,6 +97,14 @@ action = "backup"
 body = { job = "incremental" }
 enabled = true
 notifyOnFailure = true
+
+# Log alert fragment example (`/etc/maidcafe/log-alerts/errors.toml`):
+# name = "errors"
+# pattern = "(?i)\\berror\\b|\\bfail(ed|ure)?\\b"
+# container = "web"
+# title = "Web container error"
+# cooldownSeconds = 300
+# enabled = true
 
 [[daemon.jobs]]
 name = "hourly-container-restart"

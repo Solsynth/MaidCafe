@@ -36,6 +36,8 @@ type App struct {
 	runtimes        *RuntimesCollector
 	databaseMetrics *DatabaseMetricsCollector
 	logs            *LogsCollector
+	logAlerts       *logAlertEvaluator
+	logUpload       *logUploadBuffer
 	watched         *watchedProcessStore
 	jobs            *jobRunner
 	server          *http.Server
@@ -110,10 +112,13 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		runtimes:        &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
 		databaseMetrics: &DatabaseMetricsCollector{},
 		logs:            &LogsCollector{probe: runtimeProbe, store: logStore, logger: logger},
+		logAlerts:       newLogAlertEvaluator(),
+		logUpload:       newLogUploadBuffer(),
 		watched:         watchedStore,
 		jobs:            jobs,
 		logger:          logger,
 	}
+	app.logAlerts.SetAlerts(cfg.LogAlerts)
 	app.rt.Store(newReloadableConfig(cfg))
 	app.relay = NewWebhookRelay(publisherBox, executor, ops, logger)
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
@@ -842,15 +847,40 @@ func (a *App) runLogsCollector(ctx context.Context) {
 					a.logger.Debug("logs collector failed", "error", err)
 					continue
 				}
-				if len(collected) > 0 && a.hub.Subscribers("logs") > 0 {
+				if len(collected) > 0 {
+					pub := a.publish()
 					for id, lines := range collected {
-						frame, marshalErr := json.Marshal(logsFramePayload{Container: id, Lines: lines})
-						if marshalErr != nil {
+						for _, line := range lines {
+							for _, match := range a.logAlerts.Match(id, line) {
+								if pub == nil {
+									continue
+								}
+								body := strings.TrimSpace(match.Line.Line)
+								if len(body) > 4096 {
+									body = body[:4096]
+								}
+								pub.PublishNotification(ctx, notificationPayload{
+									Kind:  "daemon.log_alert",
+									Title: match.Title,
+									Body:  body,
+									Metadata: map[string]any{
+										"alert": match.Rule, "container": match.Container,
+										"timestamp": match.Line.TS,
+									},
+								})
+							}
+						}
+						a.logUpload.Add(id, lines)
+						if a.hub.Subscribers("logs") == 0 {
 							continue
 						}
-						a.hub.Broadcast("logs", frame)
+						frame, marshalErr := json.Marshal(logsFramePayload{Container: id, Lines: lines})
+						if marshalErr == nil {
+							a.hub.Broadcast("logs", frame)
+						}
 					}
 				}
+				a.logUpload.Flush(ctx, a.publish(), rt.logsUploadEnabled, rt.logsUploadInterval, rt.logsUploadBatchLines)
 			}
 		}
 	}()

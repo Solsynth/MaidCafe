@@ -290,8 +290,15 @@ func (s *Service) PruneMetrics(ctx context.Context) error {
 			s.logger.Warn("metric retention prune failed", "workspace_id", workspaceID, "error", res.Error)
 			continue
 		}
-		if res.RowsAffected > 0 {
-			s.logger.Info("pruned expired metrics", "workspace_id", workspaceID, "rows", res.RowsAffected)
+		logs := s.db.WithContext(ctx).
+			Where("daemon_id IN (SELECT id FROM daemons WHERE workspace_id = ?)", workspaceID).
+			Where("received_at < ?", cutoff).
+			Delete(&database.DaemonLog{})
+		if logs.Error != nil {
+			s.logger.Warn("log retention prune failed", "workspace_id", workspaceID, "error", logs.Error)
+		}
+		if res.RowsAffected > 0 || logs.RowsAffected > 0 {
+			s.logger.Info("pruned expired daemon data", "workspace_id", workspaceID, "metrics", res.RowsAffected, "logs", logs.RowsAffected)
 		}
 	}
 	return nil
@@ -403,6 +410,28 @@ type MetricInput struct {
 	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
+}
+
+// LogInput is one container log line uploaded by a daemon. The daemon
+// authenticates with its registered secret; the cloud stores only bounded
+// lines and timestamps.
+type LogInput struct {
+	ContainerID string    `json:"container_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	Line        string    `json:"line"`
+}
+
+type LogBatchInput struct {
+	Entries []LogInput `json:"entries"`
+}
+
+type LogView struct {
+	ID          string    `json:"id"`
+	DaemonID    string    `json:"daemon_id"`
+	ContainerID string    `json:"container_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	ReceivedAt  time.Time `json:"received_at"`
+	Line        string    `json:"line"`
 }
 type MetricView struct {
 	ID                 string    `json:"id"`
@@ -825,6 +854,72 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		}
 	}
 	return nil
+}
+
+// IngestLogs stores a bounded batch of daemon log lines. Uploads use the
+// daemon secret and are intentionally independent of metric poll pacing:
+// the daemon batches locally and the workspace retention quota bounds age.
+func (s *Service) IngestLogs(ctx context.Context, id, secret string, input LogBatchInput) error {
+	d, err := s.authenticateDaemon(ctx, id, secret)
+	if err != nil {
+		return ErrUnauthorized
+	}
+	if len(input.Entries) == 0 || len(input.Entries) > 500 {
+		return fmt.Errorf("entries must contain between 1 and 500 lines")
+	}
+	now := time.Now().UTC()
+	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	retentionDays := clampRetentionDays(quotas["metrics_retention_days"])
+	rows := make([]database.DaemonLog, 0, len(input.Entries))
+	for _, entry := range input.Entries {
+		entry.ContainerID = strings.TrimSpace(entry.ContainerID)
+		if entry.ContainerID == "" || len(entry.ContainerID) > 128 || !utf8.ValidString(entry.ContainerID) {
+			return fmt.Errorf("container_id exceeds bounds or is empty")
+		}
+		if entry.Timestamp.IsZero() {
+			return fmt.Errorf("timestamp is required")
+		}
+		if retentionDays > 0 && entry.Timestamp.Before(now.AddDate(0, 0, -retentionDays)) {
+			return fmt.Errorf("log outside retention window")
+		}
+		if len(entry.Line) == 0 || len(entry.Line) > 4096 || !utf8.ValidString(entry.Line) {
+			return fmt.Errorf("line exceeds bounds or is empty")
+		}
+		rows = append(rows, database.DaemonLog{
+			ID: uuid.NewString(), DaemonID: d.ID, ContainerID: entry.ContainerID,
+			Timestamp: entry.Timestamp.UTC(), ReceivedAt: now, Line: entry.Line,
+		})
+	}
+	return s.db.WithContext(ctx).Create(&rows).Error
+}
+
+// ListLogs returns recent uploaded log lines to workspace members.
+func (s *Service) ListLogs(ctx context.Context, accountID, daemonID, containerID string, limit int, before *time.Time) ([]LogView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := s.db.WithContext(ctx).Where("daemon_id = ?", daemonID)
+	if containerID = strings.TrimSpace(containerID); containerID != "" {
+		query = query.Where("container_id = ?", containerID)
+	}
+	if before != nil {
+		query = query.Where("timestamp < ?", before.UTC())
+	}
+	var rows []database.DaemonLog
+	if err := query.Order("timestamp desc").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]LogView, len(rows))
+	for i, row := range rows {
+		out[i] = LogView{ID: row.ID, DaemonID: row.DaemonID, ContainerID: row.ContainerID, Timestamp: row.Timestamp, ReceivedAt: row.ReceivedAt, Line: row.Line}
+	}
+	return out, nil
 }
 
 const (

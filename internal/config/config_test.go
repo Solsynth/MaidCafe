@@ -819,3 +819,21 @@ jobsDir = "`+filepath.ToSlash(dir)+`"
 		t.Fatalf("job body pid has unexpected type %T: %+v", pid, cfg.Daemon.Jobs[0].Body)
 	}
 }
+
+func TestDaemonValidatesLogAlerts(t *testing.T) {
+	base := DaemonConfig{ID: "host-1", Transport: "stdio", MetricsInterval: time.Minute, StreamInterval: time.Second, Runtimes: []string{"java"}, ProcessesLimit: 50, RequestTimeout: time.Second, ScriptTimeout: time.Second, MaxBodyBytes: 1024, MaxConcurrentRuns: 1, LogsUploadBatchLines: 100}
+	enabled := true
+	cfg := Config{Daemon: base}
+	cfg.Daemon.LogAlerts = []LogAlertConfig{{Name: "errors", Pattern: `(?i)error|fail`, Enabled: &enabled}}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Daemon.LogAlerts[0].CooldownSeconds != 300 {
+		t.Fatalf("default cooldown = %d", cfg.Daemon.LogAlerts[0].CooldownSeconds)
+	}
+	bad := cfg
+	bad.Daemon.LogAlerts = []LogAlertConfig{{Name: "bad", Pattern: "["}}
+	if err := bad.ValidateDaemon(); err == nil {
+		t.Fatal("invalid log regex accepted")
+	}
+}

@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
 
 // Container log tracking: every running container is tailed incrementally
@@ -45,6 +48,125 @@ type containerLogLine struct {
 type logsFramePayload struct {
 	Container string             `json:"container"`
 	Lines     []containerLogLine `json:"lines"`
+}
+
+type logAlertRule struct {
+	name      string
+	pattern   *regexp.Regexp
+	container string
+	title     string
+	cooldown  time.Duration
+}
+
+type logAlertEvaluator struct {
+	mu    sync.Mutex
+	rules []logAlertRule
+	last  map[string]time.Time
+}
+
+func newLogAlertEvaluator() *logAlertEvaluator {
+	return &logAlertEvaluator{last: map[string]time.Time{}}
+}
+
+func (e *logAlertEvaluator) SetAlerts(alerts []config.LogAlertConfig) {
+	rules := make([]logAlertRule, 0, len(alerts))
+	for _, alert := range alerts {
+		if alert.Enabled != nil && !*alert.Enabled {
+			continue
+		}
+		pattern, err := regexp.Compile(alert.Pattern)
+		if err != nil {
+			continue
+		}
+		cooldown := time.Duration(alert.CooldownSeconds) * time.Second
+		if cooldown <= 0 {
+			cooldown = 5 * time.Minute
+		}
+		rules = append(rules, logAlertRule{
+			name: alert.Name, pattern: pattern, container: alert.Container,
+			title: alert.Title, cooldown: cooldown,
+		})
+	}
+	e.mu.Lock()
+	e.rules = rules
+	e.mu.Unlock()
+}
+
+type logAlertMatch struct {
+	Rule      string
+	Title     string
+	Container string
+	Line      containerLogLine
+}
+
+func (e *logAlertEvaluator) Match(container string, line containerLogLine) []logAlertMatch {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := time.Now()
+	matches := make([]logAlertMatch, 0)
+	for _, rule := range e.rules {
+		if rule.container != "" && rule.container != container {
+			continue
+		}
+		if !rule.pattern.MatchString(line.Line) {
+			continue
+		}
+		key := rule.name + "\x00" + container
+		if previous, ok := e.last[key]; ok && now.Sub(previous) < rule.cooldown {
+			continue
+		}
+		e.last[key] = now
+		matches = append(matches, logAlertMatch{Rule: rule.name, Title: rule.title, Container: container, Line: line})
+	}
+	return matches
+}
+
+type logUploadBuffer struct {
+	mu      sync.Mutex
+	pending []LogUploadEntry
+	lastTry time.Time
+}
+
+func newLogUploadBuffer() *logUploadBuffer {
+	return &logUploadBuffer{}
+}
+
+func (b *logUploadBuffer) Add(container string, lines []containerLogLine) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, line := range lines {
+		b.pending = append(b.pending, LogUploadEntry{ContainerID: container, Timestamp: line.TS, Line: line.Line})
+	}
+	if len(b.pending) > 5000 {
+		b.pending = b.pending[len(b.pending)-5000:]
+	}
+}
+
+func (b *logUploadBuffer) Flush(ctx context.Context, publisher *CloudPublisher, enabled bool, interval time.Duration, maxLines int) {
+	if !enabled || publisher == nil || maxLines <= 0 {
+		return
+	}
+	b.mu.Lock()
+	now := time.Now()
+	if len(b.pending) == 0 || (!b.lastTry.IsZero() && now.Sub(b.lastTry) < interval) {
+		b.mu.Unlock()
+		return
+	}
+	b.lastTry = now
+	count := maxLines
+	if count > len(b.pending) {
+		count = len(b.pending)
+	}
+	batch := append([]LogUploadEntry(nil), b.pending[:count]...)
+	b.mu.Unlock()
+	if err := publisher.PublishLogs(ctx, batch); err != nil {
+		return
+	}
+	b.mu.Lock()
+	if len(b.pending) >= count {
+		b.pending = b.pending[count:]
+	}
+	b.mu.Unlock()
 }
 
 type containerLogTail struct {

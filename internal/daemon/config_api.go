@@ -115,6 +115,18 @@ var patchSecretRule = patchRule{
 	},
 }
 
+var patchBoolRule = patchRule{
+	validate: func(value any) error {
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("must be boolean")
+		}
+		return nil
+	},
+	toml: func(value any) (string, error) {
+		return strconv.FormatBool(value.(bool)), nil
+	},
+}
+
 // patchableDaemonKeys maps a PATCH key to its rule.
 var patchableDaemonKeys = map[string]patchRule{
 	"metricsInterval":         patchDurationRule,
@@ -126,10 +138,13 @@ var patchableDaemonKeys = map[string]patchRule{
 	"runtimesInterval":        patchDurationRule,
 	"databaseMetricsInterval": patchDurationRule,
 	"logsInterval":            patchDurationRule,
+	"logsUploadInterval":      patchDurationRule,
 	"scriptTimeout":           patchDurationRule,
 	"processesLimit":          patchIntRule(1, 500),
 	"maxBodyBytes":            patchIntRule(1, 1<<30),
 	"maxConcurrentRuns":       patchIntRule(1, 256),
+	"logsUploadBatchLines":    patchIntRule(1, 500),
+	"logsUploadEnabled":       patchBoolRule,
 	"runtimes":                patchStringListRule,
 	"watchedProcesses":        patchStringListRule,
 	"cloudUrl":                patchCloudURLRule,
@@ -176,6 +191,10 @@ type redactedConfigView struct {
 	AlarmsDir            string   `json:"alarms_dir"`
 	JobsDir              string   `json:"jobs_dir"`
 	LogsDir              string   `json:"logs_dir"`
+	LogAlertsDir         string   `json:"log_alerts_dir"`
+	LogsUploadEnabled    bool     `json:"logs_upload_enabled"`
+	LogsUploadInterval   string   `json:"logs_upload_interval"`
+	LogsUploadBatchLines int      `json:"logs_upload_batch_lines"`
 	MetricsInterval      string   `json:"metrics_interval"`
 	StreamInterval       string   `json:"stream_interval"`
 	ContainersInterval   string   `json:"containers_interval"`
@@ -199,14 +218,14 @@ func newRedactedConfigView(cfg config.DaemonConfig) redactedConfigView {
 		Version:              cfg.Version,
 		Transport:            cfg.Transport,
 		Listen:               cfg.Listen,
-		CloudURL:             cfg.CloudURL,
-		MetricsHistoryPath:   cfg.MetricsHistoryPath,
-		MetricsRetentionDays: cfg.MetricsRetentionDays,
-		AuditPath:            cfg.AuditPath,
 		ActionsDir:           cfg.ActionsDir,
 		AlarmsDir:            cfg.AlarmsDir,
 		JobsDir:              cfg.JobsDir,
 		LogsDir:              cfg.LogsDir,
+		LogAlertsDir:         cfg.LogAlertsDir,
+		LogsUploadEnabled:    cfg.LogsUploadEnabled,
+		LogsUploadInterval:   cfg.LogsUploadInterval.String(),
+		LogsUploadBatchLines: cfg.LogsUploadBatchLines,
 		MetricsInterval:      cfg.MetricsInterval.String(),
 		StreamInterval:       cfg.StreamInterval.String(),
 		ContainersInterval:   cfg.ContainersInterval.String(),

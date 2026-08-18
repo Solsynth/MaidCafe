@@ -100,9 +100,16 @@ type DaemonConfig struct {
 	// file per container, rotated at 1 MiB with one generation, pruned by
 	// metricsRetentionDays). Empty disables disk persistence but keeps the
 	// in-memory tail.
-	LogsDir                 string        `mapstructure:"logsDir"`
-	CloudURL                string        `mapstructure:"cloudUrl"`
-	CloudSecret             string        `mapstructure:"cloudSecret"`
+	LogsDir string `mapstructure:"logsDir"`
+	// LogAlertsDir holds one `<slug>.toml` fragment per regex log alert.
+	LogAlertsDir string `mapstructure:"logAlertsDir"`
+	CloudURL     string `mapstructure:"cloudUrl"`
+	CloudSecret  string `mapstructure:"cloudSecret"`
+	// LogsUploadEnabled opts the daemon into outbound log upload. It is
+	// deliberately false by default because logs may contain secrets.
+	LogsUploadEnabled       bool          `mapstructure:"logsUploadEnabled"`
+	LogsUploadInterval      time.Duration `mapstructure:"logsUploadInterval"`
+	LogsUploadBatchLines    int           `mapstructure:"logsUploadBatchLines"`
 	MetricsInterval         time.Duration `mapstructure:"metricsInterval"`
 	StreamInterval          time.Duration `mapstructure:"streamInterval"`
 	ContainersInterval      time.Duration `mapstructure:"containersInterval"`
@@ -122,17 +129,31 @@ type DaemonConfig struct {
 	// WatchedProcesses seeds the daemon-side watched-process list; dynamic
 	// additions and removals via the API are persisted to
 	// WatchedProcessesFile (authoritative once it exists).
-	WatchedProcesses     []string        `mapstructure:"watchedProcesses"`
-	WatchedProcessesFile string          `mapstructure:"watchedProcessesFile"`
-	ProcessesLimit       int             `mapstructure:"processesLimit"`
-	RequestTimeout       time.Duration   `mapstructure:"requestTimeout"`
-	ScriptTimeout        time.Duration   `mapstructure:"scriptTimeout"`
-	MaxBodyBytes         int64           `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns    int             `mapstructure:"maxConcurrentRuns"`
-	Webhooks             []WebhookConfig `mapstructure:"webhooks"`
-	Actions              []WebhookConfig `mapstructure:"actions"`
-	Alarms               []AlarmConfig   `mapstructure:"alarms"`
-	Jobs                 []JobConfig     `mapstructure:"jobs"`
+	WatchedProcesses     []string         `mapstructure:"watchedProcesses"`
+	WatchedProcessesFile string           `mapstructure:"watchedProcessesFile"`
+	ProcessesLimit       int              `mapstructure:"processesLimit"`
+	RequestTimeout       time.Duration    `mapstructure:"requestTimeout"`
+	ScriptTimeout        time.Duration    `mapstructure:"scriptTimeout"`
+	MaxBodyBytes         int64            `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns    int              `mapstructure:"maxConcurrentRuns"`
+	Webhooks             []WebhookConfig  `mapstructure:"webhooks"`
+	Actions              []WebhookConfig  `mapstructure:"actions"`
+	Alarms               []AlarmConfig    `mapstructure:"alarms"`
+	Jobs                 []JobConfig      `mapstructure:"jobs"`
+	LogAlerts            []LogAlertConfig `mapstructure:"logAlerts"`
+}
+
+// LogAlertConfig declares one daemon-side regex alert. A matching new log
+// line produces a cloud notification through the existing notification
+// publisher, subject to the cooldown. An empty Container matches all
+// containers.
+type LogAlertConfig struct {
+	Name            string `mapstructure:"name"`
+	Pattern         string `mapstructure:"pattern"`
+	Container       string `mapstructure:"container"`
+	Title           string `mapstructure:"title"`
+	Enabled         *bool  `mapstructure:"enabled"`
+	CooldownSeconds int    `mapstructure:"cooldownSeconds"`
 }
 
 // AlarmConfig declares one metric threshold the daemon evaluates against its
@@ -308,6 +329,11 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("workspace.useTLS", true)
 	viper.SetDefault("workspace.tlsSkipVerify", false)
 	viper.SetDefault("eventbus.url", "")
+	viper.SetDefault("daemon.logAlertsDir", "/etc/maidcafe/log-alerts")
+	viper.SetDefault("daemon.logsUploadEnabled", false)
+	viper.SetDefault("daemon.logsUploadInterval", 30*time.Second)
+	viper.SetDefault("daemon.logsUploadBatchLines", 100)
+
 	viper.SetDefault("eventbus.subjectPrefix", "")
 	viper.SetDefault("ring.target", "")
 	viper.SetDefault("ring.useTLS", false)
@@ -331,15 +357,15 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.processesInterval", 10*time.Second)
 	viper.SetDefault("daemon.systemdInterval", 30*time.Second)
 	viper.SetDefault("daemon.runtimesInterval", 10*time.Second)
-	viper.SetDefault("cloud.daemonDisconnectAfter", 5*time.Minute)
-	viper.SetDefault("cloud.daemonDisconnectNotificationCooldown", 30*time.Minute)
-	viper.SetDefault("cloud.alarmCheckInterval", time.Minute)
 	viper.SetDefault("daemon.databaseMetricsInterval", 10*time.Second)
 	viper.SetDefault("daemon.runtimes", []string{"java", "dotnet", "python", "node", "deno", "go", "ruby", "php"})
 	viper.SetDefault("daemon.watchedProcesses", []string{})
 	viper.SetDefault("daemon.watchedProcessesFile", "/var/lib/maidcafe/watched-processes.json")
 	viper.SetDefault("daemon.processesLimit", 50)
 	viper.SetDefault("daemon.requestTimeout", 10*time.Second)
+	viper.SetDefault("cloud.daemonDisconnectAfter", 5*time.Minute)
+	viper.SetDefault("cloud.daemonDisconnectNotificationCooldown", 30*time.Minute)
+	viper.SetDefault("cloud.alarmCheckInterval", time.Minute)
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
@@ -353,6 +379,9 @@ func Load(configPath string) (*Config, error) {
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+	if err := cfg.loadLogAlertFragments(); err != nil {
+		return nil, err
 	}
 	if err := cfg.loadActionFragments(); err != nil {
 		return nil, err
@@ -582,6 +611,66 @@ func loadJobFragment(path string) (JobConfig, error) {
 	return job, nil
 }
 
+// loadLogAlertFragments merges one regex alert per `<slug>.toml` under
+// daemon.logAlertsDir. Fragment definitions override inline alerts with the
+// same name.
+func (c *Config) loadLogAlertFragments() error {
+	dir := strings.TrimSpace(c.Daemon.LogAlertsDir)
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read log alerts dir %s: %w", dir, err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".toml") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	fragments := make([]LogAlertConfig, 0, len(paths))
+	names := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		alert, err := loadLogAlertFragment(path)
+		if err != nil {
+			return err
+		}
+		names[alert.Name] = struct{}{}
+		fragments = append(fragments, alert)
+	}
+	inline := c.Daemon.LogAlerts
+	c.Daemon.LogAlerts = make([]LogAlertConfig, 0, len(inline)+len(fragments))
+	for _, alert := range inline {
+		if _, covered := names[alert.Name]; !covered {
+			c.Daemon.LogAlerts = append(c.Daemon.LogAlerts, alert)
+		}
+	}
+	c.Daemon.LogAlerts = append(c.Daemon.LogAlerts, fragments...)
+	return nil
+}
+
+func loadLogAlertFragment(path string) (LogAlertConfig, error) {
+	v := viper.New()
+	v.SetConfigType("toml")
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return LogAlertConfig{}, fmt.Errorf("read log alert fragment %s: %w", path, err)
+	}
+	var alert LogAlertConfig
+	if err := v.Unmarshal(&alert); err != nil {
+		return LogAlertConfig{}, fmt.Errorf("parse log alert fragment %s: %w", path, err)
+	}
+	if strings.TrimSpace(alert.Name) == "" {
+		return LogAlertConfig{}, fmt.Errorf("log alert fragment %s has no name", path)
+	}
+	return alert, nil
+}
+
 func applyEnvAliases() {
 	aliases := map[string]string{
 		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
@@ -590,16 +679,20 @@ func applyEnvAliases() {
 		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
 		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_DAEMON_DISCONNECT_NOTIFICATION_COOLDOWN": "cloud.daemonDisconnectNotificationCooldown", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
 		"DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
-		"DAEMON_METRICS_SECRET":         "daemon.metricsSecret",
-		"DAEMON_METRICS_HISTORY_PATH":   "daemon.metricsHistoryPath",
-		"DAEMON_METRICS_RETENTION_DAYS": "daemon.metricsRetentionDays",
-		"DAEMON_AUDIT_PATH":             "daemon.auditPath",
-		"DAEMON_ACTIONS_DIR":            "daemon.actionsDir",
-		"DAEMON_ALARMS_DIR":             "daemon.alarmsDir",
-		"DAEMON_JOBS_DIR":               "daemon.jobsDir",
-		"DAEMON_LOGS_DIR":               "daemon.logsDir",
-		"DAEMON_LOGS_INTERVAL":          "daemon.logsInterval",
-		"DAEMON_CLOUD_URL":              "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
+		"DAEMON_METRICS_SECRET":          "daemon.metricsSecret",
+		"DAEMON_METRICS_HISTORY_PATH":    "daemon.metricsHistoryPath",
+		"DAEMON_METRICS_RETENTION_DAYS":  "daemon.metricsRetentionDays",
+		"DAEMON_AUDIT_PATH":              "daemon.auditPath",
+		"DAEMON_ACTIONS_DIR":             "daemon.actionsDir",
+		"DAEMON_ALARMS_DIR":              "daemon.alarmsDir",
+		"DAEMON_JOBS_DIR":                "daemon.jobsDir",
+		"DAEMON_LOG_ALERTS_DIR":          "daemon.logAlertsDir",
+		"DAEMON_LOGS_DIR":                "daemon.logsDir",
+		"DAEMON_LOGS_INTERVAL":           "daemon.logsInterval",
+		"DAEMON_LOGS_UPLOAD_ENABLED":     "daemon.logsUploadEnabled",
+		"DAEMON_LOGS_UPLOAD_INTERVAL":    "daemon.logsUploadInterval",
+		"DAEMON_LOGS_UPLOAD_BATCH_LINES": "daemon.logsUploadBatchLines",
+		"DAEMON_CLOUD_URL":               "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
 		"DAEMON_SYSTEMD_INTERVAL": "daemon.systemdInterval", "DAEMON_DATABASE_METRICS_INTERVAL": "daemon.databaseMetricsInterval", "DAEMON_PROCESSES_LIMIT": "daemon.processesLimit",
@@ -769,6 +862,55 @@ func (c *Config) ValidateDaemon() error {
 		}
 		if err := validateHookExecution(action, "actions", i); err != nil {
 			return err
+		}
+	}
+	if c.Daemon.LogsUploadInterval < 0 {
+		return fmt.Errorf("daemon.logsUploadInterval must not be negative")
+	}
+	if c.Daemon.LogsUploadBatchLines <= 0 {
+		c.Daemon.LogsUploadBatchLines = 100
+	}
+	if c.Daemon.LogsUploadBatchLines > 500 {
+		return fmt.Errorf("daemon.logsUploadBatchLines must be between 1 and 500")
+	}
+	if c.Daemon.LogsUploadEnabled && c.Daemon.LogsUploadInterval <= 0 {
+		return fmt.Errorf("daemon.logsUploadInterval must be positive when logsUploadEnabled is true")
+	}
+	if c.Daemon.MaxBodyBytes <= 0 {
+		return fmt.Errorf("daemon.maxBodyBytes must be positive")
+	}
+	if c.Daemon.MaxConcurrentRuns <= 0 {
+		return fmt.Errorf("daemon.maxConcurrentRuns must be positive")
+	}
+	logAlertNames := make(map[string]struct{}, len(c.Daemon.LogAlerts))
+	for i := range c.Daemon.LogAlerts {
+		alert := &c.Daemon.LogAlerts[i]
+		alert.Name = strings.TrimSpace(alert.Name)
+		alert.Pattern = strings.TrimSpace(alert.Pattern)
+		alert.Container = strings.TrimSpace(alert.Container)
+		alert.Title = strings.TrimSpace(alert.Title)
+		if alert.Name == "" || !webhookNamePattern.MatchString(alert.Name) {
+			return fmt.Errorf("daemon.logAlerts[%d].name must match [A-Za-z0-9._-]+", i)
+		}
+		if _, ok := logAlertNames[alert.Name]; ok {
+			return fmt.Errorf("daemon.logAlerts[%d].name %q is duplicated", i, alert.Name)
+		}
+		logAlertNames[alert.Name] = struct{}{}
+		if alert.Pattern == "" {
+			return fmt.Errorf("daemon.logAlerts[%d].pattern is required", i)
+		}
+		if _, err := regexp.Compile(alert.Pattern); err != nil {
+			return fmt.Errorf("daemon.logAlerts[%d].pattern is invalid: %w", i, err)
+		}
+		if alert.CooldownSeconds <= 0 {
+			alert.CooldownSeconds = 300
+		}
+		if alert.Enabled == nil {
+			enabled := true
+			alert.Enabled = &enabled
+		}
+		if alert.Title == "" {
+			alert.Title = "Container log alert: " + alert.Name
 		}
 	}
 	jobNames := make(map[string]struct{}, len(c.Daemon.Jobs))

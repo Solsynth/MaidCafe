@@ -921,3 +921,33 @@ func TestCredentialLifecycleAndScopes(t *testing.T) {
 		t.Fatalf("cross-account credential delete accepted")
 	}
 }
+
+func TestIngestAndListLogs(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "metrics_retention_days": 7}}
+	ctx := context.Background()
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "logs-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := svc.IngestLogs(ctx, created.ID, created.Secret, LogBatchInput{Entries: []LogInput{{
+		ContainerID: "web", Timestamp: now, Line: "ERROR failed to connect",
+	}, {ContainerID: "web", Timestamp: now.Add(time.Second), Line: "retrying"}}}); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := svc.ListLogs(ctx, "account-a", created.ID, "web", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 || logs[0].Line != "retrying" || logs[1].Line != "ERROR failed to connect" {
+		t.Fatalf("unexpected logs: %+v", logs)
+	}
+	if err := svc.IngestLogs(ctx, created.ID, "wrong", LogBatchInput{Entries: []LogInput{{ContainerID: "web", Timestamp: now, Line: "x"}}}); err != ErrUnauthorized {
+		t.Fatalf("wrong secret accepted: %v", err)
+	}
+	if err := svc.IngestLogs(ctx, created.ID, created.Secret, LogBatchInput{Entries: []LogInput{{ContainerID: "web", Timestamp: now, Line: ""}}}); err == nil {
+		t.Fatal("empty log line accepted")
+	}
+}

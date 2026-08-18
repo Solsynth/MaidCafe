@@ -19,19 +19,23 @@ import (
 // metrics secret, collector storage directories) is restart-required: the
 // components that own them are constructed once.
 type reloadableConfig struct {
-	actions           []config.WebhookConfig
-	alarms            []config.AlarmConfig
-	jobs              []config.JobConfig
-	runtimes          []string
-	watchedProcesses  []string
-	processesLimit    int
-	scriptTimeout     time.Duration
-	maxBodyBytes      int64
-	maxConcurrentRuns int
-	cloudURL          string
-	cloudSecret       string
-	version           string
-	intervals         reloadableIntervals
+	actions              []config.WebhookConfig
+	alarms               []config.AlarmConfig
+	jobs                 []config.JobConfig
+	logAlerts            []config.LogAlertConfig
+	runtimes             []string
+	watchedProcesses     []string
+	processesLimit       int
+	scriptTimeout        time.Duration
+	maxBodyBytes         int64
+	maxConcurrentRuns    int
+	cloudURL             string
+	cloudSecret          string
+	logsUploadEnabled    bool
+	logsUploadInterval   time.Duration
+	logsUploadBatchLines int
+	version              string
+	intervals            reloadableIntervals
 }
 
 type reloadableIntervals struct {
@@ -47,19 +51,27 @@ type reloadableIntervals struct {
 }
 
 func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
+	batchLines := cfg.LogsUploadBatchLines
+	if batchLines <= 0 {
+		batchLines = 100
+	}
 	return &reloadableConfig{
-		actions:           cfg.Actions,
-		alarms:            cfg.Alarms,
-		jobs:              cfg.Jobs,
-		runtimes:          cfg.Runtimes,
-		watchedProcesses:  cfg.WatchedProcesses,
-		processesLimit:    cfg.ProcessesLimit,
-		scriptTimeout:     cfg.ScriptTimeout,
-		maxBodyBytes:      cfg.MaxBodyBytes,
-		maxConcurrentRuns: cfg.MaxConcurrentRuns,
-		cloudURL:          cfg.CloudURL,
-		cloudSecret:       cfg.CloudSecret,
-		version:           cfg.Version,
+		actions:              cfg.Actions,
+		alarms:               cfg.Alarms,
+		jobs:                 cfg.Jobs,
+		logAlerts:            cfg.LogAlerts,
+		runtimes:             cfg.Runtimes,
+		watchedProcesses:     cfg.WatchedProcesses,
+		processesLimit:       cfg.ProcessesLimit,
+		scriptTimeout:        cfg.ScriptTimeout,
+		maxBodyBytes:         cfg.MaxBodyBytes,
+		maxConcurrentRuns:    cfg.MaxConcurrentRuns,
+		cloudURL:             cfg.CloudURL,
+		cloudSecret:          cfg.CloudSecret,
+		logsUploadEnabled:    cfg.LogsUploadEnabled,
+		logsUploadInterval:   cfg.LogsUploadInterval,
+		logsUploadBatchLines: batchLines,
+		version:              cfg.Version,
 		intervals: reloadableIntervals{
 			metrics:    cfg.MetricsInterval,
 			stream:     cfg.StreamInterval,
@@ -115,7 +127,9 @@ func (a *App) applyReload(cfg config.DaemonConfig) {
 	a.runtimes.SetLimit(cfg.ProcessesLimit)
 	a.watched.Reseed(cfg.WatchedProcesses)
 	a.jobs.SetJobs(cfg.Jobs)
-	// Cloud publishing: swap the URL/secret on the live publisher, or bring
+	if a.logAlerts != nil {
+		a.logAlerts.SetAlerts(cfg.LogAlerts)
+	}
 	// one up when cloud configuration appeared on a host that had none.
 	rt := newReloadableConfig(cfg)
 	if pub := a.publish(); pub != nil {
@@ -137,11 +151,11 @@ func (a *App) applyReload(cfg config.DaemonConfig) {
 // burst of writes coalesces into one reload. Returns after the watcher is
 // torn down (on ctx cancellation or a watch error).
 func (a *App) watchConfig(ctx context.Context) {
-	dirs := make([]string, 0, 4)
+	dirs := make([]string, 0, 5)
 	if p := filepath.Dir(a.configPath); p != "" {
 		dirs = append(dirs, p)
 	}
-	for _, dir := range []string{a.cfg.ActionsDir, a.cfg.AlarmsDir, a.cfg.JobsDir} {
+	for _, dir := range []string{a.cfg.ActionsDir, a.cfg.AlarmsDir, a.cfg.JobsDir, a.cfg.LogAlertsDir} {
 		if dir != "" {
 			dirs = append(dirs, dir)
 		}

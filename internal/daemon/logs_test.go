@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 )
 
 func TestParseLogLines(t *testing.T) {
@@ -145,5 +147,24 @@ func TestLogsCollectorSkipsStoppedContainers(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(out); len(data) != 0 {
 		t.Fatalf("logs command should not run for stopped containers: %q", data)
+	}
+}
+
+func TestLogAlertEvaluatorMatchesAndHonorsCooldown(t *testing.T) {
+	evaluator := newLogAlertEvaluator()
+	enabled := true
+	evaluator.SetAlerts([]config.LogAlertConfig{{
+		Name: "errors", Pattern: `(?i)error|fail`, Title: "Application error",
+		CooldownSeconds: 300, Enabled: &enabled,
+	}})
+	line := containerLogLine{TS: time.Now(), Line: "ERROR failed request"}
+	if got := evaluator.Match("web", line); len(got) != 1 || got[0].Rule != "errors" {
+		t.Fatalf("first match = %+v", got)
+	}
+	if got := evaluator.Match("web", line); len(got) != 0 {
+		t.Fatalf("cooldown ignored: %+v", got)
+	}
+	if got := evaluator.Match("worker", line); len(got) != 1 {
+		t.Fatalf("cooldown should be per container: %+v", got)
 	}
 }
