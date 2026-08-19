@@ -184,6 +184,50 @@ func TestNotificationPreferencesControlHistoryAndPush(t *testing.T) {
 		t.Fatalf("preference list: %v %#v", err, preferences)
 	}
 }
+func TestReconnectedNotificationHonorsRejectPreference(t *testing.T) {
+	svc, db, publisher, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetNotificationPreference(
+		ctx,
+		"account-a",
+		"ws-a",
+		daemon.ID,
+		"daemon.reconnected",
+		int(NotificationPreferenceReject),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	disconnectedAt := time.Now().UTC().Add(-time.Minute)
+	if err := db.Model(&database.Daemon{}).Where("id = ?", daemon.ID).Updates(map[string]any{
+		"disconnected_at": disconnectedAt,
+		"last_seen_at":    disconnectedAt.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{
+		SentAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(publisher.events) != 0 {
+		t.Fatalf("reconnected notification was pushed: %#v", publisher.events)
+	}
+	history, err := svc.ListNotifications(ctx, "account-a", "ws-a", false, "", 50, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("reconnected notification was stored: %#v", history)
+	}
+}
+
 func TestBatchNotificationPreferencesForDaemon(t *testing.T) {
 	svc, db, _, _ := testService(t)
 	defer db.Close()

@@ -840,6 +840,13 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		if err != nil {
 			return err
 		}
+		preference, err := s.notificationPreference(ctx, d.AccountID, d.WorkspaceID, d.ID, "daemon.reconnected")
+		if err != nil {
+			return err
+		}
+		if preference == NotificationPreferenceReject {
+			return nil
+		}
 		title, body := s.localizedAlarm(ctx, d.AccountID, "daemon.reconnected", "Daemon reconnected", body, encoded)
 		notification := database.Notification{
 			ID: uuid.NewString(), AccountID: d.AccountID, WorkspaceID: d.WorkspaceID,
@@ -849,9 +856,12 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		if err := s.db.WithContext(ctx).Create(&notification).Error; err != nil {
 			return err
 		}
-		if err := s.publishNotification(ctx, d, notification); err != nil {
-			return err
+		if preference == NotificationPreferenceNormal {
+			if err := s.publishNotification(ctx, d, notification); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 	return nil
 }
