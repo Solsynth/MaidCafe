@@ -92,6 +92,21 @@ func TestCloudHealthAndCredentialBoundary(t *testing.T) {
 	if got.Code != http.StatusNoContent {
 		t.Fatalf("daemon metric route %d %s", got.Code, got.Body)
 	}
+	actions := httptest.NewRequest(
+		http.MethodPost,
+		"/api/daemons/"+daemon.ID+"/actions",
+		strings.NewReader(`[{"name":"backup","display_name":"Backup","enabled":true}]`),
+	)
+	actions.Header.Set("Authorization", "Bearer "+daemon.Secret)
+	got = httptest.NewRecorder()
+	router.ServeHTTP(got, actions)
+	if got.Code != http.StatusNoContent {
+		t.Fatalf("daemon action sync route %d %s", got.Code, got.Body)
+	}
+	listed, err := svc.ListActions(context.Background(), "account-a", daemon.ID)
+	if err != nil || len(listed) != 1 || listed[0].Name != "backup" {
+		t.Fatalf("synced daemon actions = %#v, err = %v", listed, err)
+	}
 }
 
 func TestWorkspaceQuotaUserRoute(t *testing.T) {
