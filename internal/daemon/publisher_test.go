@@ -143,3 +143,66 @@ func TestCloudPublisherPacesThrottledTrafficByWorkspaceQuota(t *testing.T) {
 		t.Fatalf("notification posts = %d, want 1 (unthrottled path must not be paced)", notificationPosts)
 	}
 }
+func TestCloudPublisherPrioritizesMetricsAfterRelayUsesSlot(t *testing.T) {
+	publisher := &CloudPublisher{
+		pollInterval:   time.Hour,
+		lastQuotaFetch: time.Now(),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx := context.Background()
+	if !publisher.pacedOK(ctx, false) {
+		t.Fatal("relay should claim an unused pace slot")
+	}
+	publisher.pacedDone(false, true)
+
+	if publisher.pacedOK(ctx, true) {
+		t.Fatal("metric should wait for the relay's accepted request")
+	}
+	if publisher.pacedOK(ctx, false) {
+		t.Fatal("relay should yield while a metric is due")
+	}
+
+	publisher.paceMu.Lock()
+	publisher.lastPaced = time.Now().Add(-2 * time.Hour)
+	publisher.paceMu.Unlock()
+	if !publisher.pacedOK(ctx, true) {
+		t.Fatal("metric should claim the next available slot")
+	}
+	publisher.pacedDone(true, true)
+}
+
+func TestCloudPublisherDoesNotConsumePaceSlotOnFailedMetric(t *testing.T) {
+	metricPosts := 0
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/daemons/host-1/quota":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"quotas":{"polling_interval_seconds":3600}}`))
+		case "/api/daemons/host-1/metrics":
+			metricPosts++
+			if metricPosts == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer cloudServer.Close()
+
+	publisher, err := NewCloudPublisher(config.DaemonConfig{
+		ID:             "host-1",
+		CloudURL:       cloudServer.URL,
+		CloudSecret:    "secret",
+		RequestTimeout: time.Second,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher.PublishMetrics(context.Background(), MetricsPayload{SentAt: time.Now().UTC()})
+	publisher.PublishMetrics(context.Background(), MetricsPayload{SentAt: time.Now().UTC()})
+	if metricPosts != 2 {
+		t.Fatalf("metric posts after transient failure = %d, want 2", metricPosts)
+	}
+}
