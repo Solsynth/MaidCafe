@@ -347,7 +347,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.alarmsDir", "/etc/maidcafe/alarms")
 	viper.SetDefault("daemon.jobsDir", "/etc/maidcafe/jobs")
 	viper.SetDefault("daemon.logsDir", "/var/lib/maidcafe/logs")
-	viper.SetDefault("daemon.logsInterval", 10*time.Second)
+	viper.SetDefault("daemon.logsInterval", 30*time.Second)
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)

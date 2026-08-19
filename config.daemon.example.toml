@@ -18,7 +18,7 @@ jobsDir = "/etc/maidcafe/jobs"
 # Captured container logs (JSONL per container, rotated at 512 KiB, pruned by
 # metricsRetentionDays). 0 disables log tracking.
 logsDir = "/var/lib/maidcafe/logs"
-logsInterval = "10s"
+logsInterval = "30s"
 # Upload is opt-in because logs may contain credentials or user data. The
 # daemon batches lines and sends them to POST /api/daemons/:id/logs.
 logsUploadEnabled = false

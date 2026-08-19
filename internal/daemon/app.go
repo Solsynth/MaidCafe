@@ -84,6 +84,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("open metrics history: %w", err)
 	}
 	runtimeProbe := &runtimeProbeState{}
+	processTable := &processTableCache{}
 	ops := &nativeOpRunner{
 		executor: executor,
 		runtimes: probeContainerRuntimes,
@@ -98,18 +99,21 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	logStore := newContainerLogStore(cfg.LogsDir, cfg.MetricsRetentionDays)
 	jobs := newJobRunner(executor, ops, publisherBox, logger)
 	app := &App{
-		cfg:             cfg,
-		executor:        executor,
-		ops:             ops,
-		metrics:         metrics,
-		publisher:       publisherBox,
-		hub:             NewStreamHub(),
-		alarms:          newAlarmEvaluator(),
-		containers:      &ContainersCollector{probe: runtimeProbe},
-		images:          &ImagesCollector{probe: runtimeProbe},
-		processes:       &ProcessesCollector{limit: cfg.ProcessesLimit},
-		systemd:         &SystemdCollector{},
-		runtimes:        &RuntimesCollector{limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes, watched: watchedStore, history: historyStore},
+		cfg:        cfg,
+		executor:   executor,
+		ops:        ops,
+		metrics:    metrics,
+		publisher:  publisherBox,
+		hub:        NewStreamHub(),
+		alarms:     newAlarmEvaluator(),
+		containers: &ContainersCollector{probe: runtimeProbe},
+		images:     &ImagesCollector{probe: runtimeProbe},
+		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit, table: processTable},
+		systemd:    &SystemdCollector{},
+		runtimes: &RuntimesCollector{
+			limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes,
+			watched: watchedStore, history: historyStore, table: processTable,
+		},
 		databaseMetrics: &DatabaseMetricsCollector{},
 		logs:            &LogsCollector{probe: runtimeProbe, store: logStore, logger: logger},
 		logAlerts:       newLogAlertEvaluator(),

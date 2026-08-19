@@ -319,9 +319,11 @@ func (s *containerLogStore) pruneLocked(now time.Time) error {
 // LogsCollector tails running containers with the shared runtime probe and
 // sudo -n retry, appending new lines to the store.
 type LogsCollector struct {
-	probe  *runtimeProbeState
-	store  *containerLogStore
-	logger *slog.Logger
+	probe     *runtimeProbeState
+	store     *containerLogStore
+	logger    *slog.Logger
+	sudoMu    sync.Mutex
+	sudoPaths map[string]bool
 }
 
 // collect tails the given runtime -> containers mapping (probe order) and
@@ -356,8 +358,9 @@ func (c *LogsCollector) collect(ctx context.Context, runtimes map[string][]conta
 	return collected, nil
 }
 
-// tail runs one incremental `logs` for the container, retrying through
-// `sudo -n` when the direct invocation fails (root-owned containers).
+// tail runs one incremental `logs` for the container. Once a root-owned
+// runtime has required sudo successfully, subsequent tails invoke sudo
+// directly instead of paying for a failed direct invocation first.
 func (c *LogsCollector) tail(ctx context.Context, runtimePath, id string) ([]containerLogLine, error) {
 	cursor := c.store.Cursor(id)
 	args := []string{"logs"}
@@ -367,18 +370,51 @@ func (c *LogsCollector) tail(ctx context.Context, runtimePath, id string) ([]con
 		args = append(args, "--since", cursor.UTC().Format(time.RFC3339Nano))
 	}
 	args = append(args, "--timestamps", id)
-	out, err := runCommandBounded(ctx, runtimePath, args...)
-	if err != nil {
-		if os.Geteuid() != 0 {
-			if sudoOut, sudoErr := runCommandBounded(ctx, "sudo", append([]string{"-n", runtimePath}, args...)...); sudoErr == nil {
-				out = sudoOut
-				err = nil
-			}
+
+	useSudo := c.sudoPath(runtimePath)
+	var out []byte
+	var err error
+	if useSudo {
+		out, err = runCommandBounded(ctx, "sudo", append([]string{"-n", runtimePath}, args...)...)
+		if err == nil {
+			return c.acceptTail(out, cursor, id)
+		}
+		c.setSudoPath(runtimePath, false)
+	}
+	out, err = runCommandBounded(ctx, runtimePath, args...)
+	if err != nil && os.Geteuid() != 0 {
+		if sudoOut, sudoErr := runCommandBounded(ctx, "sudo", append([]string{"-n", runtimePath}, args...)...); sudoErr == nil {
+			c.setSudoPath(runtimePath, true)
+			out = sudoOut
+			err = nil
 		}
 	}
 	if err != nil {
 		return nil, err
 	}
+	return c.acceptTail(out, cursor, id)
+}
+
+func (c *LogsCollector) sudoPath(runtimePath string) bool {
+	c.sudoMu.Lock()
+	defer c.sudoMu.Unlock()
+	return c.sudoPaths != nil && c.sudoPaths[runtimePath]
+}
+
+func (c *LogsCollector) setSudoPath(runtimePath string, enabled bool) {
+	c.sudoMu.Lock()
+	defer c.sudoMu.Unlock()
+	if c.sudoPaths == nil {
+		c.sudoPaths = make(map[string]bool)
+	}
+	if enabled {
+		c.sudoPaths[runtimePath] = true
+	} else {
+		delete(c.sudoPaths, runtimePath)
+	}
+}
+
+func (c *LogsCollector) acceptTail(out []byte, cursor time.Time, id string) ([]containerLogLine, error) {
 	lines := parseLogLines(out)
 	// Lines older than the cursor (container restarts, clock skew) are
 	// dropped so the cursor never regresses.

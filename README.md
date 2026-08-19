@@ -380,10 +380,10 @@ notifyOnFailure = true
 
 ### Container logs
 
-The daemon tails every running container on `daemon.logsInterval` (default
-`10s`, `0` disables) with `<runtime> logs --since <cursor> --timestamps <id>`
-(initial run backfills the last 200 lines), reusing the runtime probe and
-`sudo -n` retry. New lines are:
+- The daemon tails every running container on `daemon.logsInterval` (default
+  `30s`, `0` disables) with `<runtime> logs --since <cursor> --timestamps <id>`
+  (initial run backfills the last 200 lines), reusing the runtime probe and
+  `sudo -n` retry. New lines are:
 
 - appended to per-container JSONL files under `daemon.logsDir` (default
   `/var/lib/maidcafe/logs`), rotated at 512 KiB with one generation and

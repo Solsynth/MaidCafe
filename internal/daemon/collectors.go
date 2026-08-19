@@ -160,16 +160,24 @@ func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, e
 // The stream uses collect(), which announces an empty runtimes list once per
 // availability flip; the HTTP endpoints use snapshot(), which always returns
 // a payload.
+const containerSnapshotCacheTTL = 1 * time.Second
+
 type ContainersCollector struct {
-	mu        sync.Mutex
-	probe     *runtimeProbeState
-	announced bool   // whether the current runtimes state was already sent
-	lastState string // fingerprint of the last probed runtimes set
+	mu           sync.Mutex
+	probe        *runtimeProbeState
+	announced    bool   // whether the current runtimes state was already sent
+	lastState    string // fingerprint of the last probed runtimes set
+	snapshotData []byte
+	snapshotAt   time.Time
 }
 
 func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.collectLocked(ctx)
+}
+
+func (c *ContainersCollector) collectLocked(ctx context.Context) ([]byte, error) {
 	paths := c.probe.probePathSnapshot(ctx)
 	state := runtimeStateKey(paths)
 	if state != c.lastState {
@@ -179,27 +187,51 @@ func (c *ContainersCollector) collect(ctx context.Context) ([]byte, error) {
 	if len(paths) == 0 {
 		if !c.announced {
 			c.announced = true
-			return c.marshal()
+			data, err := c.marshal()
+			if err != nil {
+				return nil, err
+			}
+			return c.cacheSnapshot(data), nil
 		}
 		return nil, nil
 	}
 	c.announced = true
-	return c.collectRuntimes(ctx, paths)
+	data, err := c.collectRuntimes(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+	return c.cacheSnapshot(data), nil
+}
+
+func (c *ContainersCollector) cacheSnapshot(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+	c.snapshotData = append(c.snapshotData[:0], data...)
+	c.snapshotAt = time.Now()
+	return data
 }
 
 // snapshot always returns a payload — unlike collect, which the stream uses
 // and which skips re-announcing an already-announced unavailable state.
 func (c *ContainersCollector) snapshot(ctx context.Context) ([]byte, error) {
-	data, err := c.collect(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.snapshotData) > 0 && time.Since(c.snapshotAt) < containerSnapshotCacheTTL {
+		return append([]byte(nil), c.snapshotData...), nil
+	}
+	data, err := c.collectLocked(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if data != nil {
-		return data, nil
+		return append([]byte(nil), data...), nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.marshal()
+	data, err = c.marshal()
+	if err != nil {
+		return nil, err
+	}
+	return c.cacheSnapshot(data), nil
 }
 
 func (c *ContainersCollector) collectRuntimes(ctx context.Context, paths map[string]string) ([]byte, error) {
@@ -556,29 +588,75 @@ type processesPayload struct {
 	Processes []processEntry `json:"processes"`
 }
 
-// ProcessesCollector lists the top CPU consumers via ps, falling back to the
-// BSD-style invocation when the GNU-sort form fails (e.g. on macOS). limit is
-// the daemon's default cap; per-request values override it (0 = all).
-type ProcessesCollector struct {
-	limit int
+// processTableCache coalesces process-table reads made by the processes
+// stream, runtimes stream, and history recorder when their ticks coincide.
+// A short TTL preserves the configured collection cadence while preventing
+// duplicate ps subprocesses from concurrent collectors.
+const processTableCacheTTL = 500 * time.Millisecond
+
+type processTableCache struct {
+	mu         sync.Mutex
+	entries    []runtimeProcessEntry
+	hasThreads bool
+	fetchedAt  time.Time
 }
 
-// collectEntries runs ps once and returns the parsed rows. A limit <= 0 keeps
-// the complete process table; a positive limit keeps the top `limit` CPU
-// consumers (ps already sorts by CPU, so head preserves that order).
+func (c *processTableCache) snapshot(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.fetchedAt.IsZero() && time.Since(c.fetchedAt) < processTableCacheTTL {
+		return append([]runtimeProcessEntry(nil), c.entries...), c.hasThreads, nil
+	}
+	entries, hasThreads, err := readProcessTableCommand(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	c.entries = append(c.entries[:0], entries...)
+	c.hasThreads = hasThreads
+	c.fetchedAt = time.Now()
+	return append([]runtimeProcessEntry(nil), c.entries...), c.hasThreads, nil
+}
+
+// ProcessesCollector lists the top CPU consumers via ps. The shared process
+// table keeps concurrent process and runtime collectors from spawning
+// duplicate ps subprocesses.
+type ProcessesCollector struct {
+	limit int
+	table *processTableCache
+}
+
+// collectEntries runs ps once and returns the parsed rows. A positive limit
+// keeps the top limit CPU consumers; ps already sorts by CPU.
 func (p *ProcessesCollector) collectEntries(ctx context.Context, limit int) ([]processEntry, error) {
-	head := ""
-	if limit > 0 {
-		head = " | head -n " + strconv.Itoa(limit)
+	var (
+		entries    []runtimeProcessEntry
+		hasThreads bool
+		err        error
+	)
+	if p.table != nil {
+		entries, hasThreads, err = p.table.snapshot(ctx)
+	} else {
+		entries, hasThreads, err = readProcessTableCommand(ctx)
 	}
-	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,comm= --sort=-%cpu"+head)
-	if err != nil || strings.TrimSpace(string(out)) == "" {
-		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm= -r"+head)
-		if err != nil {
-			return nil, err
-		}
+	if err != nil {
+		return nil, err
 	}
-	return parseProcesses(string(out)), nil
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	procs := make([]processEntry, 0, len(entries))
+	for _, entry := range entries {
+		procs = append(procs, processEntry{
+			PID:           entry.PID,
+			User:          entry.User,
+			CPUPercent:    entry.CPUPercent,
+			MemoryPercent: entry.MemoryPercent,
+			RSSKb:         float64(entry.RSSKb),
+			Command:       entry.Comm,
+		})
+	}
+	_ = hasThreads // retained in the shared snapshot for runtime consumers.
+	return procs, nil
 }
 
 // parseProcesses parses `ps -o pid=,user=,%cpu=,%mem=,rss=,comm=` output.
@@ -838,7 +916,8 @@ const maxJvmProbePids = 8
 // jdkReProbeInterval is the re-probe cadence while jps/jstat are unavailable.
 const jdkReProbeInterval = 60 * time.Second
 
-// runtimeProcessTableLimit caps the head of the ps pipe read per collection.
+// runtimeProcessTableLimit caps the runtime groups' input while the shared
+// process snapshot remains available to the complete processes endpoint.
 const runtimeProcessTableLimit = 300
 
 type runtimeProcessEntry struct {
@@ -848,6 +927,7 @@ type runtimeProcessEntry struct {
 	MemoryPercent float64 `json:"memory_percent"`
 	RSSKb         int64   `json:"rss_kb"`
 	Threads       *int64  `json:"threads"`
+	Comm          string  `json:"-"`
 	Command       string  `json:"command"`
 }
 
@@ -857,7 +937,6 @@ type jvmProcessEntry struct {
 	PID       int
 	MainClass string
 }
-
 type javaJvmEntry struct {
 	PID        int      `json:"pid"`
 	MainClass  *string  `json:"main_class"`
@@ -938,6 +1017,7 @@ type RuntimesCollector struct {
 	runtimes []string
 	watched  *watchedProcessStore
 	history  *processHistoryStore
+	table    *processTableCache
 }
 
 // SetRuntimes replaces the runtime group list (hot reload).
@@ -961,13 +1041,15 @@ func (r *RuntimesCollector) settings() ([]string, int) {
 	return append([]string(nil), r.runtimes...), r.limit
 }
 
-func (r *RuntimesCollector) readProcessTable(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
+func readProcessTableCommand(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
 	// GNU ps carries the nlwp thread count; fall back to the BSD form (no
-	// nlwp) when the GNU-sort form fails, e.g. on macOS.
-	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args= --sort=-%cpu | head -n "+strconv.Itoa(runtimeProcessTableLimit))
+	// nlwp) when the GNU-sort form fails, e.g. on macOS. The shared cache
+	// serves both process and runtime consumers, so capping happens after
+	// parsing rather than in separate shell pipelines.
+	out, err := runShell(ctx, "ps -eo pid=,user=,%cpu=,%mem=,rss=,nlwp=,comm=,args= --sort=-%cpu")
 	hasThreads := true
 	if err != nil || strings.TrimSpace(string(out)) == "" {
-		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm=,args= -r | head -n "+strconv.Itoa(runtimeProcessTableLimit))
+		out, err = runShell(ctx, "ps -Ao pid=,user=,%cpu=,%mem=,rss=,comm=,args= -r")
 		hasThreads = false
 		if err != nil {
 			return nil, false, err
@@ -976,11 +1058,26 @@ func (r *RuntimesCollector) readProcessTable(ctx context.Context) ([]runtimeProc
 	return parseRuntimeProcesses(string(out), hasThreads), hasThreads, nil
 }
 
+func capRuntimeProcessTable(entries []runtimeProcessEntry) []runtimeProcessEntry {
+	if len(entries) > runtimeProcessTableLimit {
+		return entries[:runtimeProcessTableLimit]
+	}
+	return entries
+}
+
+func (r *RuntimesCollector) readProcessTable(ctx context.Context) ([]runtimeProcessEntry, bool, error) {
+	if r.table != nil {
+		return r.table.snapshot(ctx)
+	}
+	return readProcessTableCommand(ctx)
+}
+
 func (r *RuntimesCollector) collect(ctx context.Context) ([]byte, error) {
 	entries, _, err := r.readProcessTable(ctx)
 	if err != nil {
 		return nil, err
 	}
+	entries = capRuntimeProcessTable(entries)
 	runtimeNames, limit := r.settings()
 	if len(runtimeNames) == 0 {
 		runtimeNames = []string{"java", "dotnet", "python"}
@@ -1014,6 +1111,7 @@ func (r *RuntimesCollector) recordHistory(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	entries = capRuntimeProcessTable(entries)
 	now := time.Now()
 	_, limit := r.settings()
 	for _, group := range groupWatchedProcesses(entries, limit, r.watched.List()) {
@@ -1153,6 +1251,9 @@ func groupWatchedProcesses(entries []runtimeProcessEntry, limit int, names []str
 // processComm returns the comm token of a parsed process row: the first
 // whitespace-delimited token of the joined command.
 func processComm(entry runtimeProcessEntry) string {
+	if entry.Comm != "" {
+		return entry.Comm
+	}
 	comm := entry.Command
 	if idx := strings.IndexByte(comm, ' '); idx >= 0 {
 		comm = comm[:idx]
@@ -1205,8 +1306,10 @@ func parseRuntimeProcesses(output string, hasThreads bool) []runtimeProcessEntry
 				continue
 			}
 			entry.Threads = &threads
+			entry.Comm = fields[6]
 			entry.Command = strings.Join(fields[6:], " ")
 		} else {
+			entry.Comm = fields[5]
 			entry.Command = strings.Join(fields[5:], " ")
 		}
 		entries = append(entries, entry)

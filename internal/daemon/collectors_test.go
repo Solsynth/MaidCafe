@@ -621,3 +621,49 @@ func TestParseSizeToBytes(t *testing.T) {
 		t.Error("expected nil for invalid size")
 	}
 }
+
+func TestProcessTableCacheCoalescesCollectors(t *testing.T) {
+	countPath := filepath.Join(t.TempDir(), "ps-count")
+	ps := fakeCommand(t, "ps", "#!/bin/sh\nprintf x >> "+countPath+"\nprintf '1 root 1.0 0.1 100 2 python python -V\\n'\n")
+	t.Setenv("PATH", filepath.Dir(ps)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	table := &processTableCache{}
+	processes := &ProcessesCollector{table: table}
+	runtimes := &RuntimesCollector{table: table, runtimes: []string{"python"}}
+	if _, err := processes.collectEntries(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtimes.collect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(count); got != 1 {
+		t.Fatalf("ps invocations = %d, want 1", got)
+	}
+}
+
+func TestContainerSnapshotCacheCoalescesConcurrentConsumers(t *testing.T) {
+	countPath := filepath.Join(t.TempDir(), "podman-count")
+	podman := fakeCommand(t, "podman", "#!/bin/sh\nprintf x >> "+countPath+"\nprintf '%s\\n' '{\"Id\":\"abc\",\"Names\":[\"web\"],\"Image\":\"nginx\",\"State\":\"running\",\"Status\":\"Up\"}'\n")
+	probe := &runtimeProbeState{
+		probed:       true,
+		runtimePaths: map[string]string{"podman": podman},
+	}
+	collector := &ContainersCollector{probe: probe}
+	if _, err := collector.snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(count); got != 1 {
+		t.Fatalf("podman ps invocations = %d, want 1", got)
+	}
+}
