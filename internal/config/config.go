@@ -107,9 +107,22 @@ type DaemonConfig struct {
 	CloudSecret  string `mapstructure:"cloudSecret"`
 	// LogsUploadEnabled opts the daemon into outbound log upload. It is
 	// deliberately false by default because logs may contain secrets.
-	LogsUploadEnabled       bool          `mapstructure:"logsUploadEnabled"`
-	LogsUploadInterval      time.Duration `mapstructure:"logsUploadInterval"`
-	LogsUploadBatchLines    int           `mapstructure:"logsUploadBatchLines"`
+	LogsUploadEnabled    bool          `mapstructure:"logsUploadEnabled"`
+	LogsUploadInterval   time.Duration `mapstructure:"logsUploadInterval"`
+	LogsUploadBatchLines int           `mapstructure:"logsUploadBatchLines"`
+	// ManagedContainers and ManagedComposes scope cloud uploads (logs and
+	// container status) to a curated set. An empty managed list uploads every
+	// container (the default, matching the pre-scoping behavior). Matching is
+	// by exact container Name or ID prefix (ManagedContainers) or compose
+	// project label (ManagedComposes, from com.docker.compose.project /
+	// io.podman.compose.project).
+	ManagedContainers []string `mapstructure:"managedContainers"`
+	ManagedComposes   []string `mapstructure:"managedComposes"`
+	// StatusUploadEnabled opts the daemon into publishing container status
+	// (state, image, compose project) to the cloud so managed hosts can be
+	// inspected centrally. Status carries no secrets, but the upload stays
+	// opt-in and is paced on the metrics tick.
+	StatusUploadEnabled     bool          `mapstructure:"statusUploadEnabled"`
 	MetricsInterval         time.Duration `mapstructure:"metricsInterval"`
 	StreamInterval          time.Duration `mapstructure:"streamInterval"`
 	ContainersInterval      time.Duration `mapstructure:"containersInterval"`

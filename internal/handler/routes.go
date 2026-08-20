@@ -28,6 +28,8 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons", createDaemon(svc))
 	user.GET("/daemons", listDaemons(svc))
 	user.GET("/daemons/:id/logs", listDaemonLogs(svc))
+	user.GET("/daemons/:id/containers", listDaemonContainers(svc))
+	user.GET("/daemons/:id/metrics", listMetrics(svc))
 	user.GET("/daemons/:id", getDaemon(svc))
 	user.PATCH("/daemons/:id", updateDaemon(svc))
 	user.POST("/daemons/:id/rotate-secret", rotateSecret(svc))
@@ -53,6 +55,7 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	daemon := r.Group("/api/daemons/:id")
 	daemon.POST("/metrics", ingestMetric(svc))
 	daemon.POST("/logs", ingestLogs(svc))
+	daemon.POST("/containers", ingestContainerStatus(svc))
 	daemon.POST("/notifications", createNotification(svc))
 	daemon.POST("/actions", syncActions(svc))
 	daemon.GET("/webhook-requests/pending", listPendingWebhooks(svc))
@@ -523,6 +526,57 @@ func listDaemonLogs(s *cloud.Service) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"logs": logs})
+	}
+}
+func ingestContainerStatus(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		secret, ok := daemonSecret(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		var in cloud.ContainerStatusBatchInput
+		if !parseJSON(c, &in) {
+			return
+		}
+		if err := s.IngestContainerStatus(c, c.Param("id"), secret, in); err != nil {
+			if errors.Is(err, cloud.ErrUnauthorized) {
+				serviceStatus(c, err)
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func listDaemonContainers(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		limit := 100
+		if raw := c.Query("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 500 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+				return
+			}
+			limit = parsed
+		}
+		var before *time.Time
+		if raw := c.Query("before"); raw != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, raw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid before"})
+				return
+			}
+			before = &parsed
+		}
+		containers, err := s.ListContainerStatus(c, accountID(c), c.Param("id"), c.Query("compose"), c.Query("state"), limit, before)
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"containers": containers})
 	}
 }
 func workspaceQuota(s *cloud.Service) gin.HandlerFunc {

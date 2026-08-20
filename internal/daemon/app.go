@@ -657,6 +657,9 @@ func (a *App) Run(ctx context.Context) error {
 				for _, notification := range a.alarms.evaluate(rt.alarms, metrics, now) {
 					pub.PublishNotification(context.Background(), notification)
 				}
+				if rt.statusUploadEnabled {
+					a.publishContainerStatus(context.Background(), pub, rt)
+				}
 				for _, alarm := range rt.alarms {
 					if alarm.Kind != "container_down" || alarm.Enabled != nil && !*alarm.Enabled {
 						continue
@@ -846,6 +849,12 @@ func (a *App) runLogsCollector(ctx context.Context) {
 				for _, runtime := range payload.Runtimes {
 					runtimes[runtime.Runtime] = runtime.Containers
 				}
+				entryByID := make(map[string]containerEntry, len(payload.Runtimes))
+				for _, runtime := range payload.Runtimes {
+					for _, c := range runtime.Containers {
+						entryByID[c.ID] = c
+					}
+				}
 				collected, err := a.logs.collect(ctx, runtimes)
 				if err != nil {
 					a.logger.Debug("logs collector failed", "error", err)
@@ -874,7 +883,9 @@ func (a *App) runLogsCollector(ctx context.Context) {
 								})
 							}
 						}
-						a.logUpload.Add(id, lines)
+						if a.isContainerManaged(id, entryByID[id]) {
+							a.logUpload.Add(id, lines)
+						}
 						if a.hub.Subscribers("logs") == 0 {
 							continue
 						}
@@ -888,4 +899,76 @@ func (a *App) runLogsCollector(ctx context.Context) {
 			}
 		}
 	}()
+}
+func (a *App) isContainerManaged(id string, entry containerEntry) bool {
+	rt := a.rt.Load()
+	if rt == nil {
+		return true
+	}
+	return matchManagedContainer(id, entry.Name, entry.ComposeProject, rt.managedContainers, rt.managedComposes)
+}
+
+// publishContainerStatus snapshots the current container set, filters to the
+// managed allowlist, and pushes one bounded status batch to the cloud on the
+// metrics tick. Non-managed containers are skipped so logs/status for
+// unmanaged workloads never leave the host.
+func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, rt *reloadableConfig) {
+	data, err := a.containers.snapshot(ctx)
+	if err != nil {
+		a.logger.Debug("container status snapshot failed", "error", err)
+		return
+	}
+	var payload containersPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	entries := make([]containerStatusEntry, 0, 8)
+	for _, runtime := range payload.Runtimes {
+		for _, c := range runtime.Containers {
+			if !matchManagedContainer(c.ID, c.Name, c.ComposeProject, rt.managedContainers, rt.managedComposes) {
+				continue
+			}
+			entries = append(entries, containerStatusEntry{
+				ContainerID:    c.ID,
+				Name:           c.Name,
+				Image:          c.Image,
+				State:          c.State,
+				Status:         c.Status,
+				ComposeProject: c.ComposeProject,
+			})
+		}
+	}
+	if len(entries) == 0 {
+		return
+	}
+	pub.PublishContainerStatus(ctx, containerStatusPayload{Containers: entries, SentAt: time.Now().UTC()})
+}
+
+// matchManagedContainer reports whether a container belongs to the managed
+// allowlist. An empty allowlist matches everything (backward-compatible with
+// the pre-scoping behavior). Containers match by exact Name or ID prefix;
+// compose projects match by exact ComposeProject label.
+func matchManagedContainer(id, name, compose string, containers, composes []string) bool {
+	if len(containers) == 0 && len(composes) == 0 {
+		return true
+	}
+	for _, c := range containers {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if c == name || strings.HasPrefix(id, c) {
+			return true
+		}
+	}
+	for _, c := range composes {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if c == compose {
+			return true
+		}
+	}
+	return false
 }

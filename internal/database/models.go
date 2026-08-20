@@ -71,6 +71,27 @@ type DaemonLog struct {
 	Line        string    `gorm:"type:text;not null"`
 }
 
+// DaemonContainer is the cloud-side, centrally inspectable status of one
+// managed container reported by a daemon. Rows are upserted by
+// (DaemonID, ContainerID); LastSeenAt drives retention pruning so a container
+// that leaves the host lingers until the workspace's metrics_retention_days
+// window elapses, then is removed.
+type DaemonContainer struct {
+	DaemonID       string    `gorm:"size:191;primaryKey;not null"`
+	ContainerID    string    `gorm:"size:128;primaryKey;not null"`
+	WorkspaceID    string    `gorm:"size:191;index;not null"`
+	Name           string    `gorm:"size:255;not null"`
+	Image          string    `gorm:"size:512"`
+	State          string    `gorm:"size:64"`
+	Status         string    `gorm:"size:255"`
+	ComposeProject string    `gorm:"size:255;index"`
+	FirstSeenAt    time.Time `gorm:"index"`
+	LastSeenAt     time.Time `gorm:"index;not null"`
+	ReceivedAt     time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 type Notification struct {
 	ID          string         `gorm:"type:char(36);primaryKey"`
 	AccountID   string         `gorm:"size:191;index;not null"`

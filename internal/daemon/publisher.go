@@ -310,6 +310,33 @@ func (p *CloudPublisher) PublishLogs(ctx context.Context, entries []LogUploadEnt
 	}
 	return p.request(ctx, http.MethodPost, "/logs", map[string]any{"entries": entries}, nil)
 }
+
+// containerStatusEntry is one container's status pushed to the cloud. Status
+// carries no secrets, unlike logs.
+type containerStatusEntry struct {
+	ContainerID    string `json:"container_id"`
+	Name           string `json:"name"`
+	Image          string `json:"image"`
+	State          string `json:"state"`
+	Status         string `json:"status"`
+	ComposeProject string `json:"compose_project"`
+}
+
+// containerStatusPayload is the wire shape of one status snapshot.
+type containerStatusPayload struct {
+	Containers []containerStatusEntry `json:"containers"`
+	SentAt     time.Time              `json:"sent_at"`
+}
+
+// PublishContainerStatus uploads the managed container status snapshot. It is
+// opt-in (StatusUploadEnabled) and fire-and-forget on the metrics tick, like
+// PublishActions; a failed request is best-effort and does not block the tick.
+func (p *CloudPublisher) PublishContainerStatus(ctx context.Context, payload containerStatusPayload) {
+	if p == nil || len(payload.Containers) == 0 {
+		return
+	}
+	p.post(ctx, "/containers", payload)
+}
 func (p *CloudPublisher) PublishNotification(ctx context.Context, payload notificationPayload) {
 	if p != nil {
 		p.post(ctx, "/notifications", payload)

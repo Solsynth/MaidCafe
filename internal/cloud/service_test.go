@@ -995,3 +995,39 @@ func TestIngestAndListLogs(t *testing.T) {
 		t.Fatal("empty log line accepted")
 	}
 }
+func TestIngestAndListContainerStatus(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "metrics_retention_days": 7}}
+	ctx := context.Background()
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "status-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestContainerStatus(ctx, created.ID, created.Secret, ContainerStatusBatchInput{Containers: []ContainerStatusInput{
+		{ContainerID: "web", Name: "web", State: "running", ComposeProject: "myapp"},
+		{ContainerID: "db", Name: "db", State: "running", ComposeProject: "myapp"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := svc.ListContainerStatus(ctx, "account-a", created.ID, "myapp", "", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status) != 2 {
+		t.Fatalf("expected 2 containers, got %d", len(status))
+	}
+	if status[0].ContainerID == "" || status[0].LastSeenAt.IsZero() {
+		t.Fatal("status missing fields")
+	}
+	if err := svc.IngestContainerStatus(ctx, created.ID, "wrong", ContainerStatusBatchInput{Containers: []ContainerStatusInput{{ContainerID: "x", Name: "x"}}}); err != ErrUnauthorized {
+		t.Fatalf("wrong secret accepted: %v", err)
+	}
+	filtered, err := svc.ListContainerStatus(ctx, "account-a", created.ID, "myapp", "", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("compose filter expected 2, got %d", len(filtered))
+	}
+}

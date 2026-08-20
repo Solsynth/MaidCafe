@@ -24,6 +24,15 @@ logsInterval = "30s"
 logsUploadEnabled = false
 logsUploadInterval = "30s"
 logsUploadBatchLines = 100
+# Managed allowlist for cloud uploads (logs + container status). Empty = upload
+# every container (default). Match by exact container name or ID prefix, or by
+# compose project label (com.docker.compose.project / io.podman.compose.project).
+# managedContainers = ["web", "db-"]
+# managedComposes = ["myapp"]
+# Publish container status (state/image/compose) to the cloud so managed hosts
+# can be inspected centrally. Opt-in; paced on the metrics tick. Status carries
+# no secrets. Logs remain gated by logsUploadEnabled + this allowlist.
+statusUploadEnabled = false
 # One <slug>.toml fragment per regex log alert.
 logAlertsDir = "/etc/maidcafe/log-alerts"
 

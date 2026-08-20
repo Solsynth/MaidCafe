@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
@@ -155,5 +156,63 @@ func TestWorkspaceQuotaUserRoute(t *testing.T) {
 
 	if got := get("/api/workspaces/ws-b/quota"); got.Code != http.StatusForbidden {
 		t.Fatalf("non-member quota route %d", got.Code)
+	}
+}
+func TestListMetricsUserRoute(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
+	router := NewRouter(nil, svc, routeAuthenticator{})
+
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, cloud.MetricInput{SentAt: time.Now(), UptimeSeconds: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer solar-token")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Unauthenticated requests must be rejected, mirroring the other
+	// per-daemon user routes.
+	unauth := httptest.NewRecorder()
+	router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/daemons/"+daemon.ID+"/metrics", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated metrics route %d", unauth.Code)
+	}
+
+	// Authenticated workspace members read metric history newest-first.
+	got := get("/api/daemons/" + daemon.ID + "/metrics")
+	if got.Code != http.StatusOK {
+		t.Fatalf("authenticated metrics route %d %s", got.Code, got.Body)
+	}
+	var metrics []cloud.MetricView
+	if err := json.Unmarshal(got.Body.Bytes(), &metrics); err != nil {
+		t.Fatal(err)
+	}
+	if len(metrics) != 1 {
+		t.Fatalf("expected 1 metric, got %d", len(metrics))
+	}
+	if metrics[0].DaemonID != daemon.ID {
+		t.Fatalf("unexpected daemon id %q", metrics[0].DaemonID)
+	}
+
+	// The previously-missing route must not 404 for valid requests.
+	if !strings.Contains(got.Body.String(), "uptime_seconds") {
+		t.Fatalf("metric body missing fields: %s", got.Body)
 	}
 }

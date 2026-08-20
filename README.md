@@ -141,6 +141,12 @@ lets the user define those action presets.
 Cloud publishing is disabled when either setting is empty. Log upload is
 separately opt-in even when cloud publishing is configured. HTTPS is required,
 except for HTTP development URLs using `localhost` or `127.0.0.1`.
+- Container status upload: when `statusUploadEnabled = true`, the daemon
+  publishes the managed container set's status (state, image, compose project)
+  to the cloud on the metrics tick, so managed hosts can be inspected centrally
+  from one place. An optional managed allowlist (`managedContainers`,
+  `managedComposes`) scopes both log upload and status upload to a curated set;
+  an empty allowlist uploads every container. Status carries no secrets.
 
 ## Cloud API
 

@@ -34,6 +34,9 @@ type reloadableConfig struct {
 	logsUploadEnabled    bool
 	logsUploadInterval   time.Duration
 	logsUploadBatchLines int
+	managedContainers    []string
+	managedComposes      []string
+	statusUploadEnabled  bool
 	version              string
 	intervals            reloadableIntervals
 }
@@ -71,6 +74,9 @@ func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
 		logsUploadEnabled:    cfg.LogsUploadEnabled,
 		logsUploadInterval:   cfg.LogsUploadInterval,
 		logsUploadBatchLines: batchLines,
+		managedContainers:    cfg.ManagedContainers,
+		managedComposes:      cfg.ManagedComposes,
+		statusUploadEnabled:  cfg.StatusUploadEnabled,
 		version:              cfg.Version,
 		intervals: reloadableIntervals{
 			metrics:    cfg.MetricsInterval,

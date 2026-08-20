@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
 	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
@@ -297,6 +298,15 @@ func (s *Service) PruneMetrics(ctx context.Context) error {
 		if logs.Error != nil {
 			s.logger.Warn("log retention prune failed", "workspace_id", workspaceID, "error", logs.Error)
 		}
+		containers := s.db.WithContext(ctx).
+			Where("daemon_id IN (SELECT id FROM daemons WHERE workspace_id = ?)", workspaceID).
+			Where("last_seen_at < ?", cutoff).
+			Delete(&database.DaemonContainer{})
+		if containers.Error != nil {
+			s.logger.Warn("container status retention prune failed", "workspace_id", workspaceID, "error", containers.Error)
+		} else if containers.RowsAffected > 0 {
+			s.logger.Info("pruned expired container status", "workspace_id", workspaceID, "containers", containers.RowsAffected)
+		}
 		if res.RowsAffected > 0 || logs.RowsAffected > 0 {
 			s.logger.Info("pruned expired daemon data", "workspace_id", workspaceID, "metrics", res.RowsAffected, "logs", logs.RowsAffected)
 		}
@@ -432,6 +442,35 @@ type LogView struct {
 	Timestamp   time.Time `json:"timestamp"`
 	ReceivedAt  time.Time `json:"received_at"`
 	Line        string    `json:"line"`
+}
+
+// ContainerStatusInput is one container's status uploaded by a daemon.
+type ContainerStatusInput struct {
+	ContainerID    string `json:"container_id"`
+	Name           string `json:"name"`
+	Image          string `json:"image"`
+	State          string `json:"state"`
+	Status         string `json:"status"`
+	ComposeProject string `json:"compose_project"`
+}
+
+// ContainerStatusBatchInput is one status snapshot for a daemon.
+type ContainerStatusBatchInput struct {
+	Containers []ContainerStatusInput `json:"containers"`
+	SentAt     time.Time              `json:"sent_at"`
+}
+
+// ContainerStatusView is one container's centrally inspectable status.
+type ContainerStatusView struct {
+	DaemonID       string    `json:"daemon_id"`
+	ContainerID    string    `json:"container_id"`
+	Name           string    `json:"name"`
+	Image          string    `json:"image"`
+	State          string    `json:"state"`
+	Status         string    `json:"status"`
+	ComposeProject string    `json:"compose_project"`
+	FirstSeenAt    time.Time `json:"first_seen_at"`
+	LastSeenAt     time.Time `json:"last_seen_at"`
 }
 type MetricView struct {
 	ID                 string    `json:"id"`
@@ -928,6 +967,85 @@ func (s *Service) ListLogs(ctx context.Context, accountID, daemonID, containerID
 	out := make([]LogView, len(rows))
 	for i, row := range rows {
 		out[i] = LogView{ID: row.ID, DaemonID: row.DaemonID, ContainerID: row.ContainerID, Timestamp: row.Timestamp, ReceivedAt: row.ReceivedAt, Line: row.Line}
+	}
+	return out, nil
+}
+
+// IngestContainerStatus upserts the managed container status snapshot for a
+// daemon, authenticated by its registered secret. Rows are keyed by
+// (DaemonID, ContainerID) so each publish refreshes LastSeenAt without
+// duplicating; FirstSeenAt is preserved from the initial insert.
+func (s *Service) IngestContainerStatus(ctx context.Context, id, secret string, input ContainerStatusBatchInput) error {
+	d, err := s.authenticateDaemon(ctx, id, secret)
+	if err != nil {
+		return ErrUnauthorized
+	}
+	if len(input.Containers) == 0 || len(input.Containers) > 500 {
+		return fmt.Errorf("containers must contain between 1 and 500 entries")
+	}
+	now := time.Now().UTC()
+	rows := make([]database.DaemonContainer, 0, len(input.Containers))
+	for _, c := range input.Containers {
+		cid := strings.TrimSpace(c.ContainerID)
+		if cid == "" || len(cid) > 128 || !utf8.ValidString(cid) {
+			return fmt.Errorf("container_id exceeds bounds or is empty")
+		}
+		name := strings.TrimSpace(c.Name)
+		if len(name) > 255 {
+			name = name[:255]
+		}
+		rows = append(rows, database.DaemonContainer{
+			DaemonID:       d.ID,
+			ContainerID:    cid,
+			WorkspaceID:    d.WorkspaceID,
+			Name:           name,
+			Image:          c.Image,
+			State:          c.State,
+			Status:         c.Status,
+			ComposeProject: c.ComposeProject,
+			FirstSeenAt:    now,
+			LastSeenAt:     now,
+			ReceivedAt:     now,
+		})
+	}
+	return s.db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "daemon_id"}, {Name: "container_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"name", "image", "state", "status", "compose_project", "last_seen_at", "received_at", "updated_at"}),
+		}).
+		Create(&rows).Error
+}
+
+// ListContainerStatus returns the latest status of managed containers to
+// workspace members, optionally filtered by compose project or state.
+func (s *Service) ListContainerStatus(ctx context.Context, accountID, daemonID, compose, state string, limit int, before *time.Time) ([]ContainerStatusView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := s.db.WithContext(ctx).Where("daemon_id = ?", daemonID)
+	if compose = strings.TrimSpace(compose); compose != "" {
+		query = query.Where("compose_project = ?", compose)
+	}
+	if state = strings.TrimSpace(state); state != "" {
+		query = query.Where("state = ?", state)
+	}
+	if before != nil {
+		query = query.Where("last_seen_at < ?", before.UTC())
+	}
+	var rows []database.DaemonContainer
+	if err := query.Order("last_seen_at desc").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]ContainerStatusView, len(rows))
+	for i, row := range rows {
+		out[i] = ContainerStatusView{
+			DaemonID: row.DaemonID, ContainerID: row.ContainerID, Name: row.Name,
+			Image: row.Image, State: row.State, Status: row.Status,
+			ComposeProject: row.ComposeProject, FirstSeenAt: row.FirstSeenAt, LastSeenAt: row.LastSeenAt,
+		}
 	}
 	return out, nil
 }
