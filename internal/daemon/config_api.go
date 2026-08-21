@@ -145,6 +145,9 @@ var patchableDaemonKeys = map[string]patchRule{
 	"maxConcurrentRuns":       patchIntRule(1, 256),
 	"logsUploadBatchLines":    patchIntRule(1, 500),
 	"logsUploadEnabled":       patchBoolRule,
+	"statusUploadEnabled":     patchBoolRule,
+	"managedContainers":       patchStringListRule,
+	"managedComposes":         patchStringListRule,
 	"runtimes":                patchStringListRule,
 	"watchedProcesses":        patchStringListRule,
 	"cloudUrl":                patchCloudURLRule,
@@ -195,6 +198,9 @@ type redactedConfigView struct {
 	LogsUploadEnabled    bool     `json:"logs_upload_enabled"`
 	LogsUploadInterval   string   `json:"logs_upload_interval"`
 	LogsUploadBatchLines int      `json:"logs_upload_batch_lines"`
+	StatusUploadEnabled  bool     `json:"status_upload_enabled"`
+	ManagedContainers    []string `json:"managed_containers"`
+	ManagedComposes      []string `json:"managed_composes"`
 	MetricsInterval      string   `json:"metrics_interval"`
 	StreamInterval       string   `json:"stream_interval"`
 	ContainersInterval   string   `json:"containers_interval"`
@@ -226,6 +232,9 @@ func newRedactedConfigView(cfg config.DaemonConfig) redactedConfigView {
 		LogsUploadEnabled:    cfg.LogsUploadEnabled,
 		LogsUploadInterval:   cfg.LogsUploadInterval.String(),
 		LogsUploadBatchLines: cfg.LogsUploadBatchLines,
+		StatusUploadEnabled:  cfg.StatusUploadEnabled,
+		ManagedContainers:    cfg.ManagedContainers,
+		ManagedComposes:      cfg.ManagedComposes,
 		MetricsInterval:      cfg.MetricsInterval.String(),
 		StreamInterval:       cfg.StreamInterval.String(),
 		ContainersInterval:   cfg.ContainersInterval.String(),

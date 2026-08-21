@@ -222,6 +222,121 @@ runtimes = ["java", "dotnet", "python"]
 	}
 }
 
+func TestManagedContainerConfigKeys(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	initial := `[daemon]
+id = "host-1"
+transport = "http"
+listen = "127.0.0.1:0"
+metricsSecret = "metrics-secret"
+metricsHistoryPath = ""
+metricsInterval = "1m"
+streamInterval = "1s"
+requestTimeout = "5s"
+scriptTimeout = "1s"
+maxBodyBytes = 1024
+maxConcurrentRuns = 2
+`
+	if err := os.WriteFile(configPath, []byte(initial), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := NewApp(cfg.Daemon, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.SetConfigPath(configPath)
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	defer app.Shutdown(ctx)
+	baseURL := "http://" + app.ListenAddr()
+
+	patch := `{"statusUploadEnabled": true, "managedContainers": ["web", "db-"], "managedComposes": ["myapp"]}`
+	req, err := http.NewRequest(http.MethodPatch, baseURL+"/api/v1/config", strings.NewReader(patch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer metrics-secret")
+	req.Header.Set("X-MaidCafe-Signature", signedHeader("metrics-secret", []byte(patch)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("managed keys PATCH status = %d", resp.StatusCode)
+	}
+
+	// The on-disk config gained the keys inside [daemon].
+	onDisk, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"statusUploadEnabled = true",
+		`managedContainers = ["web", "db-"]`,
+		`managedComposes = ["myapp"]`,
+	} {
+		if !strings.Contains(string(onDisk), want) {
+			t.Fatalf("config file missing %q:\n%s", want, onDisk)
+		}
+	}
+
+	// GET exposes the patched values.
+	getReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/config", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getReq.Header.Set("Authorization", "Bearer metrics-secret")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(getResp.Body).Decode(&body)
+	getResp.Body.Close()
+	view, ok := body["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("config view missing: %+v", body)
+	}
+	if view["status_upload_enabled"] != true {
+		t.Fatalf("status_upload_enabled = %+v", view["status_upload_enabled"])
+	}
+	containers, ok := view["managed_containers"].([]any)
+	if !ok || len(containers) != 2 || containers[0] != "web" {
+		t.Fatalf("managed_containers = %+v", view["managed_containers"])
+	}
+	composes, ok := view["managed_composes"].([]any)
+	if !ok || len(composes) != 1 || composes[0] != "myapp" {
+		t.Fatalf("managed_composes = %+v", view["managed_composes"])
+	}
+
+	// A non-list value is rejected before the file is touched.
+	bad := `{"managedContainers": "web"}`
+	badReq, err := http.NewRequest(http.MethodPatch, baseURL+"/api/v1/config", strings.NewReader(bad))
+	if err != nil {
+		t.Fatal(err)
+	}
+	badReq.Header.Set("Authorization", "Bearer metrics-secret")
+	badReq.Header.Set("X-MaidCafe-Signature", signedHeader("metrics-secret", []byte(bad)))
+	badReq.Header.Set("Content-Type", "application/json")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid managedContainers status = %d", badResp.StatusCode)
+	}
+}
+
 func TestApplyReloadSwapsExecutorHooksAndTimeout(t *testing.T) {
 	oldAction := executable(t, "#!/bin/sh\nexit 0\n")
 	newAction := executable(t, "#!/bin/sh\nexit 0\n")
