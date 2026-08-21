@@ -86,8 +86,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	runtimeProbe := &runtimeProbeState{}
 	processTable := &processTableCache{}
 	ops := &nativeOpRunner{
-		executor: executor,
-		runtimes: probeContainerRuntimes,
+		executor:  executor,
+		runtimes:  probeContainerRuntimes,
+		publisher: publisherBox,
 	}
 	ops.SetScriptTimeout(cfg.ScriptTimeout)
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)

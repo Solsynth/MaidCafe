@@ -178,6 +178,7 @@ type nativeOpRunner struct {
 	executor      *WebhookExecutor
 	runtimes      func(ctx context.Context) map[string]string
 	scriptTimeout atomic.Int64 // nanoseconds
+	publisher     *atomic.Pointer[CloudPublisher]
 }
 
 // SetScriptTimeout updates the daemon-wide op timeout (hot reload).
@@ -197,6 +198,7 @@ func (r *nativeOpRunner) dispatch(
 	invokedBy string,
 ) (executionResponse, int, *requestError) {
 	var attempts []opAttempt
+	targetLabel := ""
 	timeout := time.Duration(r.scriptTimeout.Load())
 	bad := func(message string) (executionResponse, int, *requestError) {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: message}
@@ -211,6 +213,7 @@ func (r *nativeOpRunner) dispatch(
 		if !nativeContainerRefPattern.MatchString(params.target) {
 			return bad("invalid container reference")
 		}
+		targetLabel = params.target
 		args := []string{cliVerb}
 		if verb == "remove" && params.force {
 			args = append(args, "-f")
@@ -230,6 +233,7 @@ func (r *nativeOpRunner) dispatch(
 		if params.pid <= 1 {
 			return bad("invalid process id")
 		}
+		targetLabel = strconv.Itoa(params.pid)
 		args := []string{"-s", "KILL", "--", strconv.Itoa(params.pid)}
 		attempts = append(attempts, opAttempt{command: "kill", args: args})
 		if sudo := r.sudoAttempt(); sudo != nil {
@@ -247,6 +251,7 @@ func (r *nativeOpRunner) dispatch(
 		if !nativeSystemdUnitPattern.MatchString(unit) {
 			return bad("invalid systemd unit")
 		}
+		targetLabel = unit
 		args := []string{verb, unit}
 		attempts = append(attempts, opAttempt{command: "systemctl", args: args})
 		if sudo := r.sudoAttempt(); sudo != nil {
@@ -261,6 +266,7 @@ func (r *nativeOpRunner) dispatch(
 		if !nativeProjectPattern.MatchString(params.target) || !validNativeDirectory(params.directory) {
 			return bad("invalid compose project or directory")
 		}
+		targetLabel = params.target
 		if timeout < composeOpTimeout {
 			timeout = composeOpTimeout
 		}
@@ -281,7 +287,7 @@ func (r *nativeOpRunner) dispatch(
 	if len(attempts) == 0 {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: "no container runtime available"}
 	}
-	response, status := r.executeNative(ctx, slug, nativeOpDisplayNames[slug], attempts, timeout, source, invokedBy)
+	response, status := r.executeNative(ctx, slug, nativeOpDisplayNames[slug], targetLabel, attempts, timeout, source, invokedBy)
 	return response, status, nil
 }
 
@@ -313,6 +319,7 @@ func (r *nativeOpRunner) executeNative(
 	ctx context.Context,
 	slug string,
 	displayName string,
+	target string,
 	attempts []opAttempt,
 	timeout time.Duration,
 	source string,
@@ -357,6 +364,7 @@ func (r *nativeOpRunner) executeNative(
 		response.Stdout = primaryStdout
 		response.Stderr = primaryStderr
 	}
+	duration := time.Since(started)
 	if r.executor.audit != nil {
 		r.executor.audit.Record(auditEntry{
 			Timestamp:   time.Now().UTC(),
@@ -366,7 +374,7 @@ func (r *nativeOpRunner) executeNative(
 			InvokedBy:   invokedBy,
 			OK:          response.OK,
 			ExitCode:    response.ExitCode,
-			DurationMS:  time.Since(started).Milliseconds(),
+			DurationMS:  duration.Milliseconds(),
 			Stdout:      response.Stdout,
 			Stderr:      response.Stderr,
 			Error:       auditErrorTail(response),
@@ -382,7 +390,52 @@ func (r *nativeOpRunner) executeNative(
 	} else {
 		r.executor.counts.successes.Add(1)
 	}
+	if primaryErr != nil && source != "job" {
+		r.publishFailure(slug, displayName, target, response, source, invokedBy, duration)
+	}
 	return response, status
+}
+
+// publishFailure reports a failed native operation on its own notification
+// channel (nativeop.failure) — distinct from the webhook.* channel script
+// actions use — so container, process, systemd and compose operations can be
+// routed or muted separately through notification preferences. Successes stay
+// silent: routine operations notify nobody, and the invoker already received
+// the synchronous result. Scheduled jobs are excluded because the job runner
+// publishes job.failure for them.
+func (r *nativeOpRunner) publishFailure(slug, displayName, target string, response executionResponse, source, invokedBy string, duration time.Duration) {
+	if r.publisher == nil {
+		return
+	}
+	p := r.publisher.Load()
+	if p == nil {
+		return
+	}
+	body := strings.TrimSpace(response.Stderr)
+	if body == "" {
+		body = strings.TrimSpace(response.Stdout)
+	}
+	if len(body) > 4096 {
+		body = body[:4096]
+	}
+	metadata := map[string]any{
+		"name":        slug,
+		"exit_code":   response.ExitCode,
+		"duration_ms": duration.Milliseconds(),
+		"source":      source,
+	}
+	if target != "" {
+		metadata["target"] = target
+	}
+	if invokedBy != "" {
+		metadata["invoked_by"] = invokedBy
+	}
+	p.PublishNotification(context.Background(), notificationPayload{
+		Kind:     "nativeop.failure",
+		Title:    displayName + " failed",
+		Body:     body,
+		Metadata: metadata,
+	})
 }
 
 // runOpOnce runs one attempt with bounded stdout/stderr capture and no shell.

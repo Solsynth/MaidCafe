@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -289,5 +290,79 @@ func TestRelayDispatchesNativeOp(t *testing.T) {
 	}
 	if result.Code != http.StatusOK {
 		t.Fatalf("result code %d", result.Code)
+	}
+}
+func TestNativeOpFailurePublishesNativeChannel(t *testing.T) {
+	var mu sync.Mutex
+	var notifications []notificationPayload
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/notifications") {
+			var got notificationPayload
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			mu.Lock()
+			notifications = append(notifications, got)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer cloud.Close()
+	publisher, err := NewCloudPublisher(config.DaemonConfig{
+		ID: "host-1", CloudURL: cloud.URL, CloudSecret: "s", RequestTimeout: time.Second,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	box := &atomic.Pointer[CloudPublisher]{}
+	box.Store(publisher)
+	failing := fakeCommand(t, "podman", "#!/bin/sh\necho 'no such container' >&2\nexit 1\n")
+	executor := NewWebhookExecutor(config.DaemonConfig{ScriptTimeout: time.Second, MaxConcurrentRuns: 2})
+	runner := &nativeOpRunner{
+		executor:  executor,
+		runtimes:  stubRuntimes(map[string]string{"podman": failing}),
+		publisher: box,
+	}
+	runner.SetScriptTimeout(time.Second)
+	ctx := context.Background()
+
+	// A failed manual removal reports on the native channel with its target.
+	response, status, reqErr := runner.dispatch(ctx, "container.remove", opParams{target: "web", force: true}, "http", "")
+	if reqErr != nil {
+		t.Fatalf("dispatch returned request error: %+v", reqErr)
+	}
+	if status != http.StatusBadGateway || response.OK {
+		t.Fatalf("expected failed execution, got status=%d ok=%v", status, response.OK)
+	}
+	mu.Lock()
+	if len(notifications) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(notifications))
+	}
+	got := notifications[0]
+	mu.Unlock()
+	if got.Kind != "nativeop.failure" {
+		t.Fatalf("expected nativeop.failure, got %q", got.Kind)
+	}
+	if got.Title != "Remove container failed" {
+		t.Fatalf("unexpected title %q", got.Title)
+	}
+	if got.Metadata["name"] != "container.remove" || got.Metadata["target"] != "web" {
+		t.Fatalf("notification metadata missing slug/target: %+v", got.Metadata)
+	}
+
+	// Scheduled jobs keep their own job.failure channel: no double report.
+	if _, _, reqErr := runner.dispatch(ctx, "container.remove", opParams{target: "web"}, "job", ""); reqErr != nil {
+		t.Fatalf("job dispatch returned request error: %+v", reqErr)
+	}
+	// Successes stay silent: routine operations notify nobody.
+	succeeding := fakeCommand(t, "podman", "#!/bin/sh\nexit 0\n")
+	runner.runtimes = stubRuntimes(map[string]string{"podman": succeeding})
+	if _, status, reqErr := runner.dispatch(ctx, "container.stop", opParams{target: "web"}, "http", ""); reqErr != nil || status != http.StatusOK {
+		t.Fatalf("expected success, got status=%d err=%+v", status, reqErr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notifications) != 1 {
+		t.Fatalf("expected still 1 notification, got %d", len(notifications))
 	}
 }
