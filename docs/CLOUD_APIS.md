@@ -380,9 +380,11 @@ is not a member of the workspace.
 
 Dimension keys are served by the workspace service and configurable; MaidCafe
 enforces `max_daemons` (registration limit), `polling_interval_seconds`
-(throttles daemon metric ingest and relay pickup, HTTP `429`), and
+(throttles daemon metric ingest, HTTP `429`), and
 `metrics_retention_days` (prunes stored metrics). A missing or non-positive
-dimension means no enforcement for that quota.
+dimension means no enforcement for that quota. Relay pickup is deliberately
+exempt: it is a tiny latency-critical request the daemon makes once per poll,
+so it is not throttled by this dimension.
 
 ### Notifications (user routes)
 
@@ -624,7 +626,7 @@ notification is stored under the daemon's workspace.
 #### `GET /api/daemons/:id/quota`
 
 Return the daemon's workspace-effective quota so it can self-tune its
-reporting and relay-poll cadence. `200` returns the same
+reporting cadence (metric ingest pacing). `200` returns the same
 `{workspace_id, quotas}` view as `GET /api/workspaces/:id/quota`; `401` on a
 bad/disabled daemon secret.
 

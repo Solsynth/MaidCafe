@@ -222,9 +222,9 @@ func (s *Service) workspaceQuota(ctx context.Context, workspaceID string) (map[s
 }
 
 // enforcePollInterval applies the workspace polling_interval_seconds quota to
-// daemon-initiated traffic (metric ingest, webhook relay pickup): requests
-// arriving sooner than the allowed interval are ErrRateLimited (HTTP 429).
-// A missing or non-positive dimension disables throttling.
+// daemon-initiated metric ingest: requests arriving sooner than the allowed
+// interval are ErrRateLimited (HTTP 429). A missing or non-positive dimension
+// disables throttling.
 func (s *Service) enforcePollInterval(daemon database.Daemon, quotas map[string]int64, now time.Time) error {
 	intervalSeconds := quotas["polling_interval_seconds"]
 	if intervalSeconds <= 0 {
@@ -321,10 +321,9 @@ type Service struct {
 	accounts   AccountClient
 	logger     *slog.Logger
 
-	// pollHit tracks the last accepted daemon-initiated request (metric ingest,
-	// webhook relay pickup) per daemon for the workspace polling_interval_seconds
-	// quota. In-memory only: accurate per cloud instance; multi-replica deploys
-	// should move this to shared state.
+	// pollHit tracks the last accepted daemon-initiated metric ingest per daemon
+	// for the workspace polling_interval_seconds quota. In-memory only: accurate
+	// per cloud instance; multi-replica deploys should move this to shared state.
 	pollMu  sync.Mutex
 	pollHit map[string]time.Time
 }
@@ -2039,17 +2038,11 @@ func (s *Service) CredentialByToken(ctx context.Context, token string) (*databas
 // ListPendingWebhooks leases and returns up to [limit] pending webhook
 // invocations for the daemon. Leases older than webhookLeaseDuration are
 // reclaimed first so a daemon that died mid-execution does not lose requests.
+// Relay pickup is deliberately exempt from the polling_interval_seconds
+// throttle: it is a tiny, latency-critical request the daemon makes once per
+// poll, and the quota exists to bound bulk reporting traffic.
 func (s *Service) ListPendingWebhooks(ctx context.Context, daemonID, secret string, limit int) ([]WebhookRequestView, error) {
-	d, err := s.authenticateDaemon(ctx, daemonID, secret)
-	if err != nil {
-		return nil, err
-	}
-	// Workspace polling_interval_seconds quota throttles relay pickup speed.
-	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.enforcePollInterval(d, quotas, time.Now().UTC()); err != nil {
+	if _, err := s.authenticateDaemon(ctx, daemonID, secret); err != nil {
 		return nil, err
 	}
 	if limit <= 0 || limit > webhookPendingLimit {

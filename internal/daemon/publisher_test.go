@@ -122,10 +122,9 @@ func TestCloudPublisherPacesThrottledTrafficByWorkspaceQuota(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(req)
 	})
 
-	// Metric ingest and relay pickup share one pace slot: the first request
-	// passes and records it, everything else inside the 3600s window is
-	// skipped client-side instead of burning a guaranteed 429. Ungated paths
-	// (notifications) keep flowing.
+	// Metric ingest is paced by the 3600s window: the first publish passes,
+	// the second is skipped client-side instead of burning a guaranteed 429.
+	// Relay pickup and notifications are unthrottled by design.
 	publisher.PublishMetrics(ctx, MetricsPayload{SentAt: time.Now().UTC(), UptimeSeconds: 1})
 	relay.pollOnce(ctx)
 	publisher.PublishMetrics(ctx, MetricsPayload{SentAt: time.Now().UTC(), UptimeSeconds: 2})
@@ -136,39 +135,36 @@ func TestCloudPublisherPacesThrottledTrafficByWorkspaceQuota(t *testing.T) {
 	if metricPosts != 1 {
 		t.Fatalf("metric posts = %d, want 1 (second publish should be paced)", metricPosts)
 	}
-	if pendingGets != 0 {
-		t.Fatalf("pending gets = %d, want 0 (relay pickup inside the poll interval)", pendingGets)
+	if pendingGets != 1 {
+		t.Fatalf("pending gets = %d, want 1 (relay pickup is not paced)", pendingGets)
 	}
 	if notificationPosts != 1 {
 		t.Fatalf("notification posts = %d, want 1 (unthrottled path must not be paced)", notificationPosts)
 	}
 }
-func TestCloudPublisherPrioritizesMetricsAfterRelayUsesSlot(t *testing.T) {
+func TestCloudPublisherPacesMetricsInsideQuotaWindow(t *testing.T) {
 	publisher := &CloudPublisher{
 		pollInterval:   time.Hour,
 		lastQuotaFetch: time.Now(),
 		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	ctx := context.Background()
-	if !publisher.pacedOK(ctx, false) {
-		t.Fatal("relay should claim an unused pace slot")
+	if !publisher.pacedOK(ctx) {
+		t.Fatal("first publish should claim an unused pace slot")
 	}
-	publisher.pacedDone(false, true)
+	publisher.pacedDone(true)
 
-	if publisher.pacedOK(ctx, true) {
-		t.Fatal("metric should wait for the relay's accepted request")
-	}
-	if publisher.pacedOK(ctx, false) {
-		t.Fatal("relay should yield while a metric is due")
+	if publisher.pacedOK(ctx) {
+		t.Fatal("second publish inside the window should be paced")
 	}
 
 	publisher.paceMu.Lock()
 	publisher.lastPaced = time.Now().Add(-2 * time.Hour)
 	publisher.paceMu.Unlock()
-	if !publisher.pacedOK(ctx, true) {
-		t.Fatal("metric should claim the next available slot")
+	if !publisher.pacedOK(ctx) {
+		t.Fatal("publish should claim the next available slot")
 	}
-	publisher.pacedDone(true, true)
+	publisher.pacedDone(true)
 }
 
 func TestCloudPublisherDoesNotConsumePaceSlotOnFailedMetric(t *testing.T) {

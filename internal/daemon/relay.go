@@ -14,7 +14,12 @@ import (
 // pending webhook invocations. Polling is deliberate: no long-lived
 // connections or push channels are maintained with the cloud, since those
 // would need an encrypted transport of their own.
-const webhookRelayInterval = time.Minute
+//
+// Relay pickup is the latency-critical CI path and is deliberately NOT
+// throttled by the workspace polling quota, so the tick is short: a request
+// enqueued through the cloud is picked up within this window no matter when
+// it landed.
+const webhookRelayInterval = 15 * time.Second
 
 type relayWebhookRequest struct {
 	ID        string `json:"id"`
@@ -75,17 +80,14 @@ func (r *WebhookRelay) Run(ctx context.Context) {
 }
 
 func (r *WebhookRelay) pollOnce(ctx context.Context) {
-	// Metric ingest and relay pickup share the cloud's per-daemon throttle.
-	// Metrics take priority when both cadences are due, preventing the relay
-	// ticker from starving metric uploads.
+	// Relay pickup is not throttled by the workspace polling quota: unlike
+	// metric ingest it is latency-sensitive, so each tick polls directly.
 	publisher := r.publisher.Load()
-	if publisher == nil || !publisher.pacedOK(ctx, false) {
+	if publisher == nil {
 		return
 	}
 	var pending relayPendingResponse
-	err := publisher.request(ctx, "GET", "/webhook-requests/pending", nil, &pending)
-	publisher.pacedDone(false, err == nil)
-	if err != nil {
+	if err := publisher.request(ctx, "GET", "/webhook-requests/pending", nil, &pending); err != nil {
 		r.logger.Warn("webhook relay poll failed", "error", err)
 		return
 	}

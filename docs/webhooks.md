@@ -23,7 +23,7 @@ There are two ways to invoke a hook:
 
 1. **Direct HTTP** — call the daemon's local API endpoint.
 2. **Cloud relay** — enqueue an invocation on the MaidKit cloud; the daemon
-   polls it (once a minute) and executes it on the host.
+   polls it (every 15 seconds) and executes it on the host.
 
 | Channel | Webhook | Action | Who authenticates |
 | --- | --- | --- | --- |
@@ -148,8 +148,8 @@ stdout/stderr are captured up to 8 KiB each.
 
 The relay lets a workspace member invoke a named webhook or action on a
 managed host through the cloud, without the member ever touching the host.
-The daemon polls for pending requests (immediately at startup, then once a
-minute), verifies the signature against its local configuration, executes the
+The daemon polls for pending requests (immediately at startup, then every 15
+seconds), verifies the signature against its local configuration, executes the
 hook, and reports the result back. Polling is deliberate: the cloud never
 holds a connection into the host.
 
@@ -160,7 +160,7 @@ sequenceDiagram
     participant D as Daemon
     U->>C: POST /api/daemons/:id/webhook-requests
     C-->>U: 201 {id, status: pending}
-    loop every minute
+    loop every 15 seconds
         D->>C: GET /api/daemons/:id/webhook-requests/pending
         C-->>D: requests (leased for 2 min)
     end
@@ -264,8 +264,10 @@ daemon holds it, `done` once reported.
 }
 ```
 
-Because the daemon polls once a minute, a relayed invocation takes up to one
-minute plus the hook's own runtime before the result appears.
+Because the daemon polls every 15 seconds and relay pickup is not throttled
+by the workspace polling quota, a relayed invocation appears within seconds
+of enqueue plus the hook's own runtime. Size `timeout_minutes` in CI against
+the hook's runtime (plus this pickup window), not against the poll cadence.
 
 ## 4. Signature computation
 

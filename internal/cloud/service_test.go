@@ -767,7 +767,7 @@ func TestMetricIngestRejectsOutOfRetention(t *testing.T) {
 	}
 }
 
-func TestWebhookRelayPickupRateLimited(t *testing.T) {
+func TestWebhookRelayPickupIsNotRateLimited(t *testing.T) {
 	svc, db, _, workspaces := testService(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -777,11 +777,17 @@ func TestWebhookRelayPickupRateLimited(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10); err != nil {
-		t.Fatalf("first pickup should be accepted: %v", err)
-	}
-	if _, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("expected ErrRateLimited, got %v", err)
+	// Relay pickup is the latency-critical CI path and is deliberately exempt
+	// from the polling_interval_seconds throttle (metric ingest still pays it,
+	// see TestMetricIngestRateLimited), so back-to-back pickups must succeed.
+	for i := 0; i < 2; i++ {
+		pending, err := svc.ListPendingWebhooks(ctx, created.ID, created.Secret, 10)
+		if err != nil {
+			t.Fatalf("pickup %d should be accepted: %v", i, err)
+		}
+		if len(pending) != 0 {
+			t.Fatalf("pickup %d returned %d requests, want 0", i, len(pending))
+		}
 	}
 }
 

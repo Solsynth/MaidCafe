@@ -46,18 +46,17 @@ type CloudPublisher struct {
 	logger   *slog.Logger
 
 	// Workspace quota pacing: the cloud throttles daemon-initiated metric
-	// ingest and webhook-relay pickup to at most one request per
-	// polling_interval_seconds per daemon (HTTP 429 otherwise). The daemon
-	// paces exactly those two paths itself, sharing one slot like the cloud's
-	// per-daemon bucket. Metrics are given priority so a relay ticker cannot
-	// starve metric uploads when both cadences are equal.
+	// ingest to at most one request per polling_interval_seconds per daemon
+	// (HTTP 429 otherwise). The daemon enforces the same window client-side so
+	// a publish inside the window is skipped instead of burning a guaranteed
+	// 429. Relay pickup is not paced: it is latency-critical and polls on its
+	// own cadence.
 	paceMu         sync.Mutex
 	pollInterval   time.Duration
 	lastQuotaFetch time.Time
 	lastPaced      time.Time
 	paceInFlight   bool
 	paceStarted    time.Time
-	metricsDue     bool
 }
 
 func NewCloudPublisher(cfg config.DaemonConfig, logger *slog.Logger) (*CloudPublisher, error) {
@@ -149,22 +148,14 @@ func (p *CloudPublisher) post(ctx context.Context, suffix string, payload any) e
 	return err
 }
 
-// pacedOK reports whether a cloud-throttled request may be sent now. Metrics
-// mark themselves due before checking the slot, so a relay poll cannot keep
-// winning a slot forever when both timers fire at the same cadence.
-func (p *CloudPublisher) pacedOK(ctx context.Context, metrics bool) bool {
+// pacedOK reports whether a metric publish may be sent now. It enforces the
+// workspace polling_interval_seconds window client-side so a publish inside
+// the window is skipped instead of burning a guaranteed 429.
+func (p *CloudPublisher) pacedOK(ctx context.Context) bool {
 	p.refreshQuota(ctx)
 	p.paceMu.Lock()
 	defer p.paceMu.Unlock()
-	if metrics {
-		p.metricsDue = true
-	} else if p.metricsDue {
-		return false
-	}
 	if p.pollInterval <= 0 {
-		if metrics {
-			p.metricsDue = false
-		}
 		return true
 	}
 	if p.paceInFlight {
@@ -176,18 +167,15 @@ func (p *CloudPublisher) pacedOK(ctx context.Context, metrics bool) bool {
 	}
 	p.paceInFlight = true
 	p.paceStarted = now
-	if metrics {
-		p.metricsDue = false
-	}
 	return true
 }
 
-func (p *CloudPublisher) pacedDone(metrics, success bool) {
+// pacedDone releases the pace slot after the publish settles. Only a
+// successful publish advances the window, so a transient failure retries on
+// the next tick without consuming the slot.
+func (p *CloudPublisher) pacedDone(success bool) {
 	p.paceMu.Lock()
 	defer p.paceMu.Unlock()
-	if metrics && !success {
-		p.metricsDue = true
-	}
 	if !p.paceInFlight {
 		return
 	}
@@ -229,12 +217,12 @@ func (p *CloudPublisher) PublishMetrics(ctx context.Context, payload MetricsPayl
 	if p == nil {
 		return
 	}
-	if !p.pacedOK(ctx, true) {
+	if !p.pacedOK(ctx) {
 		p.logger.Debug("metric publish skipped: inside workspace poll interval")
 		return
 	}
 	err := p.post(ctx, "/metrics", payload)
-	p.pacedDone(true, err == nil)
+	p.pacedDone(err == nil)
 }
 
 // WorkspaceQuota returns the connected workspace's effective quota map (plan
