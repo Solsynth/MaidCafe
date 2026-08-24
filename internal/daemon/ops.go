@@ -442,6 +442,7 @@ func (r *nativeOpRunner) publishFailure(slug, displayName, target string, respon
 func runOpOnce(ctx context.Context, attempt opAttempt) (stdout, stderr string, exitCode int, err error) {
 	cmd := exec.CommandContext(ctx, attempt.command, attempt.args...)
 	cmd.Dir = attempt.cwd
+	cmd.WaitDelay = execPipeWaitDelay
 	outBuf, errBuf := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
 	cmd.Stdout, cmd.Stderr = outBuf, errBuf
 	err = cmd.Run()

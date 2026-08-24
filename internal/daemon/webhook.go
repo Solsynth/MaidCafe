@@ -287,6 +287,14 @@ func (e *WebhookExecutor) ExecuteWebhook(name string, body []byte, signature str
 	return e.execute(context.Background(), hook, body, source, invokedBy)
 }
 
+// execPipeWaitDelay bounds how long a run waits for its captured-output
+// pipes to close after the command exits. A killed command can leave
+// descendants (e.g. the docker CLI spawned by docker-compose) holding the
+// pipe write ends open; without this bound the executor only notices the
+// timeout once those children exit, inflating duration_ms and delaying the
+// result report past the configured deadline.
+const execPipeWaitDelay = 5 * time.Second
+
 // buildRunCommand returns the exec.Cmd for a configured hook, honoring the
 // hook's working directory, environment and run-as user.
 //
@@ -316,6 +324,7 @@ func buildRunCommand(ctx context.Context, hook config.WebhookConfig, command str
 		if len(hook.Env) > 0 {
 			cmd.Env = append(os.Environ(), hook.Env...)
 		}
+		cmd.WaitDelay = execPipeWaitDelay
 		return cmd
 	}
 	argv := []string{"sudo", "-H", "-u", hook.User}
@@ -329,6 +338,7 @@ func buildRunCommand(ctx context.Context, hook config.WebhookConfig, command str
 		// the target user instead.
 		cmd.Dir = hook.Cwd
 	}
+	cmd.WaitDelay = execPipeWaitDelay
 	return cmd
 }
 

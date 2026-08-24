@@ -441,6 +441,36 @@ func TestPrependWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestExecuteBoundedByWaitDelayOnLingeringChildren(t *testing.T) {
+	// The script exits immediately but leaves a background child holding the
+	// captured-output pipe open. Without WaitDelay the run would block until
+	// that child exits (30s), so a timed-out docker-compose would delay its
+	// 504 report by the child's lifetime; with WaitDelay the run returns
+	// shortly after the script exits.
+	script := executable(t, "#!/bin/sh\nsleep 30 &\nexit 0\n")
+	cfg := config.DaemonConfig{
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		Actions: []config.WebhookConfig{{
+			Name: "linger", Command: script, Enabled: true,
+		}},
+	}
+	executor := NewWebhookExecutor(cfg)
+	started := time.Now()
+	result, requestErr := executor.RunAction(context.Background(), "linger", nil, "test", "test")
+	elapsed := time.Since(started)
+	if requestErr != nil {
+		t.Fatalf("unexpected request error: %v", requestErr)
+	}
+	if result.OK {
+		t.Fatal("run with lingering pipe child reported success")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("run blocked on lingering pipe child for %s", elapsed)
+	}
+}
+
 func TestExecuteUsesPerHookTimeout(t *testing.T) {
 	sleep := executable(t, "#!/bin/sh\nsleep 1\n")
 	cfg := config.DaemonConfig{
@@ -448,13 +478,12 @@ func TestExecuteUsesPerHookTimeout(t *testing.T) {
 		MaxBodyBytes:      1024,
 		MaxConcurrentRuns: 1,
 		Actions: []config.WebhookConfig{{
-			Name:    "slow-but-allowed",
-			Command: sleep,
-			Enabled: true,
+			Name: "slow-but-allowed", Command: sleep, Enabled: true,
 			Timeout: 2 * time.Second,
 		}},
 	}
 	executor := NewWebhookExecutor(cfg)
+
 	result, requestErr := executor.RunAction(context.Background(), "slow-but-allowed", nil, "test", "test")
 	if requestErr != nil {
 		t.Fatal(requestErr)
