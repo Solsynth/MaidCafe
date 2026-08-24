@@ -62,6 +62,10 @@ runtimes = ["java", "dotnet", "python", "node", "deno", "go", "ruby", "php"]
 watchedProcesses = []
 watchedProcessesFile = "/var/lib/maidcafe/watched-processes.json"
 requestTimeout = "10s"
+# Per-run deadline for hooks without their own `timeout`. 0 disables the
+# deadline: the command runs until it completes (e.g. a deploy whose image
+# pull may take arbitrarily long). An unbounded run holds a concurrency slot
+# and blocks later relayed invocations while it runs.
 scriptTimeout = "30s"
 maxBodyBytes = 65536
 maxConcurrentRuns = 4

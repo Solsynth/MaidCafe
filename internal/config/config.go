@@ -145,6 +145,10 @@ type DaemonConfig struct {
 	WatchedProcesses     []string         `mapstructure:"watchedProcesses"`
 	WatchedProcessesFile string           `mapstructure:"watchedProcessesFile"`
 	ProcessesLimit       int              `mapstructure:"processesLimit"`
+	// ScriptTimeout bounds each run that has no per-hook timeout. 0 disables
+	// the deadline entirely: commands run until they complete (slow deploys,
+	// long pulls). A run with no deadline still holds a concurrency slot and
+	// blocks later relayed invocations while it runs.
 	RequestTimeout       time.Duration    `mapstructure:"requestTimeout"`
 	ScriptTimeout        time.Duration    `mapstructure:"scriptTimeout"`
 	MaxBodyBytes         int64            `mapstructure:"maxBodyBytes"`
@@ -220,7 +224,7 @@ type WebhookConfig struct {
 	// assignments, which sudo applies on top of its reset environment.
 	Env []string `mapstructure:"env"`
 	// Timeout overrides the daemon-wide scriptTimeout for this hook (e.g.
-	// "2m"); zero or absent uses the daemon-wide value.
+	// "2m"); zero or absent uses the daemon-wide value (which 0 disables).
 	Timeout time.Duration `mapstructure:"timeout"`
 }
 
@@ -244,7 +248,8 @@ type JobConfig struct {
 	// Enabled defaults to true when absent.
 	Enabled *bool `mapstructure:"enabled"`
 	// Timeout overrides the daemon-wide scriptTimeout for this job; zero uses
-	// the daemon-wide value (native compose ops keep their own 5m bound).
+	// the daemon-wide value (which 0 disables; native compose ops keep their
+	// own 5m bound).
 	Timeout time.Duration `mapstructure:"timeout"`
 	// NotifyOnFailure publishes a job.failure notification when a run exits
 	// non-zero or fails to start.
@@ -820,8 +825,8 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.RequestTimeout <= 0 {
 		return fmt.Errorf("daemon.requestTimeout must be positive")
 	}
-	if c.Daemon.ScriptTimeout <= 0 {
-		return fmt.Errorf("daemon.scriptTimeout must be positive")
+	if c.Daemon.ScriptTimeout < 0 {
+		return fmt.Errorf("daemon.scriptTimeout must not be negative (0 disables the run deadline)")
 	}
 	if c.Daemon.MaxBodyBytes <= 0 {
 		return fmt.Errorf("daemon.maxBodyBytes must be positive")

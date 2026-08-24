@@ -441,6 +441,23 @@ func TestPrependWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestExecuteWithZeroTimeoutRunsToCompletion(t *testing.T) {
+	sleep := executable(t, "#!/bin/sh\nsleep 1\n")
+	// scriptTimeout = 0 disables the run deadline: the script must run to
+	// completion instead of being cut off instantly.
+	cfg := config.DaemonConfig{ScriptTimeout: 0, MaxBodyBytes: 1024, MaxConcurrentRuns: 1, Actions: []config.WebhookConfig{{Name: "long", Command: sleep, Enabled: true}}}
+	executor := NewWebhookExecutor(cfg)
+	started := time.Now()
+	result, requestErr := executor.RunAction(context.Background(), "long", nil, "test", "test")
+	elapsed := time.Since(started)
+	if requestErr != nil || !result.OK {
+		t.Fatalf("run failed: result=%+v err=%v", result, requestErr)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("run returned in %s; a zero deadline must not cut the script off", elapsed)
+	}
+}
+
 func TestExecuteBoundedByWaitDelayOnLingeringChildren(t *testing.T) {
 	// The script exits immediately but leaves a background child holding the
 	// captured-output pipe open. Without WaitDelay the run would block until
@@ -466,7 +483,9 @@ func TestExecuteBoundedByWaitDelayOnLingeringChildren(t *testing.T) {
 	if result.OK {
 		t.Fatal("run with lingering pipe child reported success")
 	}
-	if elapsed > 10*time.Second {
+	// The child sleeps 30s; 15s clearly separates the WaitDelay-bound run
+	// (~5s) from an unbounded one (~30s) even under load.
+	if elapsed > 15*time.Second {
 		t.Fatalf("run blocked on lingering pipe child for %s", elapsed)
 	}
 }

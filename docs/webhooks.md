@@ -67,7 +67,8 @@ enabled = true
 | `args` | fixed argument list; the request body is **never** appended to args |
 | `enabled` | a disabled or unknown name returns `404` |
 | `script` | treat `command` as a script body; `{{ NAME }}` placeholders are substituted from a JSON request body before running |
-| `cwd`, `user`, `env`, `timeout` | working directory, run-as user (via sudo), environment assignments, per-hook timeout override |
+| `cwd`, `user`, `env`, `timeout` | working directory, run-as user (via sudo), environment assignments, per-hook timeout override; `timeout` zero/absent falls back to `daemon.scriptTimeout` |
+
 
 The request body is opaque bytes piped to the command's stdin. It is never
 parsed into command arguments. For `script = true` hooks, a JSON body also
@@ -141,6 +142,15 @@ failures return an error body `{"error": "..."}`:
 | `429` | concurrency exhausted (`daemon.maxConcurrentRuns`, default 4) |
 | `502` | command exited non-zero |
 | `504` | command exceeded the timeout (`daemon.scriptTimeout` or the hook's `timeout`) |
+
+A `daemon.scriptTimeout` of `0` disables the run deadline: commands run until
+they complete (e.g. a deploy whose image pull may take arbitrarily long).
+Per-hook `timeout` values still bound their hooks, so an unbounded default can
+be combined with explicit timeouts on the rest. An unbounded run holds a
+concurrency slot and blocks later relayed invocations until it finishes — and
+MaidFlow's `timeout_minutes` still bounds the CI wait, so a run that outlives
+it keeps executing on the host while the job fails. |
+
 
 stdout/stderr are captured up to 8 KiB each.
 

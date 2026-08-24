@@ -464,7 +464,19 @@ func (e *WebhookExecutor) execute(
 		// Per-hook override; the daemon-wide scriptTimeout stays the default.
 		timeout = hook.Timeout
 	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	// A zero effective timeout disables the deadline (matching the "0
+	// disables" convention of the other daemon settings): the command runs
+	// until it completes on its own. Useful for slow deploys that must not be
+	// cut off mid-pull. Note the run still holds a concurrency slot and the
+	// relay processes requests serially, so an unbounded run blocks later
+	// relayed invocations until it finishes.
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if timeout <= 0 {
+		runCtx, cancel = context.WithCancel(ctx)
+	} else {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 	command, args := hook.Command, hook.Args
 	if hook.Script {

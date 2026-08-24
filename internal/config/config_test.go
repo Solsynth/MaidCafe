@@ -297,6 +297,19 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 			},
 		},
 		{
+			name: "zero scriptTimeout disables deadline",
+			mutate: func(d *DaemonConfig) {
+				d.ScriptTimeout = 0
+			},
+			ok: true,
+		},
+		{
+			name: "negative scriptTimeout rejected",
+			mutate: func(d *DaemonConfig) {
+				d.ScriptTimeout = -time.Second
+			},
+		},
+		{
 			name: "webhooks validated the same way",
 			mutate: func(d *DaemonConfig) {
 				d.Webhooks = []WebhookConfig{{

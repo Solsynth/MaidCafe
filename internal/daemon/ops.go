@@ -332,7 +332,15 @@ func (r *nativeOpRunner) executeNative(
 		return executionResponse{Name: slug}, http.StatusTooManyRequests
 	}
 	started := time.Now()
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	// A zero timeout disables the deadline; compose ops keep their explicit
+	// 5m bound so they never run unbounded.
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if timeout <= 0 {
+		runCtx, cancel = context.WithCancel(ctx)
+	} else {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 	var response executionResponse
 	response.Name = slug

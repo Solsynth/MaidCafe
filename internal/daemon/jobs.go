@@ -121,7 +121,14 @@ func (r *jobRunner) runJob(ctx context.Context, state *jobState) {
 	r.mu.Unlock()
 
 	body, _ := json.Marshal(state.cfg.Body)
-	jobCtx, cancel := context.WithTimeout(ctx, r.timeoutFor(state.cfg))
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if t := r.timeoutFor(state.cfg); t <= 0 {
+		// No deadline: the job runs until the command completes.
+		jobCtx, cancel = context.WithCancel(ctx)
+	} else {
+		jobCtx, cancel = context.WithTimeout(ctx, t)
+	}
 	defer cancel()
 	invokedBy := "job:" + state.cfg.Name
 
