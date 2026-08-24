@@ -21,26 +21,37 @@ import (
 )
 
 type MetricsPayload struct {
-	SentAt             time.Time `json:"sent_at"`
-	HostID             string    `json:"host_id,omitempty"`
-	UptimeSeconds      int64     `json:"uptime_seconds"`
-	ProcessMemoryBytes int64     `json:"process_memory_bytes"`
-	CPUPercent         float64   `json:"cpu_percent"`
-	CPUCount           int       `json:"cpu_count"`
-	Load1              float64   `json:"load1"`
-	Load5              float64   `json:"load5"`
-	Load15             float64   `json:"load15"`
-	MemoryUsedPercent  float64   `json:"memory_used_percent"`
-	MemoryUsedBytes    uint64    `json:"memory_used_bytes"`
-	MemoryTotalBytes   uint64    `json:"memory_total_bytes"`
-	SwapTotalKb        int64     `json:"swap_total_kb"`
-	SwapFreeKb         int64     `json:"swap_free_kb"`
-	DiskTotalKb        int64     `json:"disk_total_kb"`
-	DiskAvailableKb    int64     `json:"disk_available_kb"`
-	NetRxBytes         uint64    `json:"net_rx_bytes"`
-	NetTxBytes         uint64    `json:"net_tx_bytes"`
-	WebhookExecutions  uint64    `json:"webhook_executions"`
-	WebhookFailures    uint64    `json:"webhook_failures"`
+	SentAt             time.Time   `json:"sent_at"`
+	HostID             string      `json:"host_id,omitempty"`
+	UptimeSeconds      int64       `json:"uptime_seconds"`
+	ProcessMemoryBytes int64       `json:"process_memory_bytes"`
+	CPUPercent         float64     `json:"cpu_percent"`
+	CPUCount           int         `json:"cpu_count"`
+	Load1              float64     `json:"load1"`
+	Load5              float64     `json:"load5"`
+	Load15             float64     `json:"load15"`
+	MemoryUsedPercent  float64     `json:"memory_used_percent"`
+	MemoryUsedBytes    uint64      `json:"memory_used_bytes"`
+	MemoryTotalBytes   uint64      `json:"memory_total_bytes"`
+	SwapTotalKb        int64       `json:"swap_total_kb"`
+	SwapFreeKb         int64       `json:"swap_free_kb"`
+	DiskTotalKb        int64       `json:"disk_total_kb"`
+	DiskAvailableKb    int64       `json:"disk_available_kb"`
+	Disks              []DiskUsage `json:"disks,omitempty"`
+	NetRxBytes         uint64      `json:"net_rx_bytes"`
+	NetTxBytes         uint64      `json:"net_tx_bytes"`
+	WebhookExecutions  uint64      `json:"webhook_executions"`
+	WebhookFailures    uint64      `json:"webhook_failures"`
+}
+
+// DiskUsage is one mounted filesystem's capacity snapshot. AvailableKb is the
+// free space gopsutil reports (f_bfree, reserved blocks included), so used =
+// total - available stays consistent with the aggregate root fields.
+type DiskUsage struct {
+	Mount       string `json:"mount"`
+	Filesystem  string `json:"filesystem,omitempty"`
+	TotalKb     int64  `json:"total_kb"`
+	AvailableKb int64  `json:"available_kb"`
 }
 
 const (
@@ -247,6 +258,59 @@ func (m *MetricsCollector) compactStorageLocked() error {
 	return nil
 }
 
+// virtualFilesystems are filesystem identifiers that never back user data;
+// their partitions are skipped so the disk list stays limited to physical
+// and network storage.
+var virtualFilesystems = map[string]bool{
+	"tmpfs": true, "devtmpfs": true, "devfs": true, "udev": true,
+	"proc": true, "sysfs": true, "cgroup": true, "cgroup2": true,
+	"overlay": true, "squashfs": true, "ramfs": true, "hugetlbfs": true,
+	"mqueue": true, "shm": true, "devpts": true, "debugfs": true,
+	"tracefs": true, "securityfs": true, "configfs": true, "fusectl": true,
+	"pstore": true, "efivarfs": true, "autofs": true, "binfmt_misc": true,
+	"rpc_pipefs": true, "nsfs": true, "bpf": true, "iso9660": true,
+	"udf": true, "none": true, "map": true,
+}
+
+func reportablePartition(part disk.PartitionStat) bool {
+	if virtualFilesystems[part.Fstype] {
+		return false
+	}
+	return strings.HasPrefix(part.Device, "/dev/") ||
+		strings.HasPrefix(part.Device, "//") || // SMB/CIFS share
+		strings.Contains(part.Device, ":") // NFS host:/export, Windows C:
+}
+
+// collectDisks snapshots every reportable mounted filesystem (physical
+// partitions and network mounts), root first, deduplicated by device so a
+// filesystem mounted in several places (bind mounts, macOS synthesized
+// snapshots) never counts twice.
+func collectDisks() []DiskUsage {
+	var disks []DiskUsage
+	partitions, err := disk.Partitions(false)
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, part := range partitions {
+		if seen[part.Device] || !reportablePartition(part) {
+			continue
+		}
+		seen[part.Device] = true
+		usage, err := disk.Usage(part.Mountpoint)
+		if err != nil {
+			continue
+		}
+		disks = append(disks, DiskUsage{
+			Mount:       part.Mountpoint,
+			Filesystem:  part.Device,
+			TotalKb:     int64(usage.Total / 1024),
+			AvailableKb: int64(usage.Free / 1024),
+		})
+	}
+	return disks
+}
+
 func (m *MetricsCollector) Collect() MetricsPayload {
 	var stats runtime.MemStats
 	runtime.ReadMemStats(&stats)
@@ -276,6 +340,7 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 		diskTotalKb = int64(usage.Total / 1024)
 		diskAvailableKb = int64(usage.Free / 1024)
 	}
+	disks := collectDisks()
 	var netRxBytes, netTxBytes uint64
 	if counters, err := net.IOCounters(true); err == nil {
 		for _, counter := range counters {
@@ -309,6 +374,7 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 		SwapFreeKb:         swapFreeKb,
 		DiskTotalKb:        diskTotalKb,
 		DiskAvailableKb:    diskAvailableKb,
+		Disks:              disks,
 		NetRxBytes:         netRxBytes,
 		NetTxBytes:         netTxBytes,
 		WebhookExecutions:  successes + failures,
