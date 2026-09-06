@@ -326,8 +326,7 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 	var memoryUsedPercent float64
 	var memoryUsedBytes, memoryTotalBytes uint64
 	if stats, err := mem.VirtualMemory(); err == nil {
-		memoryUsedPercent = stats.UsedPercent
-		memoryUsedBytes = stats.Used
+		memoryUsedBytes, memoryUsedPercent = usedMemory(stats)
 		memoryTotalBytes = stats.Total
 	}
 	var swapTotalKb, swapFreeKb int64
@@ -380,4 +379,27 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 		WebhookExecutions:  successes + failures,
 		WebhookFailures:    failures,
 	}
+}
+
+// usedMemory computes used bytes and the used percentage from gopsutil's
+// memory snapshot using MemAvailable semantics (used = total - available), not
+// gopsutil's legacy Total - Free - Buffers - Cached. The legacy formula credits
+// every reclaimable page cache byte as free, so it under-reports usage on
+// Linux and stays flat while a memory-hungry process evicts cache — exactly
+// the values the MaidKit dashboard/overview/S-sidebar already show via the
+// SSH collector (MemTotal - MemAvailable). Keeping both channels on the same
+// semantics makes every MaidKit surface agree and lets the activity chart
+// move when a process actually consumes memory.
+func usedMemory(stats *mem.VirtualMemoryStat) (usedBytes uint64, usedPercent float64) {
+	if stats.Total == 0 {
+		return 0, 0
+	}
+	used := stats.Total - stats.Available
+	percent := float64(used) / float64(stats.Total) * 100.0
+	// Guard against gopsutil returning Available > Total on exotic hosts.
+	if used > stats.Total {
+		used = stats.Total
+		percent = 100.0
+	}
+	return used, percent
 }
