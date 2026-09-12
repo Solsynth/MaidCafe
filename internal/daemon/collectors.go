@@ -315,11 +315,13 @@ func resolveRuntimeBinary(ctx context.Context, name string) string {
 
 // containerJSONLine mirrors the fields of one `ps -a --format '{{json .}}'`
 // line. Podman emits "Id" while Docker emits "ID"; Labels may be a JSON object
-// or a comma-joined "k=v,k2=v2" string depending on runtime/version.
+// or a comma-joined "k=v,k2=v2" string depending on runtime/version. Names is
+// usually a JSON array, but some runtimes emit a bare string for a
+// single-named container, so it is decoded leniently via parseNames.
 type containerJSONLine struct {
 	ID     string          `json:"ID"`
 	Id     string          `json:"Id"`
-	Names  []string        `json:"Names"`
+	Names  json.RawMessage `json:"Names"`
 	Image  string          `json:"Image"`
 	State  string          `json:"State"`
 	Status string          `json:"Status"`
@@ -342,9 +344,10 @@ func parseContainerLines(out []byte) ([]containerEntry, error) {
 		if id == "" {
 			id = raw.Id
 		}
+		names := parseNames(raw.Names)
 		name := ""
-		if len(raw.Names) > 0 {
-			name = raw.Names[0]
+		if len(names) > 0 {
+			name = names[0]
 		}
 		labels := parseContainerLabels(raw.Labels)
 		project := labels["com.docker.compose.project"]
@@ -364,6 +367,24 @@ func parseContainerLines(out []byte) ([]containerEntry, error) {
 		return nil, err
 	}
 	return entries, nil
+}
+
+// parseNames accepts both the array form docker and podman emit for the
+// Names field and the bare string form some runtimes emit for a
+// single-named container or image.
+func parseNames(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var names []string
+	if err := json.Unmarshal(raw, &names); err == nil {
+		return names
+	}
+	var name string
+	if err := json.Unmarshal(raw, &name); err == nil && name != "" {
+		return []string{name}
+	}
+	return nil
 }
 
 func parseContainerLabels(raw json.RawMessage) map[string]string {
@@ -493,14 +514,15 @@ func (c *ImagesCollector) marshal() ([]byte, error) {
 
 // imageJSONLine mirrors one `images --format '{{json .}}'` line. Podman emits
 // "Id"/"RepoTags"/"Names" and an integer Size; Docker emits "ID"/"Repository"/
-// "Tag" and a string Size.
+// "Tag" and a string Size. Names is usually a JSON array but may be a bare
+// string on some runtimes, so it is decoded leniently via parseNames.
 type imageJSONLine struct {
 	ID         string          `json:"ID"`
 	Id         string          `json:"Id"`
 	Repository string          `json:"Repository"`
 	Tag        string          `json:"Tag"`
 	RepoTags   []string        `json:"RepoTags"`
-	Names      []string        `json:"Names"`
+	Names      json.RawMessage `json:"Names"`
 	Size       json.RawMessage `json:"Size"`
 	Created    int64           `json:"Created"`
 	Digest     string          `json:"Digest"`
@@ -524,7 +546,7 @@ func parseImageLines(out []byte) ([]imageEntry, error) {
 		}
 		tags := raw.RepoTags
 		if len(tags) == 0 {
-			tags = raw.Names
+			tags = parseNames(raw.Names)
 		}
 		if len(tags) == 0 && !strings.HasPrefix(raw.Repository, "<none>") {
 			tag := raw.Tag

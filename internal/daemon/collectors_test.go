@@ -207,13 +207,14 @@ func TestParseJstatGcutilOutput(t *testing.T) {
 func TestParseContainerLinesExtractsComposeProject(t *testing.T) {
 	input := `{"Id":"abc123","Names":["web"],"Image":"nginx:1.25","State":"running","Status":"Up 2 hours","Labels":"com.docker.compose.project=myapp,maintainer=me"}` + "\n" +
 		`{"ID":"def456","Names":["db"],"Image":"postgres:16","State":"exited","Status":"Exited (0) 3 hours ago","Labels":{"io.podman.compose.project":"stack","version":"1"}}` + "\n" +
-		`{"Id":"ghi789","Names":null,"Image":"busybox","State":"created","Status":"","Labels":null}` + "\n"
+		`{"Id":"ghi789","Names":null,"Image":"busybox","State":"created","Status":"","Labels":null}` + "\n" +
+		`{"ID":"jkl012","Names":"maibot-core","Image":"sengokucola/aibot:latest","State":"running","Status":"Up About an hour","Labels":"com.docker.compose.project=maibot"}` + "\n"
 	entries, err := parseContainerLines([]byte(input))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("parsed %d containers, want 3", len(entries))
+	if len(entries) != 4 {
+		t.Fatalf("parsed %d containers, want 4", len(entries))
 	}
 	first := entries[0]
 	if first.ID != "abc123" || first.Name != "web" || first.Image != "nginx:1.25" ||
@@ -227,6 +228,11 @@ func TestParseContainerLinesExtractsComposeProject(t *testing.T) {
 	third := entries[2]
 	if third.ID != "ghi789" || third.Name != "" || third.ComposeProject != "" {
 		t.Fatalf("third container parsed as %#v", third)
+	}
+	fourth := entries[3]
+	if fourth.ID != "jkl012" || fourth.Name != "maibot-core" ||
+		fourth.Image != "sengokucola/aibot:latest" || fourth.ComposeProject != "maibot" {
+		t.Fatalf("string-names container parsed as %#v", fourth)
 	}
 }
 
@@ -311,13 +317,14 @@ func TestParseContainerLinesEmptyReturnsEmptySlice(t *testing.T) {
 func TestParseImageLinesDockerAndPodmanForms(t *testing.T) {
 	input := `{"ID":"abc123def456","Repository":"nginx","Tag":"latest","Size":"192560829","Created":1730000000,"Digest":"<none>"}` + "\n" +
 		`{"Id":"sha256:ffffffffffff","RepoTags":["docker.io/library/postgres:16","localhost/dev:edge"],"Size":98765432,"Created":1730000001,"Digest":"sha256:aaaa"}` + "\n" +
-		`{"ID":"unused12345","Repository":"<none>","Tag":"<none>","Size":"123","Created":1730000002}` + "\n"
+		`{"ID":"unused12345","Repository":"<none>","Tag":"<none>","Size":"123","Created":1730000002}` + "\n" +
+		`{"Id":"sha256:beefbeef","Names":"docker.io/library/redis:7","Size":45678,"Created":1730000003}` + "\n"
 	entries, err := parseImageLines([]byte(input))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("parsed %d images, want 3", len(entries))
+	if len(entries) != 4 {
+		t.Fatalf("parsed %d images, want 4", len(entries))
 	}
 	first := entries[0]
 	if first.ID != "abc123def456" || len(first.Tags) != 1 || first.Tags[0] != "nginx:latest" ||
@@ -333,6 +340,11 @@ func TestParseImageLinesDockerAndPodmanForms(t *testing.T) {
 	third := entries[2]
 	if len(third.Tags) != 0 || third.Size != 123 {
 		t.Fatalf("untagged image parsed as %#v", third)
+	}
+	fourth := entries[3]
+	if fourth.ID != "sha256:beefbeef" || len(fourth.Tags) != 1 ||
+		fourth.Tags[0] != "docker.io/library/redis:7" || fourth.Size != 45678 {
+		t.Fatalf("string-names image parsed as %#v", fourth)
 	}
 }
 
