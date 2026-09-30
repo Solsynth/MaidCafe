@@ -53,8 +53,57 @@ command = "/bin/cat"
 		cfg.Daemon.Runtimes[7] != "php" ||
 		len(cfg.Daemon.WatchedProcesses) != 0 ||
 		cfg.Daemon.WatchedProcessesFile != "/var/lib/maidcafe/watched-processes.json" ||
+		cfg.Daemon.Terminal.Enabled ||
+		cfg.Daemon.Terminal.Secret != "" ||
+		len(cfg.Daemon.Terminal.Shells) != 0 ||
+		len(cfg.Daemon.Terminal.AllowedOrigins) != 0 ||
+		cfg.Daemon.Terminal.AllowRemote ||
+		cfg.Daemon.Terminal.MaxSessions != TerminalDefaultMaxSessions ||
+		cfg.Daemon.Terminal.IdleTimeout != 15*time.Minute ||
+		cfg.Daemon.Terminal.MaxLifetime != 8*time.Hour ||
 		cfg.Daemon.ProcessesLimit != 50 {
 		t.Fatalf("unexpected daemon defaults: %#v", cfg.Daemon)
+	}
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonTerminalConfigParsesFromTOML(t *testing.T) {
+	path := writeConfig(t, `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+[daemon.terminal]
+enabled = true
+secret = "terminal-secret"
+shells = ["/bin/sh", "/bin/bash"]
+users = ["root"]
+cwd = "/srv/app"
+env = ["LANG=C.UTF-8"]
+allowedOrigins = ["maidkit.solsynth.dev"]
+allowRemote = true
+maxSessions = 5
+idleTimeout = "3m"
+maxLifetime = "2h"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := cfg.Daemon.Terminal
+	if !terminal.Enabled ||
+		terminal.Secret != "terminal-secret" ||
+		len(terminal.Shells) != 2 || terminal.Shells[1] != "/bin/bash" ||
+		len(terminal.Users) != 1 || terminal.Users[0] != "root" ||
+		terminal.Cwd != "/srv/app" ||
+		len(terminal.Env) != 1 || terminal.Env[0] != "LANG=C.UTF-8" ||
+		len(terminal.AllowedOrigins) != 1 || terminal.AllowedOrigins[0] != "maidkit.solsynth.dev" ||
+		!terminal.AllowRemote ||
+		terminal.MaxSessions != 5 ||
+		terminal.IdleTimeout != 3*time.Minute ||
+		terminal.MaxLifetime != 2*time.Hour {
+		t.Fatalf("unexpected terminal config: %#v", terminal)
 	}
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatal(err)
@@ -316,6 +365,125 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 					Name: "w", Secret: "s", Command: "/bin/true", Enabled: true,
 					Cwd: "relative",
 				}}
+			},
+		},
+		{
+			name: "zero maxSessions uses the default",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}}
+			},
+			ok: true,
+		},
+		{
+			name: "fully populated terminal accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{
+					Enabled:        true,
+					Secret:         "terminal-secret",
+					Shells:         []string{"/bin/sh", "/bin/bash"},
+					Users:          []string{current.Username},
+					Cwd:            "/srv/app",
+					Env:            []string{"LANG=C.UTF-8", "_X=1"},
+					AllowedOrigins: []string{"maidkit.solsynth.dev", "https://*.solsynth.dev"},
+					AllowRemote:    true,
+					MaxSessions:    4,
+					IdleTimeout:    15 * time.Minute,
+					MaxLifetime:    8 * time.Hour,
+				}
+			},
+			ok: true,
+		},
+		{
+			name: "enabled without shells rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true}
+			},
+		},
+		{
+			name: "relative terminal shell rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"bin/sh"}}
+			},
+		},
+		{
+			name: "duplicate terminal shell rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh", "/bin/sh"}}
+			},
+		},
+		{
+			name: "duplicate terminal user rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{
+					Enabled: true, Shells: []string{"/bin/sh"},
+					Users: []string{current.Username, current.Username},
+				}
+			},
+		},
+		{
+			name: "missing terminal user rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{
+					Enabled: true, Shells: []string{"/bin/sh"},
+					Users: []string{"definitely-not-a-real-user-xyz"},
+				}
+			},
+		},
+		{
+			name: "relative terminal cwd rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, Cwd: "srv/app"}
+			},
+		},
+		{
+			name: "malformed terminal env rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, Env: []string{"1BAD=value"}}
+			},
+		},
+		{
+			name: "terminal secret with whitespace rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, Secret: " padded "}
+			},
+		},
+		{
+			name: "bare wildcard origin rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, AllowedOrigins: []string{"*"}}
+			},
+		},
+		{
+			name: "malformed origin pattern rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, AllowedOrigins: []string{"["}}
+			},
+		},
+		{
+			name: "oversized terminal maxSessions rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, MaxSessions: 9}
+			},
+		},
+		{
+			name: "negative terminal idle timeout rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, IdleTimeout: -time.Second}
+			},
+		},
+		{
+			name: "negative terminal max lifetime rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{Enabled: true, Shells: []string{"/bin/sh"}, MaxLifetime: -time.Second}
+			},
+		},
+		{
+			name: "terminal max lifetime shorter than idle timeout rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Terminal = TerminalConfig{
+					Enabled: true, Shells: []string{"/bin/sh"},
+					IdleTimeout: time.Hour, MaxLifetime: time.Minute,
+				}
 			},
 		},
 	} {

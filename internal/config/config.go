@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -103,8 +104,14 @@ type DaemonConfig struct {
 	LogsDir string `mapstructure:"logsDir"`
 	// LogAlertsDir holds one `<slug>.toml` fragment per regex log alert.
 	LogAlertsDir string `mapstructure:"logAlertsDir"`
-	CloudURL     string `mapstructure:"cloudUrl"`
-	CloudSecret  string `mapstructure:"cloudSecret"`
+	// Terminal is the opt-in interactive shell served over WebSocket at
+	// GET /api/v1/terminal. It exists so browser-based MaidKit builds, which
+	// cannot open raw SSH sockets, can attach a terminal. It is unrelated to
+	// the cloud relay: nothing about a terminal session is reported to the
+	// cloud. Disabled by default.
+	Terminal    TerminalConfig `mapstructure:"terminal"`
+	CloudURL    string         `mapstructure:"cloudUrl"`
+	CloudSecret string         `mapstructure:"cloudSecret"`
 	// LogsUploadEnabled opts the daemon into outbound log upload. It is
 	// deliberately false by default because logs may contain secrets.
 	LogsUploadEnabled    bool          `mapstructure:"logsUploadEnabled"`
@@ -142,22 +149,62 @@ type DaemonConfig struct {
 	// WatchedProcesses seeds the daemon-side watched-process list; dynamic
 	// additions and removals via the API are persisted to
 	// WatchedProcessesFile (authoritative once it exists).
-	WatchedProcesses     []string         `mapstructure:"watchedProcesses"`
-	WatchedProcessesFile string           `mapstructure:"watchedProcessesFile"`
-	ProcessesLimit       int              `mapstructure:"processesLimit"`
+	WatchedProcesses     []string `mapstructure:"watchedProcesses"`
+	WatchedProcessesFile string   `mapstructure:"watchedProcessesFile"`
+	ProcessesLimit       int      `mapstructure:"processesLimit"`
 	// ScriptTimeout bounds each run that has no per-hook timeout. 0 disables
 	// the deadline entirely: commands run until they complete (slow deploys,
 	// long pulls). A run with no deadline still holds a concurrency slot and
 	// blocks later relayed invocations while it runs.
-	RequestTimeout       time.Duration    `mapstructure:"requestTimeout"`
-	ScriptTimeout        time.Duration    `mapstructure:"scriptTimeout"`
-	MaxBodyBytes         int64            `mapstructure:"maxBodyBytes"`
-	MaxConcurrentRuns    int              `mapstructure:"maxConcurrentRuns"`
-	Webhooks             []WebhookConfig  `mapstructure:"webhooks"`
-	Actions              []WebhookConfig  `mapstructure:"actions"`
-	Alarms               []AlarmConfig    `mapstructure:"alarms"`
-	Jobs                 []JobConfig      `mapstructure:"jobs"`
-	LogAlerts            []LogAlertConfig `mapstructure:"logAlerts"`
+	RequestTimeout    time.Duration    `mapstructure:"requestTimeout"`
+	ScriptTimeout     time.Duration    `mapstructure:"scriptTimeout"`
+	MaxBodyBytes      int64            `mapstructure:"maxBodyBytes"`
+	MaxConcurrentRuns int              `mapstructure:"maxConcurrentRuns"`
+	Webhooks          []WebhookConfig  `mapstructure:"webhooks"`
+	Actions           []WebhookConfig  `mapstructure:"actions"`
+	Alarms            []AlarmConfig    `mapstructure:"alarms"`
+	Jobs              []JobConfig      `mapstructure:"jobs"`
+	LogAlerts         []LogAlertConfig `mapstructure:"logAlerts"`
+}
+
+// TerminalConfig is the WebSocket terminal policy. The endpoint only exists in
+// the http transport (stdio has no listener) and cannot start a session on
+// Windows, where the daemon has no PTY.
+type TerminalConfig struct {
+	// Enabled turns the endpoint on. Off by default: enabling it grants an
+	// interactive shell on this host to whoever holds the credential.
+	Enabled bool `mapstructure:"enabled"`
+	// Secret is an optional dedicated terminal credential. Empty (default)
+	// accepts metricsSecret; setting it keeps a leaked metrics secret from
+	// granting a shell.
+	Secret string `mapstructure:"secret"`
+	// Shells is the allowlist of absolute shell paths a session may request.
+	// The first entry is the default. Required when Enabled.
+	Shells []string `mapstructure:"shells"`
+	// Users is the optional allowlist for `sudo -H -u <user>` sessions.
+	// Empty means the daemon's own account only.
+	Users []string `mapstructure:"users"`
+	// Cwd is an optional absolute working directory. Empty starts in the
+	// target account's home directory.
+	Cwd string `mapstructure:"cwd"`
+	// Env are optional KEY=VALUE entries added to the shell environment.
+	Env []string `mapstructure:"env"`
+	// AllowedOrigins lists the browser origins allowed to open the socket,
+	// matched with path.Match against the Origin host (or `scheme://host`
+	// when the pattern contains "://"). Empty allows only same-host origins,
+	// so a browser client must be listed here. A request without an Origin
+	// header (native client, tunnel) is always accepted.
+	AllowedOrigins []string `mapstructure:"allowedOrigins"`
+	// AllowRemote accepts sessions from addresses outside loopback, RFC1918,
+	// link-local and Tailscale CGNAT (100.64.0.0/10). Off by default.
+	AllowRemote bool `mapstructure:"allowRemote"`
+	// MaxSessions caps concurrent sessions (1..8); 0 means the default (2).
+	MaxSessions int `mapstructure:"maxSessions"`
+	// IdleTimeout closes a session with no traffic in either direction; 0
+	// disables the idle check.
+	IdleTimeout time.Duration `mapstructure:"idleTimeout"`
+	// MaxLifetime caps a session's absolute age; 0 disables the cap.
+	MaxLifetime time.Duration `mapstructure:"maxLifetime"`
 }
 
 // LogAlertConfig declares one daemon-side regex alert. A matching new log
@@ -258,6 +305,15 @@ type JobConfig struct {
 
 var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
+// Terminal session bounds shared by config validation and the daemon's
+// session manager. MaxSessions == 0 means TerminalDefaultMaxSessions: a zero
+// value is what a caller that builds DaemonConfig directly (rather than
+// through Load) leaves behind.
+const (
+	TerminalDefaultMaxSessions = 2
+	TerminalMaxSessionsLimit   = 8
+)
+
 // runtimeNamePattern constrains daemon.runtimes entries: lowercase start so
 // they align with the client's runtime enum wire names.
 var runtimeNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
@@ -313,6 +369,70 @@ func validateHookExecution(hook WebhookConfig, kind string, index int) error {
 }
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validateTerminal checks the WebSocket terminal policy. Numeric zero means
+// "use the documented default" (maxSessions 2, no idle/lifetime cap) so a
+// DaemonConfig built directly instead of through Load still validates; the
+// runtime resolves the same defaults.
+func validateTerminal(cfg TerminalConfig) error {
+	if cfg.Enabled && len(cfg.Shells) == 0 {
+		return fmt.Errorf("daemon.terminal.shells must not be empty when the terminal is enabled")
+	}
+	shells := make(map[string]struct{}, len(cfg.Shells))
+	for i, shell := range cfg.Shells {
+		if !filepath.IsAbs(shell) {
+			return fmt.Errorf("daemon.terminal.shells[%d] must be an absolute path", i)
+		}
+		if _, ok := shells[shell]; ok {
+			return fmt.Errorf("daemon.terminal.shells[%d] %q is duplicated", i, shell)
+		}
+		shells[shell] = struct{}{}
+	}
+	users := make(map[string]struct{}, len(cfg.Users))
+	for i, name := range cfg.Users {
+		if _, ok := users[name]; ok {
+			return fmt.Errorf("daemon.terminal.users[%d] %q is duplicated", i, name)
+		}
+		users[name] = struct{}{}
+		if _, err := user.Lookup(name); err != nil {
+			return fmt.Errorf("daemon.terminal.users[%d] %q does not exist: %w", i, name, err)
+		}
+	}
+	if cfg.Cwd != "" && !filepath.IsAbs(cfg.Cwd) {
+		return fmt.Errorf("daemon.terminal.cwd must be an absolute path")
+	}
+	for i, kv := range cfg.Env {
+		if !envAssignmentPattern.MatchString(kv) {
+			return fmt.Errorf("daemon.terminal.env[%d] must be KEY=VALUE with an identifier key", i)
+		}
+	}
+	if strings.TrimSpace(cfg.Secret) != cfg.Secret {
+		return fmt.Errorf("daemon.terminal.secret must not contain whitespace")
+	}
+	for i, origin := range cfg.AllowedOrigins {
+		// A bare "*" would authorize every origin through path.Match; an
+		// operator who wants that uses a wildcard host pattern instead.
+		if origin == "" || strings.TrimSpace(origin) != origin || origin == "*" {
+			return fmt.Errorf("daemon.terminal.allowedOrigins[%d] must be a host or scheme://host pattern (no bare *)", i)
+		}
+		if _, err := path.Match(strings.ToLower(origin), "x"); err != nil {
+			return fmt.Errorf("daemon.terminal.allowedOrigins[%d] %q is not a valid pattern: %w", i, origin, err)
+		}
+	}
+	if cfg.MaxSessions < 0 || cfg.MaxSessions > TerminalMaxSessionsLimit {
+		return fmt.Errorf("daemon.terminal.maxSessions must be between 1 and %d", TerminalMaxSessionsLimit)
+	}
+	if cfg.IdleTimeout < 0 {
+		return fmt.Errorf("daemon.terminal.idleTimeout must not be negative")
+	}
+	if cfg.MaxLifetime < 0 {
+		return fmt.Errorf("daemon.terminal.maxLifetime must not be negative")
+	}
+	if cfg.MaxLifetime > 0 && cfg.IdleTimeout > 0 && cfg.MaxLifetime < cfg.IdleTimeout {
+		return fmt.Errorf("daemon.terminal.maxLifetime must not be shorter than idleTimeout")
+	}
+	return nil
+}
 
 // NativeOpNames lists the built-in operations the daemon executes natively
 // (container lifecycle, process kill, systemd unit actions, compose project
@@ -387,6 +507,17 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
+	viper.SetDefault("daemon.terminal.enabled", false)
+	viper.SetDefault("daemon.terminal.secret", "")
+	viper.SetDefault("daemon.terminal.shells", []string{})
+	viper.SetDefault("daemon.terminal.users", []string{})
+	viper.SetDefault("daemon.terminal.cwd", "")
+	viper.SetDefault("daemon.terminal.env", []string{})
+	viper.SetDefault("daemon.terminal.allowedOrigins", []string{})
+	viper.SetDefault("daemon.terminal.allowRemote", false)
+	viper.SetDefault("daemon.terminal.maxSessions", TerminalDefaultMaxSessions)
+	viper.SetDefault("daemon.terminal.idleTimeout", 15*time.Minute)
+	viper.SetDefault("daemon.terminal.maxLifetime", 8*time.Hour)
 	applyEnvAliases()
 	if configPath != "" {
 		if err := viper.ReadInConfig(); err != nil {
@@ -993,6 +1124,9 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if err := ValidateCloudURL(c.Daemon.CloudURL); err != nil {
 		return fmt.Errorf("daemon.cloudUrl %w", err)
+	}
+	if err := validateTerminal(c.Daemon.Terminal); err != nil {
+		return err
 	}
 	return nil
 }

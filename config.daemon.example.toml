@@ -124,3 +124,29 @@ name = "hourly-container-restart"
 schedule = "@every 1h"
 action = "container.restart"
 body = { id = "web" }
+
+# Opt-in interactive shell over WebSocket at GET /api/v1/terminal, for
+# browser-based MaidKit builds that cannot open an SSH socket. Off by default:
+# enabling it grants shell access on this host to whoever holds the credential.
+# Unreachable in the stdio transport and unsupported on Windows. Never reports
+# anything to the cloud.
+[daemon.terminal]
+enabled = false
+# Absolute shell paths a session may request; the first is the default.
+shells = ["/bin/bash"]
+# Optional dedicated credential. Empty accepts metricsSecret instead.
+# secret = "replace-with-terminal-secret"
+# Optional allowlist for `sudo -H -u <user>` sessions; empty = daemon account.
+# users = ["deploy"]
+# Optional absolute working directory (default: the target account's home).
+# cwd = "/srv/app"
+# Optional KEY=VALUE entries added to the shell environment.
+# env = ["LANG=C.UTF-8"]
+# Browser origins allowed to open the socket (path.Match against the Origin
+# host unless the pattern contains "://"); empty = same-host origins only.
+# allowedOrigins = ["maidkit.solsynth.dev"]
+# Allow sessions from outside loopback/RFC1918/link-local/Tailscale CGNAT.
+# allowRemote = false
+# maxSessions = 2
+# idleTimeout = "15m"
+# maxLifetime = "8h"

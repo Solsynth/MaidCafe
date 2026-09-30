@@ -3,6 +3,8 @@ module src.solsynth.dev/solsynth/maidcafe
 go 1.26.5
 
 require (
+	github.com/coder/websocket v1.8.14
+	github.com/creack/pty v1.1.24
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/gin-gonic/gin v1.10.1
 	github.com/google/uuid v1.6.0

@@ -100,6 +100,10 @@ GET /health
   processes, intervals, limits, cloud endpoint) swap without a restart.
   Transport, listen address, storage paths and the metrics secret remain
   restart-required.
+- Opt-in WebSocket terminal (`GET /api/v1/terminal`) serving an allowlisted
+  login shell on a PTY, so browser-based MaidKit builds can attach a terminal
+  without SSH. Off by default, audited as `source: "terminal"`, and never
+  reported to the cloud; see [WebSocket terminal](#websocket-terminal).
 - Public health endpoint that exposes only daemon mode and ID:
 
 ```text
@@ -233,15 +237,17 @@ GET /api/v1/audit?limit=N
 Authorization: Bearer <metrics-secret>
 ```
 
-Every execution — HTTP webhooks, actions, and cloud-relayed webhooks — is
-appended to `daemon.auditPath` (default `/var/lib/maidcafe/audit.jsonl`) as
-one JSON line per run: timestamp, `name` (API slug), optional `display_name`,
-`source` (`http` | `stdio` | `relay`), `ok`, `exit_code`, `duration_ms`, and a
-truncated failure reason. The file rotates at 1 MiB keeping one generation
-(`audit.jsonl.1`). Logging is best-effort: an unwritable path disables it with
-a warning and never affects execution. `GET /api/v1/audit?limit=N` returns the
-newest entries (default 50, max 500) newest first, authenticated with the
-metrics secret.
+Every execution — HTTP webhooks, actions, cloud-relayed webhooks and scheduled
+jobs — is appended to `daemon.auditPath` (default `/var/lib/maidcafe/audit.jsonl`)
+as one JSON line per run: timestamp, `name` (API slug), optional
+`display_name`, `source` (`http` | `stdio` | `relay` | `job` | `terminal`),
+`ok`, `exit_code`, `duration_ms`, and a truncated failure reason. WebSocket
+terminal sessions land in the same file with `name` and `source` `terminal`,
+one line per session and no transcript. The file rotates at 1 MiB keeping one
+generation (`audit.jsonl.1`). Logging is best-effort: an unwritable path
+disables it with a warning and never affects execution.
+`GET /api/v1/audit?limit=N` returns the newest entries (default 50, max 500)
+newest first, authenticated with the metrics secret.
 
 ### Realtime event stream
 
@@ -293,6 +299,84 @@ Authorization: Bearer <metrics-secret>
 - Setting a collector interval to `0` disables that collector. Collection is
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.
+
+### WebSocket terminal
+
+`GET /api/v1/terminal` (WebSocket) serves an interactive login shell on the
+host, so browser-based MaidKit builds — which cannot open the raw sockets
+`dartssh2` needs — can attach a terminal without SSH. It is opt-in, off by
+default, and unrelated to the cloud relay: nothing about a session, its output
+or its audit entry ever leaves the host.
+
+```text
+GET /api/v1/terminal?shell=/bin/bash&user=deploy&cols=120&rows=40
+Sec-WebSocket-Protocol: maidcafe.terminal.<base64url-unpadded secret>
+```
+
+The credential is the dedicated `daemon.terminal.secret` when set, and the
+metrics secret otherwise. Browsers cannot set an `Authorization` header on a
+WebSocket handshake, so they carry the secret as a subprotocol token
+(`maidcafe.terminal.` + the secret encoded with unpadded base64url, e.g.
+`metrics-secret` → `maidcafe.terminal.bWV0cmljcy1zZWNyZXQ`). Native clients
+and tunnels may use `Authorization: Bearer <secret>` instead, and the server
+echoes the offered subprotocol token back on the handshake response. Secrets
+are never accepted in the query string or a cookie.
+
+Query parameters:
+
+- `shell` — an absolute path from `daemon.terminal.shells`; omitted uses the
+  first entry. A path outside the allowlist returns `403`.
+- `user` — a name from `daemon.terminal.users`; omitted (or an empty list) runs
+  the shell as the daemon's own account. Anything else returns `403`.
+- `cols`/`rows` — initial PTY size, `1..1000` and `1..500` (defaults `80x24`).
+  A non-numeric or out-of-range value returns `400`.
+- An unauthenticated handshake returns `401`, the endpoint being disabled
+  returns `403 terminal disabled`, exceeding `maxSessions` returns `429`, and a
+  platform without a PTY (Windows) returns `501`.
+
+Frames:
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| server → client | text `{"type":"hello","version":"v1","session":"<uuid>","shell":"/bin/bash","user":"maidcafe","cols":120,"rows":40}` | session opened; `user` is the account the shell runs as |
+| server → client | binary | raw PTY output, in order, never coalesced or dropped |
+| server → client | text `{"type":"exit","code":0,"reason":""}` then close `1000` | shell exited (or the session was closed); `reason` is empty for a normal shell exit and otherwise `idle timeout`, `lifetime exceeded`, `client closed`, `client unreachable`, `daemon shutdown` or `protocol error` |
+| server → client | text `{"type":"error","message":"..."}`, then the `exit` frame, then close `1008` | protocol violation |
+| server → client | text `{"type":"error","message":"..."}` then close `1011` | the shell failed to start (no session was created) |
+| client → server | binary | keystrokes written to the PTY |
+| client → server | text `{"type":"resize","cols":100,"rows":30}` | PTY resize, `1..1000` and `1..500` |
+
+The server pings every 20s and closes a client that stops answering. Sessions
+are bounded by `idleTimeout` (no traffic in either direction) and
+`maxLifetime` (absolute age), and are recorded in `daemon.auditPath` as one
+line per session with `source: "terminal"` — the summary only, never the
+transcript. A PTY that fills up blocks the shell rather than dropping output,
+so a slow client slows its own session and nobody else's.
+
+Operator notes:
+
+- `daemon.terminal.enabled` is off by default: enabling it grants an
+  interactive shell on the host to whoever holds the credential, which is why
+  `daemon.terminal.secret` is worth setting to keep a leaked metrics secret
+  from reaching a shell.
+- Run-as-user sessions use `sudo -H -u <user>`, exactly like actions with a
+  `user`. They rely on the same NOPASSWD sudoers rule; without it, sudo's
+  password prompt appears on the PTY (a terminal is the one place that is
+  acceptable).
+- Browser origins must be listed in `daemon.terminal.allowedOrigins`
+  (`path.Match` against the `Origin` host, or `scheme://host` when the pattern
+  contains `://`); an origin equal to the request host is always allowed, and a
+  request without an `Origin` header (native client, tunnel) always is.
+- Sessions are accepted from loopback, RFC1918, link-local and Tailscale
+  addresses (`100.64.0.0/10`). `daemon.terminal.allowRemote = true` lifts that
+  restriction, and only the TCP peer address is ever inspected —
+  `X-Forwarded-For` is ignored.
+- The daemon serves plain HTTP: a page delivered over HTTPS needs `wss://` and
+  therefore the operator's own TLS front (`nginx`, `Caddy`, `tailscale serve`).
+- Terminal sessions do not consume a `maxConcurrentRuns` slot and are not
+  bounded by `scriptTimeout`: they are interactive and long-lived, so they are
+  bounded by `maxSessions`, `idleTimeout` and `maxLifetime` instead.
+- The endpoint only exists in the `http` transport; `stdio` has no listener.
 
 ### Snapshot endpoints
 
@@ -484,6 +568,12 @@ Daemon requires:
 
 Daemon cloud publishing is optional. An empty cloud URL and secret are valid.
 
+`daemon.terminal.*` is optional and disabled by default; enabling it requires
+`daemon.terminal.shells`. The keys are `enabled`, `secret`, `shells`, `users`,
+`cwd`, `env`, `allowedOrigins`, `allowRemote`, `maxSessions` (1–8, default 2),
+`idleTimeout` (default `15m`) and `maxLifetime` (default `8h`); see
+[WebSocket terminal](#websocket-terminal) for what they gate.
+
 ## Running locally
 
 ```sh
@@ -599,5 +689,10 @@ integration on the target host.
 
 Webhook request bodies are data delivered to process stdin. They are not shell
 syntax. Commands and arguments come only from validated static configuration.
-Daemon secrets are sent only in the `Authorization` header, never in query
-parameters or cookies.
+Daemon secrets are sent only in the `Authorization` header — or, for a browser
+WebSocket handshake, the `Sec-WebSocket-Protocol` token — never in query
+parameters or cookies. The WebSocket terminal is only as strong as that
+credential and rides the same transport as the rest of the daemon API: without
+an operator TLS front it is plain `ws://`, so a dedicated
+`daemon.terminal.secret` is what keeps a leaked metrics secret from becoming a
+shell.

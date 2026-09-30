@@ -40,6 +40,7 @@ type App struct {
 	logUpload       *logUploadBuffer
 	watched         *watchedProcessStore
 	jobs            *jobRunner
+	terminal        *terminalManager
 	server          *http.Server
 	listenerMu      sync.RWMutex
 	listener        net.Listener
@@ -69,8 +70,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	audit := NewAuditLogger(cfg.AuditPath, logger)
 	executor := NewWebhookExecutor(cfg)
-	executor.SetAuditLogger(NewAuditLogger(cfg.AuditPath, logger))
+	executor.SetAuditLogger(audit)
 	publisherBox := &atomic.Pointer[CloudPublisher]{}
 	publisher, err := NewCloudPublisher(cfg, logger)
 	if err != nil {
@@ -121,6 +123,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		logUpload:       newLogUploadBuffer(),
 		watched:         watchedStore,
 		jobs:            jobs,
+		terminal:        newTerminalManager(logger, audit),
 		logger:          logger,
 	}
 	app.logAlerts.SetAlerts(cfg.LogAlerts)
@@ -182,6 +185,11 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router.GET("/api/v1/stream", authorizeMetrics, func(c *gin.Context) {
 		handleStream(c, app.hub, app.rt.Load())
 	})
+	// The terminal authenticates inside the handler: a browser cannot set an
+	// Authorization header on a WebSocket handshake, so the credential may
+	// arrive as a Sec-WebSocket-Protocol token instead and the metrics
+	// middleware would reject it before the token is read.
+	router.GET("/api/v1/terminal", app.handleTerminal)
 	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
 		parseTime := func(name string) (*time.Time, error) {
 			raw := strings.TrimSpace(c.Query(name))
@@ -686,6 +694,11 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) Shutdown(ctx context.Context) error {
+	// Hijacked terminal connections are invisible to http.Server.Shutdown, so
+	// they have to be closed before the server drains.
+	if a.terminal != nil {
+		a.terminal.CloseAll()
+	}
 	if a.server == nil {
 		return nil
 	}
