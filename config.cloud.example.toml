@@ -3,6 +3,12 @@ name = "MaidCafe"
 
 [http]
 port = "8080"
+# Browser origins allowed to open the cloud's WebSocket terminal socket
+# (GET /api/daemons/<id>/terminal), matched with path.Match against the Origin
+# host. Empty allows same-host origins only, so a MaidKit web build served from
+# another host must be listed here. Requires the cloud to be served over TLS,
+# since a browser page on https:// cannot open ws://.
+# allowedOrigins = ["maidkit.solsynth.dev", "localhost:8080"]
 
 [database]
 # Replace the example password and connection settings before deployment.

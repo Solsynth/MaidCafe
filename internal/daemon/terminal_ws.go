@@ -67,6 +67,50 @@ type terminalResizeFrame struct {
 	Rows *int   `json:"rows"`
 }
 
+// terminalConn is the frame transport one session runs on. The direct endpoint
+// (the browser's own socket) and the cloud relay (the daemon-dialed agent
+// socket) both drive the same v1 loop through this interface, so the frame
+// protocol lives in exactly one place. *websocket.Conn satisfies it as-is.
+type terminalConn interface {
+	Read(ctx context.Context) (websocket.MessageType, []byte, error)
+	Write(ctx context.Context, typ websocket.MessageType, data []byte) error
+	Ping(ctx context.Context) error
+	Close(code websocket.StatusCode, reason string) error
+	CloseNow() error
+}
+
+// runTerminalSession drives one opened session over conn until either side
+// ends, then releases the session and waits for the writer to flush its last
+// frame. It returns the reason that ended the session ("" when the shell exited
+// on its own), which is also what the audit entry records.
+func runTerminalSession(ctx context.Context, sess *terminalSession, conn terminalConn, policy config.TerminalConfig) string {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The pump is the only writer. Cancelling when it returns also unblocks a
+	// read loop that outlives the connection (a failed drain, for instance).
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		terminalPump(ctx, sess, conn, policy)
+		cancel()
+	}()
+	terminalReadLoop(ctx, conn, sess)
+	// The read loop ends either because the shell exited (the pump closed the
+	// connection after the exit frame) or because the client went away first;
+	// either way the session must be released, and only the first close
+	// attributes the reason.
+	closeReason := terminalReasonClient
+	if terminalDone(sess) {
+		closeReason = ""
+	}
+	sess.Close(closeReason)
+	// Wait for the pump so the exit frame is flushed before the caller tears
+	// down the request context.
+	<-writeDone
+	_, reason := sess.Exit()
+	return reason
+}
+
 // terminalWriter adapts gin's response writer for coder/websocket.
 //
 // Hijack: coder/websocket reaches the raw connection through http.Hijacker,
@@ -163,32 +207,13 @@ func (a *App) handleTerminal(c *gin.Context) {
 		_ = conn.Close(websocket.StatusInternalError, "terminal start failed")
 		return
 	}
-	ctx, cancel := context.WithCancel(c.Request.Context())
-	writeDone := make(chan struct{})
-	go func() {
-		defer close(writeDone)
-		terminalPump(ctx, session, conn, policy)
-		cancel()
-	}()
-	terminalReadLoop(ctx, conn, session)
-	// The read loop ends either because the shell exited (the pump closed the
-	// connection after the exit frame) or because the client went away first;
-	// either way the session must be released, and only the first close
-	// attributes the reason.
-	closeReason := terminalReasonClient
-	if terminalDone(session) {
-		closeReason = ""
-	}
-	session.Close(closeReason)
-	// Wait for the pump so the exit frame is flushed before the handler
-	// returns and the request context is torn down.
-	<-writeDone
+	runTerminalSession(c.Request.Context(), session, conn, policy)
 }
 
 // terminalPump is the only writer on the connection. It forwards PTY output,
 // keeps the socket alive with pings, enforces the idle and lifetime caps, and
 // emits the exit frame.
-func terminalPump(ctx context.Context, session *terminalSession, conn *websocket.Conn, policy config.TerminalConfig) {
+func terminalPump(ctx context.Context, session *terminalSession, conn terminalConn, policy config.TerminalConfig) {
 	writeTerminalText(ctx, conn, terminalHelloFrame{
 		Type:    "hello",
 		Version: terminalProtocolVersion,
@@ -254,7 +279,7 @@ func terminalPump(ctx context.Context, session *terminalSession, conn *websocket
 
 // terminalExit flushes what the shell wrote before it died and reports the end
 // of the session, so the exit frame is always the last frame.
-func terminalExit(ctx context.Context, conn *websocket.Conn, session *terminalSession, output <-chan []byte) {
+func terminalExit(ctx context.Context, conn terminalConn, session *terminalSession, output <-chan []byte) {
 	if !drainTerminalOutput(ctx, conn, session, output) {
 		// The connection is gone; there is nobody left to report to.
 		return
@@ -272,7 +297,7 @@ func terminalExit(ctx context.Context, conn *websocket.Conn, session *terminalSe
 // the exit frame never overtakes the last bytes. It reports false when a write
 // failed. The PTY reader closes the queue before the exit is released, so an
 // empty closed queue means every byte was delivered.
-func drainTerminalOutput(ctx context.Context, conn *websocket.Conn, session *terminalSession, output <-chan []byte) bool {
+func drainTerminalOutput(ctx context.Context, conn terminalConn, session *terminalSession, output <-chan []byte) bool {
 	for {
 		select {
 		case chunk, ok := <-output:
@@ -292,7 +317,7 @@ func drainTerminalOutput(ctx context.Context, conn *websocket.Conn, session *ter
 
 // terminalReadLoop applies client frames to the session until the connection
 // ends or the client breaks the protocol.
-func terminalReadLoop(ctx context.Context, conn *websocket.Conn, session *terminalSession) {
+func terminalReadLoop(ctx context.Context, conn terminalConn, session *terminalSession) {
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
@@ -336,7 +361,7 @@ func terminalResize(session *terminalSession, frame terminalResizeFrame) error {
 
 // writeTerminalChunk writes one PTY chunk. A stalled client hits the write
 // timeout, which the library answers by closing the connection.
-func writeTerminalChunk(ctx context.Context, conn *websocket.Conn, session *terminalSession, chunk []byte) error {
+func writeTerminalChunk(ctx context.Context, conn terminalConn, session *terminalSession, chunk []byte) error {
 	writeCtx, cancel := context.WithTimeout(ctx, terminalWriteTimeout)
 	defer cancel()
 	if err := conn.Write(writeCtx, websocket.MessageBinary, chunk); err != nil {
@@ -346,7 +371,7 @@ func writeTerminalChunk(ctx context.Context, conn *websocket.Conn, session *term
 	return nil
 }
 
-func writeTerminalText(ctx context.Context, conn *websocket.Conn, value any) {
+func writeTerminalText(ctx context.Context, conn terminalConn, value any) {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return

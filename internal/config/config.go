@@ -45,6 +45,13 @@ type AppConfig struct {
 }
 type HTTPConfig struct {
 	Port string `mapstructure:"port"`
+	// AllowedOrigins lists the browser origins allowed to open the cloud's
+	// WebSocket terminal socket, matched with path.Match against the Origin
+	// host (or `scheme://host` when the pattern contains "://"). Empty allows
+	// only same-host origins, so a browser client served from another origin
+	// (e.g. a MaidKit web build) must be listed here. A request without an
+	// Origin header is always accepted.
+	AllowedOrigins []string `mapstructure:"allowedOrigins"`
 }
 type DatabaseConfig struct {
 	DSN string `mapstructure:"dsn"`
@@ -205,6 +212,33 @@ type TerminalConfig struct {
 	IdleTimeout time.Duration `mapstructure:"idleTimeout"`
 	// MaxLifetime caps a session's absolute age; 0 disables the cap.
 	MaxLifetime time.Duration `mapstructure:"maxLifetime"`
+	// Relay serves sessions that arrive through the MaidCafe cloud instead of
+	// this host's own listener, so a browser client can attach to a daemon
+	// behind NAT. Off by default.
+	Relay TerminalRelayConfig `mapstructure:"relay"`
+}
+
+// TerminalRelayConfig is the cloud-relayed terminal policy. A relayed session
+// is one the cloud handed to this daemon: the daemon polls the cloud for
+// pending sessions, dials out to the cloud for each accepted one, and both
+// legs of the browser connection ride that outbound socket. Relayed sessions
+// obey the same shell/user/idle policy as the direct endpoint and share its
+// MaxSessions budget.
+type TerminalRelayConfig struct {
+	// Enabled turns relayed sessions on. Requires cloudUrl and cloudSecret;
+	// the relay is outbound, so it also works in the stdio transport.
+	Enabled bool `mapstructure:"enabled"`
+	// Users is an optional allowlist of cloud identities allowed to open a
+	// relayed session. Entries match the identity the cloud forwards (the
+	// Solarpass handle, or the account id when no handle is known) exactly.
+	// Empty accepts any identity, which means any account the cloud
+	// authorizes — the cloud only authorizes members of the daemon's
+	// workspace, but a workspace is not the same trust boundary as a shell.
+	Users []string `mapstructure:"users"`
+	// PollWait is how long one pickup long-poll holds before it returns empty,
+	// which bounds session start latency and idle cloud traffic. 0 uses
+	// TerminalRelayDefaultPollWait.
+	PollWait time.Duration `mapstructure:"pollWait"`
 }
 
 // LogAlertConfig declares one daemon-side regex alert. A matching new log
@@ -312,6 +346,18 @@ var envAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 const (
 	TerminalDefaultMaxSessions = 2
 	TerminalMaxSessionsLimit   = 8
+
+	// TerminalRelayDefaultPollWait is how long one cloud relay pickup
+	// long-poll holds before it returns empty, used when
+	// daemon.terminal.relay.pollWait is 0.
+	TerminalRelayDefaultPollWait = 20 * time.Second
+	// TerminalRelayMinPollWait rejects a wait so short it would hammer the
+	// cloud's pickup route; the daemon re-polls immediately, so a tiny wait
+	// becomes a busy loop.
+	TerminalRelayMinPollWait = 3 * time.Second
+	// TerminalRelayMaxPollWait keeps the long-poll inside the cloud's own
+	// hold cap, so a stuck poll can never outlive the cloud's response.
+	TerminalRelayMaxPollWait = 25 * time.Second
 )
 
 // runtimeNamePattern constrains daemon.runtimes entries: lowercase start so
@@ -370,12 +416,27 @@ func validateHookExecution(hook WebhookConfig, kind string, index int) error {
 
 var webhookNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
+// validateOriginPattern checks one browser-origin allowlist entry, shared by
+// the daemon's terminal endpoint and the cloud's relayed terminal socket. A
+// bare "*" is rejected because path.Match would then authorize every origin;
+// an operator who wants that writes a wildcard host pattern such as
+// "*.example.com".
+func validateOriginPattern(origin string) error {
+	if origin == "" || strings.TrimSpace(origin) != origin || origin == "*" {
+		return fmt.Errorf("must be a host or scheme://host pattern (no bare *)")
+	}
+	if _, err := path.Match(strings.ToLower(origin), "x"); err != nil {
+		return fmt.Errorf("%q is not a valid pattern: %w", origin, err)
+	}
+	return nil
+}
+
 // validateTerminal checks the WebSocket terminal policy. Numeric zero means
 // "use the documented default" (maxSessions 2, no idle/lifetime cap) so a
 // DaemonConfig built directly instead of through Load still validates; the
 // runtime resolves the same defaults.
 func validateTerminal(cfg TerminalConfig) error {
-	if cfg.Enabled && len(cfg.Shells) == 0 {
+	if (cfg.Enabled || cfg.Relay.Enabled) && len(cfg.Shells) == 0 {
 		return fmt.Errorf("daemon.terminal.shells must not be empty when the terminal is enabled")
 	}
 	shells := make(map[string]struct{}, len(cfg.Shells))
@@ -410,13 +471,8 @@ func validateTerminal(cfg TerminalConfig) error {
 		return fmt.Errorf("daemon.terminal.secret must not contain whitespace")
 	}
 	for i, origin := range cfg.AllowedOrigins {
-		// A bare "*" would authorize every origin through path.Match; an
-		// operator who wants that uses a wildcard host pattern instead.
-		if origin == "" || strings.TrimSpace(origin) != origin || origin == "*" {
-			return fmt.Errorf("daemon.terminal.allowedOrigins[%d] must be a host or scheme://host pattern (no bare *)", i)
-		}
-		if _, err := path.Match(strings.ToLower(origin), "x"); err != nil {
-			return fmt.Errorf("daemon.terminal.allowedOrigins[%d] %q is not a valid pattern: %w", i, origin, err)
+		if err := validateOriginPattern(origin); err != nil {
+			return fmt.Errorf("daemon.terminal.allowedOrigins[%d] %w", i, err)
 		}
 	}
 	if cfg.MaxSessions < 0 || cfg.MaxSessions > TerminalMaxSessionsLimit {
@@ -430,6 +486,20 @@ func validateTerminal(cfg TerminalConfig) error {
 	}
 	if cfg.MaxLifetime > 0 && cfg.IdleTimeout > 0 && cfg.MaxLifetime < cfg.IdleTimeout {
 		return fmt.Errorf("daemon.terminal.maxLifetime must not be shorter than idleTimeout")
+	}
+	relayUsers := make(map[string]struct{}, len(cfg.Relay.Users))
+	for i, name := range cfg.Relay.Users {
+		if name == "" || strings.TrimSpace(name) != name {
+			return fmt.Errorf("daemon.terminal.relay.users[%d] must be a non-empty cloud identity", i)
+		}
+		if _, ok := relayUsers[name]; ok {
+			return fmt.Errorf("daemon.terminal.relay.users[%d] %q is duplicated", i, name)
+		}
+		relayUsers[name] = struct{}{}
+	}
+	if cfg.Relay.PollWait != 0 && (cfg.Relay.PollWait < TerminalRelayMinPollWait || cfg.Relay.PollWait > TerminalRelayMaxPollWait) {
+		return fmt.Errorf("daemon.terminal.relay.pollWait must be between %s and %s",
+			TerminalRelayMinPollWait, TerminalRelayMaxPollWait)
 	}
 	return nil
 }
@@ -507,6 +577,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
+	viper.SetDefault("http.allowedOrigins", []string{})
 	viper.SetDefault("daemon.terminal.enabled", false)
 	viper.SetDefault("daemon.terminal.secret", "")
 	viper.SetDefault("daemon.terminal.shells", []string{})
@@ -518,6 +589,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.terminal.maxSessions", TerminalDefaultMaxSessions)
 	viper.SetDefault("daemon.terminal.idleTimeout", 15*time.Minute)
 	viper.SetDefault("daemon.terminal.maxLifetime", 8*time.Hour)
+	viper.SetDefault("daemon.terminal.relay.enabled", false)
+	viper.SetDefault("daemon.terminal.relay.users", []string{})
+	viper.SetDefault("daemon.terminal.relay.pollWait", TerminalRelayDefaultPollWait)
 	applyEnvAliases()
 	if configPath != "" {
 		if err := viper.ReadInConfig(); err != nil {
@@ -869,6 +943,11 @@ func (c *Config) ValidateCloud() error {
 	if err := validatePort(c.HTTP.Port); err != nil {
 		return fmt.Errorf("http.port: %w", err)
 	}
+	for i, origin := range c.HTTP.AllowedOrigins {
+		if err := validateOriginPattern(origin); err != nil {
+			return fmt.Errorf("http.allowedOrigins[%d] %w", i, err)
+		}
+	}
 	if c.Cloud.DaemonDisconnectAfter < 0 {
 		return fmt.Errorf("cloud.daemonDisconnectAfter must not be negative")
 	}
@@ -1124,6 +1203,16 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if err := ValidateCloudURL(c.Daemon.CloudURL); err != nil {
 		return fmt.Errorf("daemon.cloudUrl %w", err)
+	}
+	if c.Daemon.Terminal.Relay.Enabled {
+		// The relay is outbound to the cloud: without a cloud endpoint and
+		// secret there is nothing to poll and nowhere to dial back to.
+		if strings.TrimSpace(c.Daemon.CloudURL) == "" {
+			return fmt.Errorf("daemon.cloudUrl is required when daemon.terminal.relay.enabled")
+		}
+		if strings.TrimSpace(c.Daemon.CloudSecret) == "" {
+			return fmt.Errorf("daemon.cloudSecret is required when daemon.terminal.relay.enabled")
+		}
 	}
 	if err := validateTerminal(c.Daemon.Terminal); err != nil {
 		return err

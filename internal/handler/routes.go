@@ -12,17 +12,25 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
+	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
 	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
 )
 
-func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc) {
+func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc, cfg *config.Config) {
+	// The terminal pairing registry is per-router state: it pairs the in-memory
+	// browser and agent sockets of one relayed session.
+	terminalReg := newTerminalRegistry()
 	r.GET("/", func(c *gin.Context) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cloudLandingPageHTML))
 	})
 	r.GET("/favicon.png", serveFavicon)
 	r.GET("/favicon.ico", serveFavicon)
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "cloud"}) })
+	// The browser socket authenticates from Sec-WebSocket-Protocol inside the
+	// handler: a browser cannot set an Authorization header on a handshake, so
+	// it must live outside the userAuth group.
+	r.GET("/api/daemons/:id/terminal", browserTerminal(svc, cfg, terminalReg))
 	user := r.Group("/api")
 	user.Use(userAuth, requireUser())
 	user.POST("/daemons", createDaemon(svc))
@@ -48,6 +56,9 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	user.POST("/daemons/:id/webhook-requests", enqueueWebhook(svc))
 	user.GET("/daemons/:id/webhook-requests/:request_id", getWebhookResult(svc))
 	user.GET("/daemons/:id/actions", listActions(svc))
+	user.POST("/daemons/:id/terminal", createTerminalSession(svc))
+	user.GET("/daemons/:id/terminals", listTerminalSessions(svc))
+	user.DELETE("/daemons/:id/terminal/:session_id", closeTerminalSession(svc, terminalReg))
 	user.GET("/workspaces/:id/quota", workspaceQuota(svc))
 	user.POST("/credentials", createCredential(svc))
 	user.GET("/credentials", listCredentials(svc))
@@ -60,6 +71,8 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc)
 	daemon.POST("/actions", syncActions(svc))
 	daemon.GET("/webhook-requests/pending", listPendingWebhooks(svc))
 	daemon.POST("/webhook-requests/:request_id/result", completeWebhook(svc))
+	daemon.GET("/terminal/requests/pending", listPendingTerminalSessions(svc))
+	daemon.GET("/terminal/agent", agentTerminal(svc, terminalReg))
 	daemon.GET("/quota", daemonQuota(svc))
 }
 
@@ -390,11 +403,13 @@ func updateDaemon(s *cloud.Service) gin.HandlerFunc {
 		var in struct {
 			Name    *string `json:"name"`
 			Enabled *bool   `json:"enabled"`
+			// TerminalRelayEnabled opts the host into cloud-relayed terminals.
+			TerminalRelayEnabled *bool `json:"terminal_relay_enabled"`
 		}
 		if !parseJSON(c, &in) {
 			return
 		}
-		out, err := s.UpdateDaemon(c, accountID(c), c.Param("id"), in.Name, in.Enabled)
+		out, err := s.UpdateDaemon(c, accountID(c), c.Param("id"), in.Name, in.Enabled, in.TerminalRelayEnabled)
 		if err != nil {
 			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) {
 				serviceStatus(c, err)

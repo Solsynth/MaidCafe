@@ -101,13 +101,58 @@ func (p *CloudPublisher) Reload(cloudURL, cloudSecret string) {
 }
 
 func (p *CloudPublisher) request(ctx context.Context, method, suffix string, payload any, dst any) error {
+	return p.requestWithTimeout(ctx, 0, method, suffix, payload, dst)
+}
+
+// terminalAgentTarget returns the absolute WebSocket URL and the bearer secret
+// for the cloud's relayed-terminal agent socket. The socket cannot go through
+// request: it is a WebSocket, and its credential is the daemon secret the
+// publisher already holds. HTTPS maps to wss and HTTP (localhost development)
+// to ws, and any base path the cloud URL carries is preserved, because the
+// relay routes hang off the same /api/daemons/<id> prefix as the JSON routes.
+func (p *CloudPublisher) terminalAgentTarget(sessionID string) (string, string, error) {
+	if p == nil {
+		return "", "", fmt.Errorf("cloud publisher is not configured")
+	}
+	p.mu.RLock()
+	baseURL, daemonID, secret := p.baseURL, p.daemonID, p.secret
+	p.mu.RUnlock()
+	if baseURL == "" {
+		return "", "", fmt.Errorf("cloud publisher is not configured")
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("cloud url: %w", err)
+	}
+	switch parsed.Scheme {
+	case "https":
+		parsed.Scheme = "wss"
+	case "http":
+		parsed.Scheme = "ws"
+	default:
+		return "", "", fmt.Errorf("cloud url scheme %q cannot be dialed as a websocket", parsed.Scheme)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/api/daemons/" + daemonID + "/terminal/agent"
+	query := parsed.Query()
+	query.Set("session", sessionID)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), secret, nil
+}
+
+// requestWithTimeout is request with an explicit deadline. A zero timeout keeps
+// the configured RequestTimeout, which is what every ordinary call wants; the
+// terminal relay pickup long-poll passes its own because the cloud deliberately
+// holds that request for longer than the default.
+func (p *CloudPublisher) requestWithTimeout(ctx context.Context, timeout time.Duration, method, suffix string, payload any, dst any) error {
 	if p == nil {
 		return fmt.Errorf("cloud publisher is not configured")
 	}
 	p.mu.RLock()
 	baseURL := p.baseURL
 	secret := p.secret
-	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = p.timeout
+	}
 	p.mu.RUnlock()
 	var body []byte
 	var err error

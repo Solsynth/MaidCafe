@@ -102,8 +102,10 @@ GET /health
   restart-required.
 - Opt-in WebSocket terminal (`GET /api/v1/terminal`) serving an allowlisted
   login shell on a PTY, so browser-based MaidKit builds can attach a terminal
-  without SSH. Off by default, audited as `source: "terminal"`, and never
-  reported to the cloud; see [WebSocket terminal](#websocket-terminal).
+  without SSH. Off by default, audited as `source: "terminal"`. A daemon behind
+  NAT can serve the same terminal through the cloud instead
+  (`daemon.terminal.relay.enabled`); see
+  [WebSocket terminal](#websocket-terminal).
 - Public health endpoint that exposes only daemon mode and ID:
 
 ```text
@@ -378,6 +380,40 @@ Operator notes:
   bounded by `maxSessions`, `idleTimeout` and `maxLifetime` instead.
 - The endpoint only exists in the `http` transport; `stdio` has no listener.
 
+### Cloud-relayed terminal
+
+A daemon behind NAT cannot be dialed from a browser, so the same terminal can
+instead reach it through the MaidCafe cloud. With `daemon.terminal.relay.enabled`
+the daemon long-polls the cloud for handovers and, per accepted session, dials
+one outbound `wss://<cloudUrl>/api/daemons/<id>/terminal/agent?session=<id>`
+socket authenticated with the daemon cloud secret (`cloudUrl` and `cloudSecret`
+are required). The browser attaches to
+`wss://<cloud-host>/api/daemons/<id>/terminal` with a cloud-minted session
+ticket; the cloud pairs the two sockets and forwards frames verbatim, so the
+frames, and therefore the client, are exactly the ones above. The daemon only
+ever dials out — it never listens for a relayed session — so this works in the
+`stdio` transport too.
+
+Relayed sessions are the same sessions: they share `maxSessions`, `idleTimeout`
+and `maxLifetime`, obey the `daemon.terminal.shells` and `daemon.terminal.users`
+allowlists, and land in `daemon.auditPath` with `source: "terminal"` and
+`invoked_by` set to the cloud identity prefixed with `cloud:` (e.g.
+`cloud:alice@solsynth.dev`). `daemon.terminal.allowedOrigins` does not apply:
+the browser talks to the cloud, and the daemon's own socket sends no `Origin`.
+
+- `daemon.terminal.relay.enabled` (default `false`) — serve relayed sessions.
+- `daemon.terminal.relay.users` — optional allowlist of cloud identities; empty
+  accepts any identity the cloud authorizes, which is still the daemon's own
+  gate: the cloud only authorizes members of the daemon's workspace, and a
+  workspace is not the same trust boundary as a shell.
+- `daemon.terminal.relay.pollWait` (default `20s`, `3s`–`25s`) — how long one
+  pickup long-poll is held, which bounds start latency and idle cloud traffic.
+
+The cloud terminates TLS and pumps the frames, so a relayed session passes
+through it in the clear: it can read every keystroke and every byte of output,
+including a password typed at a `sudo` prompt. Neither side persists a
+transcript — the audit entry is the session summary only.
+
 ### Snapshot endpoints
 
 The same state the stream pushes is also available as one-shot responses, so
@@ -571,8 +607,11 @@ Daemon cloud publishing is optional. An empty cloud URL and secret are valid.
 `daemon.terminal.*` is optional and disabled by default; enabling it requires
 `daemon.terminal.shells`. The keys are `enabled`, `secret`, `shells`, `users`,
 `cwd`, `env`, `allowedOrigins`, `allowRemote`, `maxSessions` (1–8, default 2),
-`idleTimeout` (default `15m`) and `maxLifetime` (default `8h`); see
-[WebSocket terminal](#websocket-terminal) for what they gate.
+`idleTimeout` (default `15m`) and `maxLifetime` (default `8h`). The
+cloud-relayed part adds `relay.enabled` (default `false`, requires
+`daemon.cloudUrl` and `daemon.cloudSecret`), `relay.users` and `relay.pollWait`
+(default `20s`); see [WebSocket terminal](#websocket-terminal) for what they
+gate.
 
 ## Running locally
 
@@ -695,4 +734,5 @@ parameters or cookies. The WebSocket terminal is only as strong as that
 credential and rides the same transport as the rest of the daemon API: without
 an operator TLS front it is plain `ws://`, so a dedicated
 `daemon.terminal.secret` is what keeps a leaked metrics secret from becoming a
-shell.
+shell. A cloud-relayed session additionally passes through the cloud, which
+terminates TLS and can therefore read the session; the direct endpoint does not.

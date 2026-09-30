@@ -61,6 +61,10 @@ command = "/bin/cat"
 		cfg.Daemon.Terminal.MaxSessions != TerminalDefaultMaxSessions ||
 		cfg.Daemon.Terminal.IdleTimeout != 15*time.Minute ||
 		cfg.Daemon.Terminal.MaxLifetime != 8*time.Hour ||
+		cfg.Daemon.Terminal.Relay.Enabled ||
+		len(cfg.Daemon.Terminal.Relay.Users) != 0 ||
+		cfg.Daemon.Terminal.Relay.PollWait != TerminalRelayDefaultPollWait ||
+		len(cfg.HTTP.AllowedOrigins) != 0 ||
 		cfg.Daemon.ProcessesLimit != 50 {
 		t.Fatalf("unexpected daemon defaults: %#v", cfg.Daemon)
 	}
@@ -74,6 +78,8 @@ func TestDaemonTerminalConfigParsesFromTOML(t *testing.T) {
 [daemon]
 id = "host-1"
 metricsSecret = "metrics-secret"
+cloudUrl = "https://mk.solsynth.dev"
+cloudSecret = "cloud-secret"
 [daemon.terminal]
 enabled = true
 secret = "terminal-secret"
@@ -86,6 +92,10 @@ allowRemote = true
 maxSessions = 5
 idleTimeout = "3m"
 maxLifetime = "2h"
+[daemon.terminal.relay]
+enabled = true
+users = ["alice@solsynth.dev"]
+pollWait = "10s"
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -102,7 +112,10 @@ maxLifetime = "2h"
 		!terminal.AllowRemote ||
 		terminal.MaxSessions != 5 ||
 		terminal.IdleTimeout != 3*time.Minute ||
-		terminal.MaxLifetime != 2*time.Hour {
+		terminal.MaxLifetime != 2*time.Hour ||
+		!terminal.Relay.Enabled ||
+		len(terminal.Relay.Users) != 1 || terminal.Relay.Users[0] != "alice@solsynth.dev" ||
+		terminal.Relay.PollWait != 10*time.Second {
 		t.Fatalf("unexpected terminal config: %#v", terminal)
 	}
 	if err := cfg.ValidateDaemon(); err != nil {
@@ -483,6 +496,94 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 				d.Terminal = TerminalConfig{
 					Enabled: true, Shells: []string{"/bin/sh"},
 					IdleTimeout: time.Hour, MaxLifetime: time.Minute,
+				}
+			},
+		},
+		{
+			name: "relay terminal accepted without the direct endpoint",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay: TerminalRelayConfig{
+						Enabled:  true,
+						Users:    []string{"alice@solsynth.dev"},
+						PollWait: 15 * time.Second,
+					},
+				}
+			},
+			ok: true,
+		},
+		{
+			name: "relay terminal without shells rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{Relay: TerminalRelayConfig{Enabled: true}}
+			},
+		},
+		{
+			name: "relay terminal without cloud url rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true},
+				}
+			},
+		},
+		{
+			name: "relay terminal without cloud secret rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true},
+				}
+			},
+		},
+		{
+			name: "relay terminal identity with whitespace rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true, Users: []string{" alice"}},
+				}
+			},
+		},
+		{
+			name: "relay terminal duplicate identity rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true, Users: []string{"alice", "alice"}},
+				}
+			},
+		},
+		{
+			name: "relay terminal short poll wait rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true, PollWait: time.Second},
+				}
+			},
+		},
+		{
+			name: "relay terminal oversized poll wait rejected",
+			mutate: func(d *DaemonConfig) {
+				d.CloudURL = "https://mk.solsynth.dev"
+				d.CloudSecret = "cloud-secret"
+				d.Terminal = TerminalConfig{
+					Shells: []string{"/bin/sh"},
+					Relay:  TerminalRelayConfig{Enabled: true, PollWait: time.Minute},
 				}
 			},
 		},

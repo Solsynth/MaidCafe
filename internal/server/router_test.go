@@ -216,3 +216,42 @@ func TestListMetricsUserRoute(t *testing.T) {
 		t.Fatalf("metric body missing fields: %s", got.Body)
 	}
 }
+
+// TestRouterRegistersTerminalRoutes proves the full terminal route set builds
+// without a gin route conflict and that the browser socket authenticates
+// in-handler (401) rather than 404/500.
+func TestRouterRegistersTerminalRoutes(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
+	router := NewRouter(nil, svc, routeAuthenticator{})
+
+	registered := make(map[string]bool)
+	for _, route := range router.Routes() {
+		registered[route.Method+" "+route.Path] = true
+	}
+	for _, want := range []string{
+		"GET /api/daemons/:id/terminal",
+		"GET /api/daemons/:id/terminals",
+		"POST /api/daemons/:id/terminal",
+		"DELETE /api/daemons/:id/terminal/:session_id",
+		"GET /api/daemons/:id/terminal/requests/pending",
+		"GET /api/daemons/:id/terminal/agent",
+	} {
+		if !registered[want] {
+			t.Fatalf("missing route %s", want)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/daemons/x/terminal", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated browser socket route %d %s", rec.Code, rec.Body)
+	}
+}

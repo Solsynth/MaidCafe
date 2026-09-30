@@ -111,6 +111,26 @@ func main() {
 			}
 		}
 	}()
+	// Terminal sessions: fail never-attached sessions and prune finished rows,
+	// once at startup then every minute.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		sweep := func() {
+			if err := svc.SweepTerminalSessions(ctx, time.Now().UTC()); err != nil {
+				log.Warn().Err(err).Msg("terminal session sweep")
+			}
+		}
+		sweep()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweep()
+			}
+		}
+	}()
 	disconnectAfter := cfg.Cloud.DaemonDisconnectAfter
 	if disconnectAfter <= 0 {
 		disconnectAfter = cloud.DefaultDaemonDisconnectAfter

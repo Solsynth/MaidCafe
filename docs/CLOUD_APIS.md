@@ -48,6 +48,7 @@ error, never a grant.
   "name": "managed-host-01",
   "host_id": "9e4b...",
   "enabled": true,
+  "terminal_relay_enabled": false,
   "last_seen_at": "2026-08-15T12:00:00Z",
   "disconnected_at": null,
   "created_at": "2026-08-15T10:00:00Z",
@@ -69,6 +70,7 @@ Daemon registration additionally returns the one-time `secret`:
   "name": "managed-host-01",
   "host_id": "",
   "enabled": true,
+  "terminal_relay_enabled": false,
   "last_seen_at": null,
   "disconnected_at": null,
   "created_at": "2026-08-15T10:00:00Z",
@@ -273,17 +275,19 @@ workspace; `404` if unknown.
 
 #### `PATCH /api/daemons/:id`
 
-Change the name or enabled state.
+Change the name, enabled state, or relayed-terminal opt-in.
 
 ```sh
 curl -X PATCH http://localhost:8080/api/daemons/d0f2f0c2-... \
   -H 'Authorization: Bearer <solar-token>' \
   -H 'Content-Type: application/json' \
-  -d '{"name":"managed-host-01","enabled":false}'
+  -d '{"name":"managed-host-01","enabled":false,"terminal_relay_enabled":true}'
 ```
 
-Both fields are optional; omitted fields are unchanged. `200` returns the
-updated daemon.
+All fields are optional; omitted fields are unchanged. `200` returns the
+updated daemon. `terminal_relay_enabled` (default `false`) lets workspace
+members open a cloud-relayed interactive terminal on the host; the daemon must
+also enable `daemon.terminal.relay.enabled` locally.
 
 #### `POST /api/daemons/:id/rotate-secret`
 
@@ -565,6 +569,135 @@ Read a relayed request and, once the daemon completed it, its result.
 
 `200` returns a webhook request resource. `404` if unknown.
 
+### Terminal relay (user routes)
+
+A browser cannot open an SSH socket and a daemon behind NAT cannot be dialed
+in, so an interactive shell is relayed through the cloud: the browser opens a
+WebSocket with a short-lived ticket, the daemon long-polls for the session and
+dials one outbound socket per session, and the cloud pumps frames between the
+two sockets without parsing them. The frames are the daemon's own v1 terminal
+protocol (binary = PTY bytes, text = control), so clients are unchanged. Both
+sides must opt in: the daemon sets `daemon.terminal.relay.enabled` locally and
+the cloud sets `terminal_relay_enabled` on the daemon row.
+
+The browser socket is registered on the **root** router, outside the
+`userAuth` group, because a browser cannot set an `Authorization` header on a
+WebSocket handshake. It authenticates from
+`Sec-WebSocket-Protocol: maidcafe.terminal.<base64url-unpadded(session_id + "." + ticket)>`
+instead. Query parameters are ignored (geometry comes from the `POST`).
+
+Two deployment requirements follow from that:
+
+- The cloud must be reachable over TLS (`wss://`). A browser page served from
+  `https://` may not open a `ws://` socket, and the browser handshake carries
+  the ticket — front the cloud with a TLS terminator (Caddy, nginx,
+  `tailscale serve`) before offering this to browsers.
+- The page's origin must be listed in `http.allowedOrigins`; an empty list
+  allows only same-host origins, so a separately hosted MaidKit build is
+  rejected with `403` until it is added.
+
+The cloud terminates TLS and pumps frames without parsing the PTY bytes, so a
+relayed session passes through it in the clear: the cloud can read every
+keystroke and every byte of output, including a password typed at a `sudo`
+prompt. Neither side stores a transcript — the session row holds only metadata
+and byte counters, and the daemon audit entry is a summary.
+
+#### `POST /api/daemons/:id/terminal`
+
+Mint a session ticket for the authenticated Solar user. A user-level API
+credential (`mk_...`) is rejected with `403`: a terminal requires an
+interactive user.
+
+```sh
+curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../terminal \
+  -H 'Authorization: Bearer <solar-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"shell":"/bin/bash","user":"deploy","cols":120,"rows":36}'
+```
+
+`201`:
+
+```json
+{"session_id":"b7c1...","ticket":"hQ2...","expires_at":"2026-10-01T00:01:00Z","daemon_id":"d0f2f0c2-..."}
+```
+
+| Field | Type | Constraints |
+| --- | --- | --- |
+| `shell` | string | optional, `<= 1024` bytes |
+| `user` | string | optional, `<= 64` bytes |
+| `cols` | int | optional, `0..1000` (`0` = daemon default) |
+| `rows` | int | optional, `0..500` (`0` = daemon default) |
+
+The ticket is 32 random bytes returned base64url (unpadded); only its SHA-256
+hex is stored, it is valid for 60 seconds, and it is consumed by the browser
+socket's first handshake (single use). `403` if the caller is not a member of
+the daemon's workspace or the daemon has not enabled the relay; `429` when the
+workspace's concurrent-session cap is reached (the `terminal_sessions` quota
+when the workspace service returns one, else 4).
+
+#### `GET /api/daemons/:id/terminals`
+
+List recent sessions for the daemon (admin visibility). `200` returns
+`{"sessions":[TerminalSessionView…]}`.
+
+```json
+{
+  "id": "b7c1...",
+  "daemon_id": "d0f2f0c2-...",
+  "invoked_by": "@alice",
+  "shell": "/bin/bash",
+  "user": "deploy",
+  "cols": 120,
+  "rows": 36,
+  "status": "active",
+  "exit_code": 0,
+  "error": "",
+  "bytes_in": 1234,
+  "bytes_out": 56789,
+  "started_at": "2026-10-01T00:00:01Z",
+  "ended_at": null,
+  "created_at": "2026-10-01T00:00:00Z"
+}
+```
+
+| Query | Type | Default | Bounds |
+| --- | --- | --- | --- |
+| `limit` | int | `50` | `1..100` |
+
+`status` is one of `pending` (created, awaiting pickup), `offered` (leased to
+a daemon long-poll), `active` (both sockets attached), `closed` (ended), or
+`failed` (never picked up or attached within 3 minutes, or left `active` for
+more than 24 hours by sockets that died without reporting it — the daemon's own
+`idleTimeout`/`maxLifetime` normally closes those first). Finished rows are
+pruned after 7 days. PTY bytes and the ticket are never stored.
+
+#### `DELETE /api/daemons/:id/terminal/:session_id`
+
+Revoke a session: close both sockets and mark it `closed`. `204` on success;
+`403` for a non-member; `404` if unknown.
+
+#### `GET /api/daemons/:id/terminal`
+
+The browser WebSocket upgrade (root router). Auth is the ticket subprotocol
+above; the handshake fails with `401` when it is missing, malformed, unknown,
+expired, or already used. `403` when the request's `Origin` is not allowed by
+`http.allowedOrigins` (empty allows only same-host origins).
+
+Frames are forwarded verbatim in both directions; the cloud caps one frame at
+1 MiB (closing `1009` past it) and never drops or coalesces them, so a slow
+client propagates TCP backpressure to the PTY. The cloud closes both sockets
+when either ends, and if the daemon never attaches within 90 seconds it sends
+an `error` frame and closes `1011`.
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| daemon → browser | text `{"type":"hello","version":"v1","session":"…","shell":"…","user":"…","cols":N,"rows":N}` | session opened |
+| daemon → browser | binary | raw PTY bytes |
+| daemon → browser | text `{"type":"exit","code":N,"reason":"…"}` then close `1000` | shell exited / session closed |
+| daemon → browser | text `{"type":"error","message":"…"}` then close `1008`/`1011` | protocol violation / start failure |
+| browser → daemon | binary | raw keystrokes |
+| browser → daemon | text `{"type":"resize","cols":N,"rows":N}` | PTY resize |
+
 ### Daemon ingestion routes
 
 These routes use `Authorization: Bearer <daemon-secret>`. They are how the
@@ -669,6 +802,39 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../webhook-requests/3f9
 | `code` | int | webhook exit/HTTP code |
 | `body` | string | base64 result body |
 | `error` | string | `<= 512` bytes |
+
+#### `GET /api/daemons/:id/terminal/requests/pending?wait=20s&limit=1`
+
+Long-poll for relayed terminal sessions (daemon-secret authenticated). Leased
+sessions are returned immediately; otherwise the request holds up to `wait`
+(capped at `30s`) and returns `{"sessions":[]}` when nothing arrives. Each
+pickup leases every session currently pending for the daemon (a batch of at
+most 8). Leases expire after 90 seconds and the session is re-offered, so a
+daemon that dies mid-pickup strands nothing.
+
+```sh
+curl 'http://localhost:8080/api/daemons/d0f2f0c2-.../terminal/requests/pending?wait=20s&limit=1' \
+  -H 'Authorization: Bearer <daemon-secret>'
+```
+
+`200`:
+
+```json
+{"sessions":[{"id":"b7c1...","shell":"/bin/bash","user":"deploy","cols":120,"rows":36,"invoked_by":"@alice","created_at":"2026-10-01T00:00:00Z"}]}
+```
+
+| Query | Type | Default | Bounds |
+| --- | --- | --- | --- |
+| `wait` | duration | `0s` | `0..30s` |
+| `limit` | int | `1` | `1..8` |
+
+#### `GET /api/daemons/:id/terminal/agent?session=<id>`
+
+WebSocket upgrade for the daemon side of one session, authenticated with
+`Authorization: Bearer <daemon-secret>`. The daemon dials this for each
+accepted session and pumps frames with the browser side (see the frame table
+above). Attaching marks the session `active`; `404` if the session is unknown
+or already ended.
 
 ## End-to-end daemon flow
 

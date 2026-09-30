@@ -41,6 +41,7 @@ type App struct {
 	watched         *watchedProcessStore
 	jobs            *jobRunner
 	terminal        *terminalManager
+	terminalRelay   *terminalRelay
 	server          *http.Server
 	listenerMu      sync.RWMutex
 	listener        net.Listener
@@ -129,6 +130,15 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	app.logAlerts.SetAlerts(cfg.LogAlerts)
 	app.rt.Store(newReloadableConfig(cfg))
 	app.relay = NewWebhookRelay(publisherBox, executor, ops, logger)
+	// The relayed terminal is outbound, so it works in the stdio transport too;
+	// it only exists when the operator enabled it and the daemon has a cloud to
+	// poll. The policy is re-read from the reloadable snapshot on every use, so
+	// a reload can turn sessions off without a restart.
+	if cfg.Terminal.Relay.Enabled {
+		app.terminalRelay = newTerminalRelay(publisherBox, app.terminal, func() config.TerminalConfig {
+			return app.rt.Load().terminal
+		}, logger)
+	}
 	executor.SetCompletionHandler(func(hook config.WebhookConfig, ok bool, exitCode int, stderr string, duration time.Duration) {
 		p := publisherBox.Load()
 		if p == nil || (!ok && !hook.NotifyOnFailure) || (ok && !hook.NotifyOnSuccess) {
@@ -625,6 +635,11 @@ func (a *App) ListenAddr() string {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	// The relay is outbound and needs no listener, so it runs in both
+	// transports and stops with the app context.
+	if a.terminalRelay != nil {
+		go a.terminalRelay.Run(ctx)
+	}
 	if strings.EqualFold(strings.TrimSpace(a.cfg.Transport), "stdio") {
 		return a.runStdio(ctx)
 	}

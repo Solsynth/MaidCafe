@@ -326,15 +326,22 @@ type Service struct {
 	// per cloud instance; multi-replica deploys should move this to shared state.
 	pollMu  sync.Mutex
 	pollHit map[string]time.Time
+
+	// terminalWait wakes the daemon's terminal long-poll the instant a session
+	// is created for it. In-memory only: the pairing registry is per-instance
+	// too, so multi-replica deploys must sticky-route by daemon id.
+	terminalMu   sync.Mutex
+	terminalWait map[string]*terminalWaiter
 }
 
 func NewService(db *database.DB, publisher PushPublisher, workspaces WorkspaceClient) *Service {
 	return &Service{
-		db:         db,
-		publisher:  publisher,
-		workspaces: workspaces,
-		logger:     slog.Default(),
-		pollHit:    make(map[string]time.Time),
+		db:           db,
+		publisher:    publisher,
+		workspaces:   workspaces,
+		logger:       slog.Default(),
+		pollHit:      make(map[string]time.Time),
+		terminalWait: make(map[string]*terminalWaiter),
 	}
 }
 
@@ -343,15 +350,18 @@ func (s *Service) SetAccountClient(accounts AccountClient) {
 }
 
 type DaemonView struct {
-	ID             string     `json:"id"`
-	WorkspaceID    string     `json:"workspace_id"`
-	Name           string     `json:"name"`
-	HostID         string     `json:"host_id"`
-	Enabled        bool       `json:"enabled"`
-	LastSeenAt     *time.Time `json:"last_seen_at"`
-	DisconnectedAt *time.Time `json:"disconnected_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	Name        string `json:"name"`
+	HostID      string `json:"host_id"`
+	Enabled     bool   `json:"enabled"`
+	// TerminalRelayEnabled reports whether this host accepts cloud-relayed
+	// interactive terminals (set with PATCH /api/daemons/:id).
+	TerminalRelayEnabled bool       `json:"terminal_relay_enabled"`
+	LastSeenAt           *time.Time `json:"last_seen_at"`
+	DisconnectedAt       *time.Time `json:"disconnected_at"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 type Credential struct {
 	DaemonView
@@ -537,7 +547,7 @@ func generateSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 func viewDaemon(d database.Daemon) DaemonView {
-	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, HostID: d.HostID, Enabled: d.Enabled, LastSeenAt: d.LastSeenAt, DisconnectedAt: d.DisconnectedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
+	return DaemonView{ID: d.ID, WorkspaceID: d.WorkspaceID, Name: d.Name, HostID: d.HostID, Enabled: d.Enabled, TerminalRelayEnabled: d.TerminalRelayEnabled, LastSeenAt: d.LastSeenAt, DisconnectedAt: d.DisconnectedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
 }
 func (s *Service) CreateDaemon(ctx context.Context, accountID, workspaceID, name string) (Credential, error) {
 	workspaceID = strings.TrimSpace(workspaceID)
@@ -629,7 +639,7 @@ func (s *Service) GetDaemon(ctx context.Context, accountID, id string) (DaemonVi
 	}
 	return viewDaemon(d), nil
 }
-func (s *Service) UpdateDaemon(ctx context.Context, accountID, id string, name *string, enabled *bool) (DaemonView, error) {
+func (s *Service) UpdateDaemon(ctx context.Context, accountID, id string, name *string, enabled *bool, terminalRelayEnabled *bool) (DaemonView, error) {
 	d, err := s.daemonForAccount(ctx, accountID, id)
 	if err != nil {
 		return DaemonView{}, err
@@ -645,6 +655,9 @@ func (s *Service) UpdateDaemon(ctx context.Context, accountID, id string, name *
 		if !d.Enabled {
 			d.DisconnectedAt = nil
 		}
+	}
+	if terminalRelayEnabled != nil {
+		d.TerminalRelayEnabled = *terminalRelayEnabled
 	}
 	if err := s.db.WithContext(ctx).Save(&d).Error; err != nil {
 		return DaemonView{}, err

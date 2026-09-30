@@ -14,12 +14,16 @@ type Daemon struct {
 	SecretHash  string `gorm:"size:255;not null" json:"-"`
 	// HostID is the stable machine identity the daemon reports with its
 	// metrics; credential scopes can link to it instead of daemon ids.
-	HostID         string `gorm:"size:191;index"`
-	Enabled        bool   `gorm:"not null;index"`
-	LastSeenAt     *time.Time
-	DisconnectedAt *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	HostID  string `gorm:"size:191;index"`
+	Enabled bool   `gorm:"not null;index"`
+	// TerminalRelayEnabled opts the host into cloud-relayed interactive
+	// terminals. Off by default: enabling it lets workspace members open a
+	// shell on the host through the cloud relay.
+	TerminalRelayEnabled bool `gorm:"column:terminal_relay_enabled"`
+	LastSeenAt           *time.Time
+	DisconnectedAt       *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type DaemonMetric struct {
@@ -152,4 +156,31 @@ type Credential struct {
 	ActionNames string `gorm:"size:4096"` // comma-separated, empty = all
 	CreatedAt   time.Time
 	LastUsedAt  *time.Time
+}
+
+// TerminalSession is one cloud-relayed interactive terminal. The row is
+// authorization, audit and admin visibility only: PTY bytes never touch the
+// database. The plain ticket is shown once at creation; only its SHA-256 hex
+// is stored and it is consumed by the browser socket's first handshake.
+type TerminalSession struct {
+	ID          string `gorm:"type:char(36);primaryKey"`
+	DaemonID    string `gorm:"size:191;index;not null"`
+	WorkspaceID string `gorm:"size:191;index;not null"`
+	AccountID   string `gorm:"size:191;index;not null"`
+	InvokedBy   string `gorm:"size:191"` // handle shown in the daemon audit log
+	Shell       string `gorm:"size:1024"`
+	User        string `gorm:"size:64"`
+	Columns     int
+	Rows        int
+	TicketHash  string `gorm:"size:64;not null;index" json:"-"`
+	Status      string `gorm:"size:16;not null;index"`
+	LeasedAt    *time.Time
+	StartedAt   *time.Time
+	EndedAt     *time.Time
+	ExitCode    int
+	Error       string `gorm:"size:512"`
+	BytesIn     int64
+	BytesOut    int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

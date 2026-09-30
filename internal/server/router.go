@@ -12,7 +12,7 @@ import (
 	gen "src.solsynth.dev/sosys/go/proto"
 )
 
-func NewRouter(_ *config.Config, svc *cloud.Service, authenticator dyauth.TokenAuthenticator) *gin.Engine {
+func NewRouter(cfg *config.Config, svc *cloud.Service, authenticator dyauth.TokenAuthenticator) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	userAuth := func(c *gin.Context) {
@@ -46,6 +46,6 @@ func NewRouter(_ *config.Config, svc *cloud.Service, authenticator dyauth.TokenA
 		dyauth.WithAuth(c, result, token)
 		c.Next()
 	}
-	handler.RegisterRoutes(r, svc, userAuth)
+	handler.RegisterRoutes(r, svc, userAuth, cfg)
 	return r
 }

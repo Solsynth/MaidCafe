@@ -150,3 +150,15 @@ shells = ["/bin/bash"]
 # maxSessions = 2
 # idleTimeout = "15m"
 # maxLifetime = "8h"
+
+# Sessions the MaidCafe cloud hands to this daemon, for browser clients that
+# cannot reach it (behind NAT). Off by default: enabling it lets the cloud's
+# authorized workspace members open a shell here, so set `users` to say who.
+# Requires cloudUrl/cloudSecret. The daemon only dials out.
+[daemon.terminal.relay]
+enabled = false
+# Cloud identities allowed to open a relayed session (the Solarpass handle the
+# cloud forwards); empty accepts any identity the cloud authorizes.
+# users = ["you@solsynth.dev"]
+# How long one pickup long-poll holds before returning empty (3s..25s).
+# pollWait = "20s"
