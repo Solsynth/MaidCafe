@@ -38,9 +38,11 @@ const composeOpTimeout = 5 * time.Minute
 // channels accept exactly the same targets.
 var (
 	nativeContainerRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]*$`)
-	nativeSystemdUnitPattern  = regexp.MustCompile(`^[A-Za-z0-9:._@\-]+\.service$`)
-	nativeProjectPattern      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
-	nativeDirectoryPattern    = regexp.MustCompile(`^/[a-zA-Z0-9_./-]+$`)
+	// The first character must not be a dash: "-H.service" would reach
+	// systemctl's option parser as the --host option rather than a unit name.
+	nativeSystemdUnitPattern = regexp.MustCompile(`^[A-Za-z0-9:._@][A-Za-z0-9:._@\-]*\.service$`)
+	nativeProjectPattern     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+	nativeDirectoryPattern   = regexp.MustCompile(`^/[a-zA-Z0-9_./-]+$`)
 )
 
 // nativeContainerVerbs maps a container lifecycle action to the runtime CLI
@@ -174,16 +176,58 @@ type opAttempt struct {
 // concurrency slot, timeout, counters and audit log. Container runtimes are
 // resolved with the shared runtime probe (podman first), falling back to the
 // other runtime when the target is not found there.
+// opPrivPolicy is how a native operation reaches root, if it may. It is read
+// per request so a reload can switch it without a restart.
+type opPrivPolicy struct {
+	helper string
+	runner *privRunner
+	// systemd routes systemd actions through the helper, and makes the helper
+	// the only path for them: see [config.PrivConfig.Systemd].
+	systemd bool
+}
+
 type nativeOpRunner struct {
 	executor      *WebhookExecutor
 	runtimes      func(ctx context.Context) map[string]string
 	scriptTimeout atomic.Int64 // nanoseconds
 	publisher     *atomic.Pointer[CloudPublisher]
+	// priv is how an operation reaches root, when it may. Nil means the
+	// pre-helper behavior (a direct call, then a blanket `sudo -n`).
+	priv atomic.Pointer[opPrivPolicy]
 }
 
 // SetScriptTimeout updates the daemon-wide op timeout (hot reload).
 func (r *nativeOpRunner) SetScriptTimeout(timeout time.Duration) {
 	r.scriptTimeout.Store(int64(timeout))
+}
+
+// SetPrivilegedPolicy records how native operations may reach root. Called at
+// construction and on every reload.
+func (r *nativeOpRunner) SetPrivilegedPolicy(helper string, systemd bool, runner *privRunner) {
+	if runner == nil {
+		r.priv.Store(nil)
+		return
+	}
+	r.priv.Store(&opPrivPolicy{helper: helper, runner: runner, systemd: systemd})
+}
+
+// systemdHelperAttempt builds the attempt that runs a systemd action through the
+// helper, or returns false when systemd actions are not routed there.
+//
+// The helper is the *only* path when it is configured for systemd: its grant
+// file names the units and verbs, and falling back to a blanket `sudo -n
+// systemctl` would silently keep whatever broader grant an operator had, which
+// is the boundary this replaces.
+func (r *nativeOpRunner) systemdHelperAttempt(verb, unit string) (opAttempt, bool) {
+	policy := r.priv.Load()
+	if policy == nil || !policy.systemd || policy.runner == nil {
+		return opAttempt{}, false
+	}
+	argv := policy.runner.argv(policy.helper, "systemd", verb, unit)
+	if len(argv) == 0 {
+		return opAttempt{}, false
+	}
+	return opAttempt{command: argv[0], args: argv[1:]}, true
 }
 
 // dispatch validates [slug] and [params], builds the command attempts and
@@ -253,6 +297,11 @@ func (r *nativeOpRunner) dispatch(
 		}
 		targetLabel = unit
 		args := []string{verb, unit}
+		if helperAttempt, ok := r.systemdHelperAttempt(verb, unit); ok {
+			// Routed: the helper decides, and nothing else is tried.
+			attempts = append(attempts, helperAttempt)
+			break
+		}
 		attempts = append(attempts, opAttempt{command: "systemctl", args: args})
 		if sudo := r.sudoAttempt(); sudo != nil {
 			attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{"systemctl"}, args...)...)})

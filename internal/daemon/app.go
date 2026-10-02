@@ -99,6 +99,10 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		publisher: publisherBox,
 	}
 	ops.SetScriptTimeout(cfg.ScriptTimeout)
+	priv := newPrivRunner()
+	if priv != nil {
+		ops.SetPrivilegedPolicy(cfg.Priv.Helper, cfg.Priv.Systemd, priv)
+	}
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
 	historyDir := ""
 	if strings.TrimSpace(cfg.MetricsHistoryPath) != "" {
@@ -131,7 +135,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		watched:         watchedStore,
 		jobs:            jobs,
 		terminal:        newTerminalManager(logger, audit),
-		priv:            newPrivRunner(),
+		priv:            priv,
 		logger:          logger,
 	}
 	app.logAlerts.SetAlerts(cfg.LogAlerts)

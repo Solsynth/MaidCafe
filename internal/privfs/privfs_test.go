@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -431,5 +432,170 @@ func TestDigestIsStable(t *testing.T) {
 func TestSafeRelNormalizes(t *testing.T) {
 	if rel, err := safeRel("a//b/./c"); err != nil || rel != filepath.Join("a", "b", "c") {
 		t.Fatalf("safeRel = %q, %v", rel, err)
+	}
+}
+
+func TestLoadSetValidatesSystemdGrants(t *testing.T) {
+	root := t.TempDir()
+	good := writeProfile(t, `
+[[profiles]]
+name = "nginx"
+path = "`+root+`"
+modes = ["0644"]
+
+[[systemd]]
+unit = "nginx.service"
+verbs = ["restart", "reload"]
+
+[[systemd]]
+unit = "my-app@b.service"
+verbs = ["start"]
+`)
+	set, err := LoadSet(good, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if units := strings.Join(set.GrantedUnits(), ","); units != "my-app@b.service,nginx.service" {
+		t.Fatalf("granted units = %q", units)
+	}
+	grant, err := set.LookupUnit("nginx.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := grant.CheckVerb("restart"); err != nil {
+		t.Fatal(err)
+	}
+	// A verb the operator did not grant is refused, and the message says which
+	// ones they did.
+	if err := grant.CheckVerb("stop"); err == nil || !strings.Contains(err.Error(), "granted: reload, restart") {
+		t.Fatalf("ungranted verb error = %v", err)
+	}
+	// So is a verb systemd has but this helper does not run.
+	if err := grant.CheckVerb("freeze"); err == nil || !strings.Contains(err.Error(), "is not one of") {
+		t.Fatalf("unknown verb error = %v", err)
+	}
+	if _, err := set.LookupUnit("nginx"); err == nil || !strings.Contains(err.Error(), "not granted") {
+		t.Fatalf("ungranted unit error = %v", err)
+	}
+	if _, err := set.LookupUnit("absent.service"); err == nil || !strings.Contains(err.Error(), "nginx.service") {
+		t.Fatalf("unknown unit error = %v", err)
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"unit without .service", "[[systemd]]\nunit = \"nginx\"\nverbs = [\"restart\"]\n"},
+		// A leading dash would reach systemctl's option parser as an option.
+		{"unit starting with a dash", "[[systemd]]\nunit = \"-H.service\"\nverbs = [\"restart\"]\n"},
+		{"unit with a path separator", "[[systemd]]\nunit = \"/etc/systemd/nginx.service\"\nverbs = [\"restart\"]\n"},
+		{"unit with a space", "[[systemd]]\nunit = \"ngi nx.service\"\nverbs = [\"restart\"]\n"},
+		{"no verbs", "[[systemd]]\nunit = \"nginx.service\"\n"},
+		{"unknown verb", "[[systemd]]\nunit = \"nginx.service\"\nverbs = [\"freeze\"]\n"},
+		{"duplicate unit", "[[systemd]]\nunit = \"nginx.service\"\nverbs = [\"start\"]\n[[systemd]]\nunit = \"nginx.service\"\nverbs = [\"stop\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := LoadSet(writeProfile(t, tc.body), Options{}); err == nil {
+				t.Fatalf("expected refusal for %s", tc.name)
+			}
+		})
+	}
+
+	// A file with only unit grants is usable: an operator who only wants
+	// systemd actions should not have to declare a file profile.
+	unitsOnly := writeProfile(t, "[[systemd]]\nunit = \"nginx.service\"\nverbs = [\"restart\"]\n")
+	set, err = LoadSet(unitsOnly, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Names()) != 0 || len(set.GrantedUnits()) != 1 {
+		t.Fatalf("units-only set = %+v", set)
+	}
+	// And an empty file is still a refusal.
+	if _, err := LoadSet(writeProfile(t, "# nothing\n"), Options{}); err == nil {
+		t.Fatal("an empty grant file was accepted")
+	}
+}
+
+func TestSystemdArgvEndsOptionParsing(t *testing.T) {
+	// The binary is supplied rather than discovered: this asserts the shape of
+	// the command, which must hold whether or not systemctl is installed here.
+	grant := &UnitGrant{Unit: "nginx.service", Verbs: map[string]bool{"restart": true}}
+	argv, err := grant.systemdArgv("/usr/bin/systemctl", "restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[0] != "/usr/bin/systemctl" {
+		t.Fatalf("argv does not run the supplied binary: %v", argv)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--no-ask-password") || !strings.Contains(joined, "--no-pager") {
+		t.Fatalf("argv is not non-interactive: %v", argv)
+	}
+	// `--` before the unit is the guard against the unit being read as an
+	// option, in addition to the name pattern.
+	restartAt := slices.Index(argv, "restart")
+	unitAt := slices.Index(argv, "nginx.service")
+	if unitAt != restartAt+2 || argv[unitAt-1] != "--" {
+		t.Fatalf("unit is not separated from the options: %v", argv)
+	}
+	// An ungranted verb never produces a command.
+	if _, err := grant.systemdArgv("/usr/bin/systemctl", "stop"); err == nil {
+		t.Fatal("an ungranted verb produced a command")
+	}
+	// FindSystemctl reports a missing binary rather than running something
+	// else from the path.
+	if _, err := grant.SystemdArgv("restart"); err != nil {
+		if !strings.Contains(err.Error(), "systemctl was not found") {
+			t.Fatalf("unexpected error from SystemdArgv: %v", err)
+		}
+	}
+}
+
+func TestRunSystemdRefusals(t *testing.T) {
+	root := t.TempDir()
+	path := writeProfile(t, "[[profiles]]\nname = \"p\"\npath = \""+root+"\"\nmodes = [\"0644\"]\n"+
+		"[[systemd]]\nunit = \"nginx.service\"\nverbs = [\"restart\"]\n")
+
+	// Unprivileged: the sudoers gate, as with the file operations.
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"--config", path, "systemd", "restart", "nginx.service"}, nil, &stdout, &stderr, Env{EUID: 501}); code != ExitNotRoot {
+		t.Fatalf("unprivileged systemd exit = %d", code)
+	}
+	// Malformed invocations are usage errors, not policy ones.
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"systemd", "restart"}, nil, &stdout, &stderr, Env{EUID: 0}); code != ExitUsage {
+		t.Fatalf("short argv exit = %d", code)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"systemd", "freeze", "nginx.service"}, nil, &stdout, &stderr, Env{EUID: 0}); code != ExitUsage {
+		t.Fatalf("unknown verb exit = %d", code)
+	}
+	// An appended argument must not be reinterpreted as another unit or verb.
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"systemd", "restart", "nginx.service", "sshd.service"}, nil, &stdout, &stderr, Env{EUID: 0}); code != ExitUsage {
+		t.Fatalf("extra argument exit = %d", code)
+	}
+	// Running as root with a test user's grant file is refused for ownership,
+	// and says so, rather than running an action against an untrusted file.
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"--config", path, "systemd", "restart", "nginx.service"}, nil, &stdout, &stderr, Env{EUID: 0})
+	if code != ExitConfigBad {
+		t.Skipf("running as root (euid 0); the ownership gate did not apply: exit %d", code)
+	}
+	if !strings.Contains(stderr.String(), "owned by root") {
+		t.Fatalf("ownership refusal = %q", stderr.String())
+	}
+}
+
+func TestSudoersRuleCoversSystemd(t *testing.T) {
+	rule := SudoersRule("maidcafe", DefaultHelperPath)
+	if !strings.Contains(rule, DefaultHelperPath+" systemd *") {
+		t.Fatalf("rule does not authorize systemd actions:\n%s", rule)
 	}
 }

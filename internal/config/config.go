@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -123,9 +124,14 @@ type DaemonConfig struct {
 	// reason as Terminal: browser-based MaidKit builds cannot open an SFTP
 	// channel, so the daemon serves the operations the file manager and the
 	// editor need. Disabled by default.
-	Files       FilesConfig `mapstructure:"files"`
-	CloudURL    string      `mapstructure:"cloudUrl"`
-	CloudSecret string      `mapstructure:"cloudSecret"`
+	Files FilesConfig `mapstructure:"files"`
+	// Priv names the privileged-operation helper, the one component that runs
+	// as root. A privileged file root and a privileged systemd action both go
+	// through it, and the helper's own root-owned configuration is the
+	// authorization boundary for both.
+	Priv        PrivConfig `mapstructure:"priv"`
+	CloudURL    string     `mapstructure:"cloudUrl"`
+	CloudSecret string     `mapstructure:"cloudSecret"`
 	// LogsUploadEnabled opts the daemon into outbound log upload. It is
 	// deliberately false by default because logs may contain secrets.
 	LogsUploadEnabled    bool          `mapstructure:"logsUploadEnabled"`
@@ -274,11 +280,6 @@ type FilesConfig struct {
 	// delete). Off by default, so an operator can publish a read-only view of
 	// a directory tree.
 	AllowWrite bool `mapstructure:"allowWrite"`
-	// PrivilegedHelper is the root-installed helper the daemon runs through
-	// sudo to write inside a privileged root. Empty uses the installed
-	// default; it is configurable so a distribution can choose its libexec
-	// directory.
-	PrivilegedHelper string `mapstructure:"privilegedHelper"`
 	// MaxReadBytes caps one read request (editor load, download window);
 	// 0 uses FilesDefaultMaxReadBytes. A larger file is still reachable by
 	// paging with offset/limit.
@@ -289,6 +290,28 @@ type FilesConfig struct {
 	// MaxListEntries caps one directory listing; 0 uses
 	// FilesDefaultMaxListEntries. A larger directory is reported truncated.
 	MaxListEntries int `mapstructure:"maxListEntries"`
+}
+
+// PrivConfig describes the root-capable helper.
+//
+// The helper is not a general "run as root" tool: it implements a fixed set of
+// operations, and each of them resolves what it may touch from its own
+// root-owned configuration. This table only says where the helper is and which
+// operations the daemon may route to it.
+type PrivConfig struct {
+	// Helper is the installed helper binary. Empty uses the compiled-in
+	// default; it is configurable so a distribution can choose its libexec
+	// directory. Setting it does not by itself grant anything: an operation
+	// has to be routed to it, and the helper has to have a grant for it.
+	Helper string `mapstructure:"helper"`
+	// Systemd routes native systemd unit actions through the helper instead of
+	// the blanket `sudo -n systemctl` attempt.
+	//
+	// When true the helper is the only path: a refusal from it is an error, not
+	// a fallback to a broader sudo rule. Falling back would mean an operator who
+	// granted two units also silently kept whatever blanket grant they had,
+	// which is exactly the boundary this replaces.
+	Systemd bool `mapstructure:"systemd"`
 }
 
 // FilesRootConfig declares one directory the file API may touch, and whether
@@ -324,7 +347,7 @@ const (
 	FilesMaxListEntriesLimit   = 100000
 
 	// FilesDefaultPrivilegedHelper is the installed maidkit-priv path, used
-	// when daemon.files.privilegedHelper is empty.
+	// when daemon.priv.helper is empty.
 	FilesDefaultPrivilegedHelper = "/usr/local/libexec/maidkit-priv"
 )
 
@@ -635,9 +658,6 @@ func validateFiles(cfg FilesConfig) error {
 	if cfg.MaxListEntries < 0 || cfg.MaxListEntries > FilesMaxListEntriesLimit {
 		return fmt.Errorf("daemon.files.maxListEntries must be between 1 and %d", FilesMaxListEntriesLimit)
 	}
-	if cfg.PrivilegedHelper != "" && !filepath.IsAbs(cfg.PrivilegedHelper) {
-		return fmt.Errorf("daemon.files.privilegedHelper must be an absolute path")
-	}
 	if !cfg.Enabled {
 		return nil
 	}
@@ -674,21 +694,32 @@ func validateFiles(cfg FilesConfig) error {
 			privileged++
 		}
 	}
-	if privileged > 0 {
-		// A privileged root without an installed helper would fail every write
-		// with a permission error from sudo; report it at load instead, where
-		// the operator can still see the configuration being rejected.
-		helper := cfg.PrivilegedHelper
-		if helper == "" {
-			helper = FilesDefaultPrivilegedHelper
-		}
-		info, err := os.Stat(helper)
-		if err != nil {
-			return fmt.Errorf("daemon.files.privilegedHelper %q is not usable: %w", helper, err)
-		}
-		if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
-			return fmt.Errorf("daemon.files.privilegedHelper %q is not an executable file", helper)
-		}
+	return nil
+}
+
+// validatePriv checks the privileged-helper configuration, and with it the
+// helper's presence whenever something is routed to it. An operation routed to
+// a helper that is not installed fails on the request instead of at load, which
+// is a worse place to discover it.
+func validatePriv(cfg PrivConfig, files FilesConfig) error {
+	if cfg.Helper != "" && !filepath.IsAbs(cfg.Helper) {
+		return fmt.Errorf("daemon.priv.helper must be an absolute path")
+	}
+	needsHelper := cfg.Systemd ||
+		slices.ContainsFunc(files.Roots, func(root FilesRootConfig) bool { return root.Privileged })
+	if !needsHelper {
+		return nil
+	}
+	helper := cfg.Helper
+	if helper == "" {
+		helper = FilesDefaultPrivilegedHelper
+	}
+	info, err := os.Stat(helper)
+	if err != nil {
+		return fmt.Errorf("daemon.priv.helper %q is not usable: %w", helper, err)
+	}
+	if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("daemon.priv.helper %q is not an executable file", helper)
 	}
 	return nil
 }
@@ -769,7 +800,8 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.files.enabled", false)
 	viper.SetDefault("daemon.files.secret", "")
 	viper.SetDefault("daemon.files.roots", []map[string]any{})
-	viper.SetDefault("daemon.files.privilegedHelper", "")
+	viper.SetDefault("daemon.priv.helper", "")
+	viper.SetDefault("daemon.priv.systemd", false)
 	viper.SetDefault("daemon.files.allowWrite", false)
 	viper.SetDefault("daemon.files.maxReadBytes", int64(FilesDefaultMaxReadBytes))
 	viper.SetDefault("daemon.files.maxWriteBytes", int64(FilesDefaultMaxWriteBytes))
@@ -1416,6 +1448,9 @@ func (c *Config) ValidateDaemon() error {
 		return err
 	}
 	if err := validateFiles(c.Daemon.Files); err != nil {
+		return err
+	}
+	if err := validatePriv(c.Daemon.Priv, c.Daemon.Files); err != nil {
 		return err
 	}
 	return nil

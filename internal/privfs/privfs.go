@@ -97,9 +97,66 @@ type Profile struct {
 	Modes map[fs.FileMode]bool
 }
 
+// UnitGrant authorizes the systemd verbs a unit may receive.
+//
+// This is the same shape as a file profile, and for the same reason: a sudoers
+// rule over `systemctl` is not a boundary, because `systemctl` takes the unit
+// from its argument — and a unit *file* is root code execution. The allowlist
+// lives here, in a root-owned file the daemon cannot write, so the daemon can
+// name only units an operator declared and only the verbs they granted.
+type UnitGrant struct {
+	Unit  string
+	Verbs map[string]bool
+}
+
 // Set is the loaded profile file.
 type Set struct {
 	byName map[string]*Profile
+	units  map[string]*UnitGrant
+}
+
+// systemdUnitPattern is the unit name a grant may name. It matches the daemon's
+// own accepted shape and additionally requires a first character that is not a
+// dash: a unit named "-H.service" would otherwise reach systemctl's option
+// parser, where "-H.service" reads as the --host option with the value
+// ".service".
+var systemdUnitPattern = regexp.MustCompile(`^[A-Za-z0-9:._@][A-Za-z0-9:._@-]*\.service$`)
+
+// allowedSystemdVerbs is every systemd verb a grant may name. The set matches
+// the daemon's native systemd operations, so a grant cannot authorize a verb
+// the daemon would never ask for and an operator cannot grant more than it can
+// use.
+var allowedSystemdVerbs = map[string]bool{
+	"start": true, "stop": true, "restart": true,
+	"reload": true, "enable": true, "disable": true,
+}
+
+// validSystemdVerb reports whether [verb] is a systemd verb the helper runs.
+func validSystemdVerb(verb string) bool { return allowedSystemdVerbs[verb] }
+
+// SystemdVerbs lists the grantable verbs for an error message, sorted.
+func SystemdVerbs() string {
+	verbs := make([]string, 0, len(allowedSystemdVerbs))
+	for verb := range allowedSystemdVerbs {
+		verbs = append(verbs, verb)
+	}
+	sort.Strings(verbs)
+	return strings.Join(verbs, ", ")
+}
+
+// systemctlPath is where systemctl is looked for, in order. A fixed list rather
+// than PATH: the helper runs as root, and resolving an absolute path from the
+// environment is one more thing an attacker could influence.
+var systemctlPaths = []string{"/usr/bin/systemctl", "/bin/systemctl"}
+
+// FindSystemctl returns the systemctl binary to run.
+func FindSystemctl() (string, error) {
+	for _, candidate := range systemctlPaths {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("systemctl was not found in %s", strings.Join(systemctlPaths, ", "))
 }
 
 // Options controls loading. RequireRootOwner is the production setting: the
@@ -117,6 +174,10 @@ type fileConfig struct {
 		Path  string   `mapstructure:"path"`
 		Modes []string `mapstructure:"modes"`
 	} `mapstructure:"profiles"`
+	Systemd []struct {
+		Unit  string   `mapstructure:"unit"`
+		Verbs []string `mapstructure:"verbs"`
+	} `mapstructure:"systemd"`
 }
 
 // LoadSet reads and fully validates the profile file. Every rejection here is
@@ -149,7 +210,10 @@ func LoadSet(configPath string, opts Options) (*Set, error) {
 	if err := reader.Unmarshal(&parsed); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", configPath, err)
 	}
-	set := &Set{byName: make(map[string]*Profile, len(parsed.Profiles))}
+	set := &Set{
+		byName: make(map[string]*Profile, len(parsed.Profiles)),
+		units:  make(map[string]*UnitGrant, len(parsed.Systemd)),
+	}
 	for i, entry := range parsed.Profiles {
 		profile, err := buildProfile(entry.Name, entry.Path, entry.Modes)
 		if err != nil {
@@ -160,10 +224,112 @@ func LoadSet(configPath string, opts Options) (*Set, error) {
 		}
 		set.byName[profile.Name] = profile
 	}
-	if len(set.byName) == 0 {
-		return nil, fmt.Errorf("%s declares no profiles", configPath)
+	for i, entry := range parsed.Systemd {
+		grant, err := buildUnitGrant(entry.Unit, entry.Verbs)
+		if err != nil {
+			return nil, fmt.Errorf("systemd[%d]: %w", i, err)
+		}
+		if _, exists := set.units[grant.Unit]; exists {
+			return nil, fmt.Errorf("systemd[%d]: unit %q is duplicated", i, grant.Unit)
+		}
+		set.units[grant.Unit] = grant
+	}
+	if len(set.byName) == 0 && len(set.units) == 0 {
+		return nil, fmt.Errorf("%s declares no profiles and no systemd units", configPath)
 	}
 	return set, nil
+}
+
+// buildUnitGrant validates one systemd entry.
+func buildUnitGrant(unit string, verbs []string) (*UnitGrant, error) {
+	if !systemdUnitPattern.MatchString(unit) {
+		return nil, fmt.Errorf("unit %q must be a .service name such as nginx.service", unit)
+	}
+	if len(verbs) == 0 {
+		return nil, fmt.Errorf("unit %q declares no verbs", unit)
+	}
+	allowed := make(map[string]bool, len(verbs))
+	for _, verb := range verbs {
+		if !validSystemdVerb(verb) {
+			return nil, fmt.Errorf("unit %q verb %q is not one of: %s", unit, verb, SystemdVerbs())
+		}
+		allowed[verb] = true
+	}
+	return &UnitGrant{Unit: unit, Verbs: allowed}, nil
+}
+
+// LookupUnit resolves a systemd unit, or lists the granted ones so a
+// misconfigured operator can see what the helper will actually accept.
+func (s *Set) LookupUnit(unit string) (*UnitGrant, error) {
+	grant, ok := s.units[unit]
+	if !ok {
+		names := make([]string, 0, len(s.units))
+		for name := range s.units {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if len(names) == 0 {
+			return nil, fmt.Errorf("no systemd units are granted (add a [[systemd]] entry naming %s)", unit)
+		}
+		return nil, fmt.Errorf("unit %q is not granted (granted: %s)", unit, strings.Join(names, ", "))
+	}
+	return grant, nil
+}
+
+// GrantedUnits lists the granted units, sorted.
+func (s *Set) GrantedUnits() []string {
+	units := make([]string, 0, len(s.units))
+	for unit := range s.units {
+		units = append(units, unit)
+	}
+	sort.Strings(units)
+	return units
+}
+
+// CheckVerb reports whether the grant authorizes [verb].
+func (g *UnitGrant) CheckVerb(verb string) error {
+	if !validSystemdVerb(verb) {
+		return fmt.Errorf("verb %q is not one of: %s", verb, SystemdVerbs())
+	}
+	if !g.Verbs[verb] {
+		granted := make([]string, 0, len(g.Verbs))
+		for name := range g.Verbs {
+			granted = append(granted, name)
+		}
+		sort.Strings(granted)
+		return fmt.Errorf("verb %q is not granted for %s (granted: %s)", verb, g.Unit, strings.Join(granted, ", "))
+	}
+	return nil
+}
+
+// SystemdArgv builds the command that runs one granted unit action.
+//
+// The unit is passed after `--`, which ends systemctl's option parsing, and the
+// unit name pattern already refuses a leading dash — two independent guards
+// against a unit name being read as an option rather than an operand.
+func (g *UnitGrant) SystemdArgv(verb string) ([]string, error) {
+	systemctl, err := FindSystemctl()
+	if err != nil {
+		return nil, err
+	}
+	return g.systemdArgv(systemctl, verb)
+}
+
+// systemdArgv is the argv construction with the binary supplied, so its shape
+// — which is what keeps a unit name from being read as an option — is testable
+// on a machine that has no systemctl.
+func (g *UnitGrant) systemdArgv(systemctl, verb string) ([]string, error) {
+	if err := g.CheckVerb(verb); err != nil {
+		return nil, err
+	}
+	return []string{
+		systemctl,
+		"--no-ask-password",
+		"--no-pager",
+		verb,
+		"--",
+		g.Unit,
+	}, nil
 }
 
 // buildProfile validates one entry and resolves its directory.
@@ -457,10 +623,12 @@ func tempName() string {
 // describe the account that actually invoked the helper rather than one the
 // caller claims.
 type Entry struct {
-	Time      string `json:"time"`
-	Event     string `json:"event"`
-	Verb      string `json:"verb"`
-	Profile   string `json:"profile,omitempty"`
+	Time    string `json:"time"`
+	Event   string `json:"event"`
+	Verb    string `json:"verb"`
+	Profile string `json:"profile,omitempty"`
+	// Unit is the systemd unit a systemd action targeted.
+	Unit      string `json:"unit,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Mode      string `json:"mode,omitempty"`
 	Bytes     int    `json:"bytes,omitempty"`

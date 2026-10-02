@@ -51,16 +51,17 @@ echo "{\"event\":\"privfs\",\"verb\":\"$verb\",\"profile\":\"$profile\",\"ok\":t
 	}
 
 	files := config.FilesConfig{
-		Enabled:          true,
-		Secret:           "files-secret",
-		Roots:            []config.FilesRootConfig{{Path: root, Privileged: true, Profile: "testprof"}},
-		AllowWrite:       true,
-		PrivilegedHelper: helper,
+		Enabled:    true,
+		Secret:     "files-secret",
+		Roots:      []config.FilesRootConfig{{Path: root, Privileged: true, Profile: "testprof"}},
+		AllowWrite: true,
 	}
+	priv := config.PrivConfig{Helper: helper}
 	if mutate != nil {
 		mutate(&files)
 	}
 	cfg := config.DaemonConfig{
+		Priv:              priv,
 		ID:                "host-priv",
 		Transport:         "http",
 		Listen:            "127.0.0.1:0",
@@ -333,17 +334,18 @@ func privHelperFailureFixture(t *testing.T, stderr string, exit int) string {
 		t.Fatal(err)
 	}
 	files := config.FilesConfig{
-		Enabled:          true,
-		Secret:           "files-secret",
-		Roots:            []config.FilesRootConfig{{Path: root, Privileged: true, Profile: "testprof"}},
-		AllowWrite:       true,
-		PrivilegedHelper: helper,
+		Enabled:    true,
+		Secret:     "files-secret",
+		Roots:      []config.FilesRootConfig{{Path: root, Privileged: true, Profile: "testprof"}},
+		AllowWrite: true,
 	}
+	priv := config.PrivConfig{Helper: helper}
 	cfg := config.DaemonConfig{
 		ID: "host-priv-fail", Transport: "http", Listen: "127.0.0.1:0",
 		MetricsSecret: "metrics-secret", MetricsInterval: time.Hour, StreamInterval: time.Second,
 		Runtimes: []string{"java"}, ProcessesLimit: 50, RequestTimeout: 10 * time.Second,
-		ScriptTimeout: time.Second, MaxBodyBytes: 65536, MaxConcurrentRuns: 1, Files: files,
+		ScriptTimeout: time.Second, MaxBodyBytes: 65536, MaxConcurrentRuns: 1,
+		Files: files, Priv: priv,
 	}
 	app, err := NewApp(cfg, nil)
 	if err != nil {
@@ -440,5 +442,106 @@ func TestHelperMessagePrefersTheSentence(t *testing.T) {
 	}
 	if got := helperMessage("{\"event\":\"privfs\"}"); got != "" {
 		t.Fatalf("helperMessage = %q", got)
+	}
+}
+
+// TestNativeSystemdOpRoutesThroughTheHelper pins the systemd path: with the
+// helper configured for it, the action must go there and nowhere else. The
+// blanket `sudo -n systemctl` attempt must not remain behind it, because a
+// helper refusal would then silently fall through to whatever broader sudo
+// grant the host happens to have.
+func TestNativeSystemdOpRoutesThroughTheHelper(t *testing.T) {
+	root := t.TempDir()
+	argvLog := filepath.Join(root, "argv.log")
+	helper := filepath.Join(root, "maidkit-priv-stand-in")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> ` + argvLog + `
+case "$1 $2" in
+  "systemd restart") echo "restarted $3"; exit 0 ;;
+esac
+echo "maidkit-priv: refused" >&2
+exit 3
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	newRunner := func(systemd bool) *nativeOpRunner {
+		cfg := config.DaemonConfig{
+			ID: "host-ops", Transport: "http", Listen: "127.0.0.1:0",
+			MetricsSecret: "metrics-secret", MetricsInterval: time.Hour,
+			StreamInterval: time.Second, Runtimes: []string{"java"},
+			ProcessesLimit: 50, RequestTimeout: 5 * time.Second,
+			ScriptTimeout: 5 * time.Second, MaxBodyBytes: 65536, MaxConcurrentRuns: 1,
+			AuditPath: filepath.Join(root, "audit.jsonl"),
+			Priv:      config.PrivConfig{Helper: helper, Systemd: systemd},
+		}
+		executor := NewWebhookExecutor(cfg)
+		executor.SetAuditLogger(NewAuditLogger(cfg.AuditPath, nil))
+		runner := &nativeOpRunner{executor: executor, runtimes: func(context.Context) map[string]string { return nil }}
+		runner.SetScriptTimeout(cfg.ScriptTimeout)
+		runner.SetPrivilegedPolicy(helper, systemd, &privRunner{})
+		return runner
+	}
+
+	// Routed: the helper runs it, and the response carries its stdout.
+	routed := newRunner(true)
+	response, status, requestErr := routed.dispatch(
+		context.Background(), "systemd.restart",
+		opParams{target: "nginx.service"}, "http", "tester",
+	)
+	if requestErr != nil {
+		t.Fatalf("routed request error: %v", requestErr.message)
+	}
+	if status != http.StatusOK || !response.OK {
+		t.Fatalf("routed systemd status = %d, response = %+v", status, response)
+	}
+	if !strings.Contains(response.Stdout, "restarted nginx.service") {
+		t.Fatalf("stdout = %q", response.Stdout)
+	}
+	lines := recordedArgv(t, argvLog)
+	if len(lines) != 1 || lines[0] != "systemd restart nginx.service" {
+		t.Fatalf("helper argv = %v", lines)
+	}
+
+	// Not routed: the helper is untouched, and the host's own systemctl is
+	// tried instead — the behavior that predates the helper.
+	if err := os.Remove(argvLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	direct := newRunner(false)
+	_, _, requestErr = direct.dispatch(
+		context.Background(), "systemd.restart",
+		opParams{target: "nginx.service"}, "http", "tester",
+	)
+	if requestErr != nil {
+		t.Fatalf("direct request error: %v", requestErr.message)
+	}
+	if lines := recordedArgv(t, argvLog); len(lines) != 0 {
+		t.Fatalf("an unrouted action invoked the helper: %v", lines)
+	}
+}
+
+// TestNativeSystemdOpRejectsAnOptionShapedUnit guards the unit pattern: a
+// leading dash would let a unit name reach systemctl's option parser.
+func TestNativeSystemdOpRejectsAnOptionShapedUnit(t *testing.T) {
+	runner := &nativeOpRunner{
+		executor: NewWebhookExecutor(config.DaemonConfig{
+			ScriptTimeout: time.Second, MaxBodyBytes: 1024, MaxConcurrentRuns: 1,
+		}),
+		runtimes: func(context.Context) map[string]string { return nil },
+	}
+	runner.SetScriptTimeout(time.Second)
+	for _, unit := range []string{"-H.service", "--now.service", "--.service"} {
+		_, _, requestErr := runner.dispatch(
+			context.Background(), "systemd.restart", opParams{target: unit}, "http", "tester",
+		)
+		if requestErr == nil {
+			t.Fatalf("unit %q was accepted", unit)
+		}
+		if requestErr.status != http.StatusBadRequest {
+			t.Fatalf("unit %q status = %d", unit, requestErr.status)
+		}
 	}
 }

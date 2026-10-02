@@ -36,8 +36,10 @@ graph LR
 ```
 
 1. **`maidkit-priv`** — a small root-capable binary
-   (`cmd/maidkit-priv`, logic in `internal/privfs`). It takes a *profile name*,
-   never a directory, and performs one of three operations inside it.
+   (`cmd/maidkit-priv`, logic in `internal/privfs`). It performs a fixed set of
+   operations, and none of them takes a path or a binary from its caller: a
+   file operation names a *profile* it resolves against its own file, and a
+   systemd operation names a *unit* an operator granted.
 2. **`/etc/maidkit/priv.toml`** — the profile file, owned by root and writable
    only by root. It maps a profile name to a directory and to the modes that
    may be used there. This file, not the sudoers rule, is the authorization
@@ -60,12 +62,15 @@ graph LR
 ## The helper's command surface
 
 ```sh
-# content on stdin
+# file operations; content on stdin
 maidkit-priv fs write  <profile> <relative-path> <mode>
 maidkit-priv fs mkdir  <profile> <relative-path> <mode>
 maidkit-priv fs remove <profile> <relative-path>
 
-maidkit-priv fs profiles          # list the configured profiles
+# one granted systemd unit action
+maidkit-priv systemd <verb> <unit>
+
+maidkit-priv fs profiles          # list every grant in the file
 maidkit-priv sudoers [account]    # print the rule to install
 ```
 
@@ -85,9 +90,10 @@ Exit codes distinguish a policy answer from a failure:
 | `5` | Not run as root — the sudoers rule is missing. |
 | `6` | The profile file is unusable or untrusted. |
 
-## The profile file
+## The grant file
 
 ```toml
+# Directories the file operations may reach.
 [[profiles]]
 name = "nginx"
 path = "/etc/nginx"
@@ -97,6 +103,11 @@ modes = ["0644", "0640"]
 name = "systemd-units"
 path = "/etc/systemd/system"
 modes = ["0644"]
+
+# Systemd units and the verbs each may receive.
+[[systemd]]
+unit = "nginx.service"
+verbs = ["reload", "restart"]
 ```
 
 Every entry is validated before any operation runs:
@@ -112,6 +123,11 @@ Every entry is validated before any operation runs:
   root may execute; group- and other-write are excluded so a privileged write
   can never plant a file another account can rewrite.
 - Names must be unique and match `[a-z0-9][a-z0-9_-]*`.
+- A `[[systemd]]` entry names a `.service` unit and a non-empty subset of
+  `start`, `stop`, `restart`, `reload`, `enable`, `disable`, which are exactly the
+  verbs the daemon's native systemd operations use. A unit name must not begin
+  with a dash: `-H.service` would otherwise reach systemctl's option parser as
+  the `--host` option rather than as a unit. Units are unique within the file.
 
 ## Confinement
 
@@ -253,12 +269,54 @@ it*. Neither alone answers an incident question; together they do.
   root can write is a way to hand it to another account.
 - **No recursive delete, no archive extraction.** Both are ways to make a small
   grant act on an unbounded set of paths.
-- **No systemd, package or firewall operations yet.** They are the natural next
-  verbs, and the same shape applies: a declared operation, validated arguments,
-  never a binary or a unit-file path from the caller. `sudo systemctl start
-  nginx.service` is a grant; `sudo systemctl start /tmp/evil.service` is root
-  code execution, and the difference must live in the helper, not in the
-  sudoers pattern.
+- **No package or firewall operations yet.** They are the natural next verbs,
+  and the same shape applies: a declared operation with validated arguments,
+  never a binary, a unit file or a rule from the caller. Both are
+  root-equivalent — a package's maintainer scripts run as root, and a firewall
+  rule can redirect traffic — so each deserves its own opt-in rather than
+  riding along with file or systemd grants.
+
+## Systemd actions
+
+The daemon already had native systemd operations — the Services tab calls them,
+and it prefers the daemon over SSH when one is reachable. What it lacked was a
+safe way to elevate: it tried `systemctl` directly and then through a blanket
+`sudo -n systemctl`, which is a rule that can start any unit *on the host* and
+would have been a root-code-execution grant the moment an operator relaxed the
+unit for some other reason.
+
+With `[daemon.priv] systemd = true` the helper is the path instead:
+
+```toml
+[daemon.priv]
+helper = "/usr/local/libexec/maidkit-priv"
+systemd = true
+```
+
+and the helper's own file decides what that means:
+
+```toml
+[[systemd]]
+unit = "nginx.service"
+verbs = ["reload", "restart"]
+```
+
+The unit is checked against that list and the verb against the entry's list, so
+a caller who appends arguments to the sudoers pattern reaches nothing. The
+helper runs `systemctl --no-ask-password --no-pager <verb> -- <unit>` — the unit
+after `--`, so it cannot be read as an option even if the name pattern were ever
+loosened.
+
+**When `systemd = true`, the helper is the only path.** A refusal from it is an
+error, not a fallback to `sudo -n systemctl`: falling back would mean an
+operator who granted two units also silently kept whatever wider grant the host
+happened to have, which is the boundary this replaces. That also means turning
+it on is not free — if the blanket sudo rule was what made systemd actions work
+before, they will now fail until the unit is granted in the helper's file.
+
+Enabling this is a real grant: `systemctl restart` on a unit an operator chose
+is what they authorized, and a unit file's `ExecStart` runs as root, so keep the
+list to the units a client actually needs and prefer `reload` to `restart`.
 
 ## Testing
 
@@ -283,7 +341,7 @@ entry and the helper's own refusal when no rule matches).
 suite has ever run a write as root through the helper. The runbook below is the
 one remaining step, and it is deliberately short.
 
-### Verifying the privileged path on a real host
+## Verifying the privileged path on a real host
 
 Run on a Linux host with sudo and systemd. Every expected output is what the
 implementation produces; a difference is a finding.
@@ -377,3 +435,22 @@ curl -sS -X PUT \
 The last one is the reason the mode list exists: the API preserves an existing
 file's mode, so an operator who grants `0644` and later finds a `0600` file in
 that directory gets a refusal to read rather than a silent rewrite.
+
+For the systemd path, the same shape applies — the grant is what decides:
+
+```sh
+sudo tee -a /etc/maidkit/priv.toml >/dev/null <<'EOF'
+
+[[systemd]]
+unit = "maidkit-smoke.service"
+verbs = ["reload"]
+EOF
+# with [daemon.priv] systemd = true, the daemon's own systemd op now goes
+# through the helper. A unit that is not listed is refused by the helper, and
+# the refusal names the granted ones.
+```
+
+Without a granted unit there is nothing to act on, so this half is verified by
+the helper's own tests (`internal/privfs`) and by the daemon's routing tests
+against a stand-in helper, and its end-to-end check belongs on the same host as
+the file runbook above.

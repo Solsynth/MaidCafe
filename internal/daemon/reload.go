@@ -40,6 +40,7 @@ type reloadableConfig struct {
 	version              string
 	terminal             config.TerminalConfig
 	files                config.FilesConfig
+	priv                 config.PrivConfig
 	intervals            reloadableIntervals
 }
 
@@ -82,6 +83,7 @@ func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
 		version:              cfg.Version,
 		terminal:             cfg.Terminal,
 		files:                cfg.Files,
+		priv:                 cfg.Priv,
 		intervals: reloadableIntervals{
 			metrics:    cfg.MetricsInterval,
 			stream:     cfg.StreamInterval,
@@ -133,6 +135,11 @@ func (a *App) applyReload(cfg config.DaemonConfig) {
 	a.executor.SetMaxBodyBytes(cfg.MaxBodyBytes)
 	a.executor.SetMaxConcurrentRuns(cfg.MaxConcurrentRuns)
 	a.ops.SetScriptTimeout(cfg.ScriptTimeout)
+	// The privileged-helper policy is reloadable, so an operator can route
+	// systemd actions through the helper, or stop doing so, without a restart.
+	if a.priv != nil {
+		a.ops.SetPrivilegedPolicy(cfg.Priv.Helper, cfg.Priv.Systemd, a.priv)
+	}
 	a.runtimes.SetRuntimes(cfg.Runtimes)
 	a.runtimes.SetLimit(cfg.ProcessesLimit)
 	a.watched.Reseed(cfg.WatchedProcesses)

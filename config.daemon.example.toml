@@ -192,10 +192,23 @@ path = "/srv"
 # privileged = true
 # profile = "nginx"
 
-# Where the privileged helper is installed. Empty uses
-# /usr/local/libexec/maidkit-priv; set it only if your distribution puts it
-# elsewhere, and keep the sudoers rule in step (maidkit-priv sudoers prints it).
-# privilegedHelper = "/usr/local/libexec/maidkit-priv"
+# [daemon.priv] names the privileged helper and says which operations may be
+# routed through it. Where the helper is installed: empty uses the compiled
+# default. Setting it grants nothing on its own — an operation has to be routed
+# here, and the helper has to have a grant for it in /etc/maidkit/priv.toml.
+[daemon.priv]
+# helper = "/usr/local/libexec/maidkit-priv"
+
+# Route native systemd unit actions through the helper instead of the blanket
+# `sudo -n systemctl` attempt. Off by default. When on, the helper is the only
+# path: its own file lists the units and verbs, and a refusal from it is an
+# error rather than a fallback to a wider sudo rule.
+#
+# The helper's grants look like this (/etc/maidkit/priv.toml):
+#   [[systemd]]
+#   unit = "nginx.service"
+#   verbs = ["restart", "reload"]
+systemd = false
 # Allow the mutating operations (write, mkdir, move, copy, delete). Leave off
 # to publish a read-only view of a tree.
 allowWrite = false

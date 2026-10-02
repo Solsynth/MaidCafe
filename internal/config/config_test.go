@@ -663,10 +663,10 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 			name: "privileged file root without profile rejected",
 			mutate: func(d *DaemonConfig) {
 				d.Files = FilesConfig{
-					Enabled:          true,
-					Roots:            []FilesRootConfig{{Path: dir, Privileged: true}},
-					PrivilegedHelper: helper,
+					Enabled: true,
+					Roots:   []FilesRootConfig{{Path: dir, Privileged: true}},
 				}
+				d.Priv = PrivConfig{Helper: helper}
 			},
 		},
 		{
@@ -679,30 +679,80 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 			name: "malformed profile name rejected",
 			mutate: func(d *DaemonConfig) {
 				d.Files = FilesConfig{
-					Enabled:          true,
-					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "Nginx Prod"}},
-					PrivilegedHelper: helper,
+					Enabled: true,
+					Roots:   []FilesRootConfig{{Path: dir, Privileged: true, Profile: "Nginx Prod"}},
 				}
+				d.Priv = PrivConfig{Helper: helper}
 			},
 		},
 		{
 			name: "missing privileged helper rejected",
 			mutate: func(d *DaemonConfig) {
 				d.Files = FilesConfig{
-					Enabled:          true,
-					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
-					PrivilegedHelper: filepath.Join(dir, "absent-helper"),
+					Enabled: true,
+					Roots:   []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
 				}
+				d.Priv = PrivConfig{Helper: filepath.Join(dir, "absent-helper")}
 			},
+		},
+		{
+			name: "systemd routing without a helper rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Systemd: true}
+			},
+		},
+		{
+			name: "systemd routing with a missing helper rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Systemd: true, Helper: filepath.Join(dir, "absent-helper")}
+			},
+		},
+		{
+			name: "systemd routing with an installed helper accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Systemd: true, Helper: helper}
+			},
+			ok: true,
+		},
+		{
+			name: "relative helper path rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Helper: "libexec/maidkit-priv"}
+			},
+		},
+		{
+			name: "a helper path that is a directory rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Systemd: true, Helper: dir}
+			},
+		},
+		{
+			name: "a helper path that is not executable rejected",
+			mutate: func(d *DaemonConfig) {
+				plain := filepath.Join(dir, "not-executable")
+				if err := os.WriteFile(plain, []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				d.Priv = PrivConfig{Systemd: true, Helper: plain}
+			},
+		},
+		{
+			// Naming a helper without routing anything to it must not require
+			// it to exist: an operator may install it later.
+			name: "an unrouted helper path is accepted without the binary",
+			mutate: func(d *DaemonConfig) {
+				d.Priv = PrivConfig{Helper: filepath.Join(dir, "absent-helper")}
+			},
+			ok: true,
 		},
 		{
 			name: "privileged file root accepted",
 			mutate: func(d *DaemonConfig) {
 				d.Files = FilesConfig{
-					Enabled:          true,
-					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
-					PrivilegedHelper: helper,
+					Enabled: true,
+					Roots:   []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
 				}
+				d.Priv = PrivConfig{Helper: helper}
 			},
 			ok: true,
 		},

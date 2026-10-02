@@ -57,10 +57,23 @@ func newPrivRunner() *privRunner {
 
 // helperPath resolves the helper binary from the live configuration.
 func (a *App) helperPath() string {
-	if path := strings.TrimSpace(a.rt.Load().files.PrivilegedHelper); path != "" {
+	if path := strings.TrimSpace(a.rt.Load().priv.Helper); path != "" {
 		return path
 	}
 	return config.FilesDefaultPrivilegedHelper
+}
+
+// privateSystemd reports whether native systemd actions are routed through the
+// helper. Read per request, so a reload switches it without a restart.
+func (a *App) privateSystemd() bool { return a.rt.Load().priv.Systemd }
+
+// argv renders the full argument vector for one helper invocation, with the
+// sudo prefix this host needs. It is the single place that knows how the daemon
+// reaches root, so the file API and the native ops cannot spell it differently.
+func (r *privRunner) argv(path string, args ...string) []string {
+	argv := append([]string{}, r.sudo...)
+	argv = append(argv, path)
+	return append(argv, args...)
 }
 
 // run executes one helper verb with [payload] on stdin. It returns the
@@ -71,8 +84,7 @@ func (a *App) helperPath() string {
 // the profile, path or mode), a missing sudoers rule and a missing binary are
 // answers an operator must act on, so the helper's own message survives.
 func (r *privRunner) run(ctx context.Context, path, verb, profile, rel, mode string, payload []byte) (string, string, *fileActionError) {
-	args := append([]string{}, r.sudo...)
-	args = append(args, path, "fs", verb, profile, rel)
+	args := r.argv(path, "fs", verb, profile, rel)
 	if mode != "" {
 		args = append(args, mode)
 	}

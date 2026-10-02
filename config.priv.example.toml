@@ -36,3 +36,20 @@ modes = ["0644", "0640"]
 # name = "systemd-units"
 # path = "/etc/systemd/system"
 # modes = ["0644"]
+
+# Systemd unit actions. The daemon routes these here only with
+# `[daemon.priv] systemd = true`, and this list is what makes that routing
+# safe: a unit is named here with the verbs it may receive, so the daemon can
+# only act on what an operator declared. Without this the daemon's systemd
+# operations have no way to elevate.
+#
+# Keep the list to the units a client actually needs to restart, and prefer
+# `reload` over `restart` where a service supports it: restarting takes the
+# service down, and a reload usually does not.
+[[systemd]]
+unit = "nginx.service"
+verbs = ["reload", "restart"]
+
+# [[systemd]]
+# unit = "caddy.service"
+# verbs = ["reload"]
