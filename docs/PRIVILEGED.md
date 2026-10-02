@@ -271,6 +271,10 @@ missing sudoers rule (`403`, naming the rule to install) and the helper not
 being granted root.
 
 The genuinely privileged path — a real `sudo -n`, a root-owned profile file and
-root-owned targets — cannot be exercised by an unprivileged test run. It is
-covered by installation and by the smoke test in this repository's history
-rather than by `go test`.
+root-owned targets — cannot be exercised by an unprivileged test run: the helper
+refuses to load a profile file this test user owns, and the daemon reaches for
+sudo, which has no rule to match. What *can* be checked without root is checked
+above; the rest is verified by the end-to-end run that exercises the real
+daemon and the real helper over a temporary tree with a stand-in for sudo, and
+by installing the helper and confirming `maidkit-priv fs profiles` reports the
+grants before a privileged root is enabled.
