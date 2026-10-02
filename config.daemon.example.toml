@@ -162,3 +162,32 @@ enabled = false
 # users = ["you@solsynth.dev"]
 # How long one pickup long-poll holds before returning empty (3s..25s).
 # pollWait = "20s"
+
+# Opt-in file API at /api/v1/files/*, for browser-based MaidKit builds that
+# cannot open an SFTP channel: list, stat, read (windowed), write, mkdir, move,
+# copy and delete. Off by default: enabling it grants file access on this host
+# to whoever holds the credential. The same operations are reachable over the
+# stdio transport as `files.*` actions, policy included.
+[daemon.files]
+enabled = false
+# Absolute, existing directories the API may touch. Required when enabled;
+# paths outside every root are refused, and a root itself can never be written,
+# moved, copied or deleted through the API. The I/O runs through os.Root too,
+# so a symlink inside a root cannot be used to escape it. Operations run as the
+# daemon account and never elevate.
+roots = ["/srv", "/etc/maidcafe"]
+# Allow the mutating operations (write, mkdir, move, copy, delete). Leave off
+# to publish a read-only view of a tree.
+allowWrite = false
+# Optional dedicated credential. Empty accepts metricsSecret instead; setting
+# it keeps a leaked metrics secret from granting file access. GET
+# /api/v1/files/content is the one route that also accepts it as ?token=, for a
+# browser download or image load; no other route does, so a leaked URL cannot
+# change a file.
+# secret = "replace-with-files-secret"
+# Per-request caps. A read without an explicit window larger than maxReadBytes
+# is refused (413) rather than truncated; use offset/limit to page it.
+# maxReadBytes = 8388608
+# maxWriteBytes = 8388608
+# Per-listing cap; a larger directory is reported with truncated = true.
+# maxListEntries = 5000

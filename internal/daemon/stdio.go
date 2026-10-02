@@ -39,6 +39,10 @@ type stdioActionResult struct {
 	request stdioRequest
 	result  executionResponse
 	err     *requestError
+	// fileResult carries a file API action's decoded result. It is a separate
+	// field because file actions return their own shapes rather than an
+	// execution response.
+	fileResult any
 }
 
 func (a *App) runStdio(ctx context.Context) error {
@@ -93,6 +97,26 @@ func (a *App) runStdio(ctx context.Context) error {
 				continue
 			}
 			action := strings.ToLower(strings.TrimSpace(request.Action))
+			// File API actions arrive as their slug (files.list, files.read,
+			// files.write, ...) with the parameters in the body. Like actions
+			// and native operations, no signature is needed: the SSH pipe is
+			// the transport, and reaching it already required the account's
+			// SSH credentials. The daemon's own [daemon.files] policy still
+			// applies, so the pipe cannot reach outside the configured roots.
+			if isFileActionSlug(action) {
+				body, err := stdioBody(request.Body)
+				if err != nil {
+					if err := write(stdioResponse{Type: "response", ID: request.ID, OK: false, Error: err.Error()}); err != nil {
+						return err
+					}
+					continue
+				}
+				go func(request stdioRequest, body []byte) {
+					result, requestErr := a.runStdioFileAction(action, body)
+					results <- stdioActionResult{request: request, err: requestErr, fileResult: result}
+				}(request, body)
+				continue
+			}
 			// Native operations arrive as their slug (container.restart,
 			// process.kill, systemd.restart, compose.up) with the identity in
 			// the body; the transport is the SSH pipe, so no signature is
@@ -262,6 +286,12 @@ func (a *App) runStdio(ctx context.Context) error {
 		case result := <-results:
 			if result.err != nil {
 				if err := write(stdioResponse{Type: "response", ID: result.request.ID, OK: false, Error: result.err.message}); err != nil {
+					return err
+				}
+				continue
+			}
+			if result.fileResult != nil {
+				if err := write(stdioResponse{Type: "response", ID: result.request.ID, OK: true, Result: result.fileResult}); err != nil {
 					return err
 				}
 				continue

@@ -39,6 +39,7 @@ type reloadableConfig struct {
 	statusUploadEnabled  bool
 	version              string
 	terminal             config.TerminalConfig
+	files                config.FilesConfig
 	intervals            reloadableIntervals
 }
 
@@ -80,6 +81,7 @@ func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
 		statusUploadEnabled:  cfg.StatusUploadEnabled,
 		version:              cfg.Version,
 		terminal:             cfg.Terminal,
+		files:                cfg.Files,
 		intervals: reloadableIntervals{
 			metrics:    cfg.MetricsInterval,
 			stream:     cfg.StreamInterval,

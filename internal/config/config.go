@@ -116,9 +116,15 @@ type DaemonConfig struct {
 	// cannot open raw SSH sockets, can attach a terminal. It is unrelated to
 	// the cloud relay: nothing about a terminal session is reported to the
 	// cloud. Disabled by default.
-	Terminal    TerminalConfig `mapstructure:"terminal"`
-	CloudURL    string         `mapstructure:"cloudUrl"`
-	CloudSecret string         `mapstructure:"cloudSecret"`
+	Terminal TerminalConfig `mapstructure:"terminal"`
+	// Files is the opt-in file-management API served over HTTP
+	// (/api/v1/files/...) and the stdio transport. It exists for the same
+	// reason as Terminal: browser-based MaidKit builds cannot open an SFTP
+	// channel, so the daemon serves the operations the file manager and the
+	// editor need. Disabled by default.
+	Files       FilesConfig `mapstructure:"files"`
+	CloudURL    string      `mapstructure:"cloudUrl"`
+	CloudSecret string      `mapstructure:"cloudSecret"`
 	// LogsUploadEnabled opts the daemon into outbound log upload. It is
 	// deliberately false by default because logs may contain secrets.
 	LogsUploadEnabled    bool          `mapstructure:"logsUploadEnabled"`
@@ -240,6 +246,55 @@ type TerminalRelayConfig struct {
 	// TerminalRelayDefaultPollWait.
 	PollWait time.Duration `mapstructure:"pollWait"`
 }
+
+// FilesConfig is the opt-in file-management API policy. The API serves the
+// operations a browser-based MaidKit build cannot perform over SFTP: listing
+// a directory, reading and writing file contents, and the create/rename/
+// copy/delete mutations the file manager offers.
+//
+// Every request path must be absolute and lexically inside one of Roots. The
+// actual I/O runs through os.Root, so a symlink that resolves outside its
+// root is refused by the OS layer even when the requested path is inside it.
+// Operations run as the daemon's own account: the API never elevates, so it
+// can touch exactly what that account can touch.
+type FilesConfig struct {
+	// Enabled turns the API on. Off by default: enabling it grants file
+	// access on this host to whoever holds the credential.
+	Enabled bool `mapstructure:"enabled"`
+	// Secret is an optional dedicated credential. Empty (default) accepts
+	// metricsSecret; setting it keeps a leaked metrics secret from granting
+	// file access.
+	Secret string `mapstructure:"secret"`
+	// Roots is the allowlist of absolute directories the API may touch.
+	// Required when Enabled; paths outside every root are refused. A root
+	// itself cannot be deleted through the API.
+	Roots []string `mapstructure:"roots"`
+	// AllowWrite permits the mutating operations (write, mkdir, move, copy,
+	// delete). Off by default, so an operator can publish a read-only view of
+	// a directory tree.
+	AllowWrite bool `mapstructure:"allowWrite"`
+	// MaxReadBytes caps one read request (editor load, download window);
+	// 0 uses FilesDefaultMaxReadBytes. A larger file is still reachable by
+	// paging with offset/limit.
+	MaxReadBytes int64 `mapstructure:"maxReadBytes"`
+	// MaxWriteBytes caps one write request body; 0 uses
+	// FilesDefaultMaxWriteBytes.
+	MaxWriteBytes int64 `mapstructure:"maxWriteBytes"`
+	// MaxListEntries caps one directory listing; 0 uses
+	// FilesDefaultMaxListEntries. A larger directory is reported truncated.
+	MaxListEntries int `mapstructure:"maxListEntries"`
+}
+
+// File API bounds shared by config validation and the daemon's file runner.
+// A zero value in FilesConfig means "use the default"; the limits exist so an
+// operator can raise them deliberately rather than by accident.
+const (
+	FilesDefaultMaxReadBytes   = 8 << 20 // 8 MiB
+	FilesDefaultMaxWriteBytes  = 8 << 20 // 8 MiB
+	FilesMaxTransferBytes      = 1 << 30 // 1 GiB per request
+	FilesDefaultMaxListEntries = 5000
+	FilesMaxListEntriesLimit   = 100000
+)
 
 // LogAlertConfig declares one daemon-side regex alert. A matching new log
 // line produces a cloud notification through the existing notification
@@ -504,6 +559,52 @@ func validateTerminal(cfg TerminalConfig) error {
 	return nil
 }
 
+// validateFiles checks the opt-in file API policy. Shape and limits are
+// checked whenever they are set; the presence rules (roots) only apply when
+// the API is enabled, so a disabled-but-present table never blocks startup.
+func validateFiles(cfg FilesConfig) error {
+	if cfg.Secret != "" && strings.ContainsAny(cfg.Secret, " \t\r\n") {
+		return fmt.Errorf("daemon.files.secret must not contain whitespace")
+	}
+	if cfg.MaxReadBytes < 0 || cfg.MaxWriteBytes < 0 {
+		return fmt.Errorf("daemon.files maxReadBytes and maxWriteBytes must not be negative")
+	}
+	if cfg.MaxReadBytes > FilesMaxTransferBytes || cfg.MaxWriteBytes > FilesMaxTransferBytes {
+		return fmt.Errorf("daemon.files maxReadBytes and maxWriteBytes must be at most %d bytes", FilesMaxTransferBytes)
+	}
+	if cfg.MaxListEntries < 0 || cfg.MaxListEntries > FilesMaxListEntriesLimit {
+		return fmt.Errorf("daemon.files.maxListEntries must be between 1 and %d", FilesMaxListEntriesLimit)
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	if len(cfg.Roots) == 0 {
+		return fmt.Errorf("daemon.files.roots must not be empty when the file API is enabled")
+	}
+	seen := make(map[string]struct{}, len(cfg.Roots))
+	for i, root := range cfg.Roots {
+		if strings.TrimSpace(root) != root || root == "" {
+			return fmt.Errorf("daemon.files.roots[%d] must be a non-empty absolute path", i)
+		}
+		if !filepath.IsAbs(root) {
+			return fmt.Errorf("daemon.files.roots[%d] %q must be an absolute path", i, root)
+		}
+		clean := filepath.Clean(root)
+		if _, ok := seen[clean]; ok {
+			return fmt.Errorf("daemon.files.roots[%d] %q is duplicated", i, root)
+		}
+		seen[clean] = struct{}{}
+		info, err := os.Stat(clean)
+		if err != nil {
+			return fmt.Errorf("daemon.files.roots[%d] %q is not usable: %w", i, root, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("daemon.files.roots[%d] %q is not a directory", i, root)
+		}
+	}
+	return nil
+}
+
 // NativeOpNames lists the built-in operations the daemon executes natively
 // (container lifecycle, process kill, systemd unit actions, compose project
 // actions). These slugs are reserved: webhooks and actions may not reuse
@@ -577,6 +678,13 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.scriptTimeout", 30*time.Second)
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
+	viper.SetDefault("daemon.files.enabled", false)
+	viper.SetDefault("daemon.files.secret", "")
+	viper.SetDefault("daemon.files.roots", []string{})
+	viper.SetDefault("daemon.files.allowWrite", false)
+	viper.SetDefault("daemon.files.maxReadBytes", int64(FilesDefaultMaxReadBytes))
+	viper.SetDefault("daemon.files.maxWriteBytes", int64(FilesDefaultMaxWriteBytes))
+	viper.SetDefault("daemon.files.maxListEntries", FilesDefaultMaxListEntries)
 	viper.SetDefault("http.allowedOrigins", []string{})
 	viper.SetDefault("daemon.terminal.enabled", false)
 	viper.SetDefault("daemon.terminal.secret", "")
@@ -1215,6 +1323,9 @@ func (c *Config) ValidateDaemon() error {
 		}
 	}
 	if err := validateTerminal(c.Daemon.Terminal); err != nil {
+		return err
+	}
+	if err := validateFiles(c.Daemon.Files); err != nil {
 		return err
 	}
 	return nil

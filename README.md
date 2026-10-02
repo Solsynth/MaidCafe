@@ -106,6 +106,12 @@ GET /health
   NAT can serve the same terminal through the cloud instead
   (`daemon.terminal.relay.enabled`); see
   [WebSocket terminal](#websocket-terminal).
+- Opt-in file API (`/api/v1/files/...`) serving the SFTP operations a browser
+  cannot make — list, stat, read (windowed), write, mkdir, move, copy, delete —
+  confined to an allowlisted set of roots by `daemon.files.roots` and by
+  `os.Root`, with mutations gated separately by `allowWrite`. Off by default and
+  available over the stdio transport as `files.*` actions; see
+  [File API](#file-api).
 - Public health endpoint that exposes only daemon mode and ID:
 
 ```text
@@ -245,9 +251,11 @@ as one JSON line per run: timestamp, `name` (API slug), optional
 `display_name`, `source` (`http` | `stdio` | `relay` | `job` | `terminal`),
 `ok`, `exit_code`, `duration_ms`, and a truncated failure reason. WebSocket
 terminal sessions land in the same file with `name` and `source` `terminal`,
-one line per session and no transcript. The file rotates at 1 MiB keeping one
-generation (`audit.jsonl.1`). Logging is best-effort: an unwritable path
-disables it with a warning and never affects execution.
+one line per session and no transcript. File API calls land there too, with
+the action slug as `name`, `source` `http` or `stdio`, and the resolved path
+in `target` (`from -> to` for a move or copy). The file rotates at 1 MiB
+keeping one generation (`audit.jsonl.1`). Logging is best-effort: an
+unwritable path disables it with a warning and never affects execution.
 `GET /api/v1/audit?limit=N` returns the newest entries (default 50, max 500)
 newest first, authenticated with the metrics secret.
 
@@ -413,6 +421,118 @@ The cloud terminates TLS and pumps the frames, so a relayed session passes
 through it in the clear: it can read every keystroke and every byte of output,
 including a password typed at a `sudo` prompt. Neither side persists a
 transcript — the audit entry is the session summary only.
+
+### File API
+
+The file manager and the editor reach a host over SFTP, which a browser build
+cannot open. With `daemon.files.enabled` the daemon serves the same operations
+over plain HTTP (and over the SSH stdio pipe), so a MaidKit web build can
+browse, read, edit, upload and delete files on a managed host without an SSH
+session.
+
+```text
+GET    /api/v1/files/roots
+GET    /api/v1/files/list?path=<abs>
+GET    /api/v1/files/stat?path=<abs>&follow=<bool>
+GET    /api/v1/files/content?path=<abs>&offset=<n>&limit=<n>   # raw bytes
+POST   /api/v1/files/read                                      # JSON, base64
+POST   /api/v1/files/write                                     # JSON, base64
+PUT    /api/v1/files/content?path=<abs>                        # raw body
+POST   /api/v1/files/mkdir    {"path","parents"}
+POST   /api/v1/files/move     {"from","to"}
+POST   /api/v1/files/copy     {"from","to","overwrite"}
+POST   /api/v1/files/delete   {"path","recursive"}
+```
+
+Each mount also accepts an alternate verb (the read routes `POST`, the write
+routes `POST`/`PUT`, delete `POST`/`DELETE`), so a client whose HTTP helper
+issues only one method is not locked out of an operation it is allowed to make.
+
+Authentication is `Authorization: Bearer <secret>`, where the secret is
+`daemon.files.secret` when set and `daemon.metricsSecret` otherwise; a
+`Sec-WebSocket-Protocol: maidcafe.files.<base64url>` token is accepted too, the
+same accommodation the terminal handshake makes. `GET /api/v1/files/content`
+additionally accepts `?token=<secret>`, because a download or an image load
+cannot carry a header at all — and that is the only route that does: a URL
+which leaks into a proxy log or a `Referer` can read a file, never change one.
+Every mutation presents the credential in a header, and a JSON mutation body
+must additionally carry the usual `X-MaidCafe-Signature` HMAC, so a credential
+lifted in transit cannot be replayed against a body it was never signed for.
+
+```sh
+API=https://host/api/v1/files
+AUTH='Authorization: Bearer <files-secret>'
+
+curl -sS "$API/roots" -H "$AUTH"
+curl -sS "$API/list?path=/srv/app" -H "$AUTH"
+curl -sS "$API/read?path=/srv/app/index.html" -H "$AUTH"
+curl -sS "$API/content?path=/srv/app/logo.png&offset=0&limit=2048" -H "$AUTH" -o window.bin
+
+# Mutations present the credential in a header; a JSON body is signed too.
+BODY='{"path":"/srv/app/notes.txt","content":"aGVsbG8K"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac '<metrics-secret>' -hex | awk '{print $NF}')
+curl -sS -X POST "$API/write" -H "$AUTH" -H "X-MaidCafe-Signature: $SIG" \
+  -H 'Content-Type: application/json' --data-binary "$BODY"
+
+curl -sS -X PUT "$API/content?path=/srv/app/upload.bin" -H "$AUTH" --data-binary @upload.bin
+curl -sS -X POST "$API/delete?path=/srv/app/upload.bin" -H "$AUTH"
+```
+
+Containment is layered:
+
+- Every path must be absolute and lexically inside one of `daemon.files.roots`;
+  anything else is `403` before the filesystem is touched, and a configured
+  root itself can never be written, moved, copied or deleted through the API.
+- The I/O then runs through `os.Root`, which refuses any access that resolves
+  outside the root — including through a symbolic link planted inside it — so
+  the kernel closes the race the lexical check cannot. `stat` reports a link
+  as `type: "symlink"` with its raw `link_target`, and `target_type` only when
+  the destination still resolves inside the root.
+- Operations run as the daemon's own account. The API never elevates, so it
+  can touch exactly what that account can touch.
+- `daemon.files.allowWrite` (default `false`) gates every mutation, so a root
+  can be published read-only.
+
+Reads are windowed rather than whole-file: `offset`/`limit` return a slice,
+`size` reports the file's real length, and a whole-file read of something
+larger than `maxReadBytes` is refused with `413` instead of silently
+truncated. `GET /api/v1/files/content` carries the total size in
+`X-MaidCafe-File-Size`. A listing reports `truncated: true` when a directory
+holds more entries than `maxListEntries`; a whole-file copy (move/copy) is not
+bounded by `maxReadBytes`, which caps one request, not one operation.
+
+Every call is appended to `daemon.auditPath` with the action slug
+(`files.list`, `files.write`, …), the resolved path in `target`
+(`from -> to` for a move or copy), `source` `http` or `stdio`, and the usual
+`ok`/`duration_ms`/`error` fields.
+
+- `daemon.files.enabled` (default `false`) — serve the API at all.
+- `daemon.files.roots` — required when enabled; absolute, existing
+  directories. A root the daemon account cannot read is a root the API cannot
+  serve.
+- `daemon.files.secret` — optional dedicated credential.
+- `daemon.files.allowWrite` (default `false`) — allow mutating operations.
+- `daemon.files.maxReadBytes` / `maxWriteBytes` (default 8 MiB) — per-request
+  caps.
+- `daemon.files.maxListEntries` (default 5000) — per-listing cap.
+
+Over the stdio transport the same operations are actions named `files.list`,
+`files.read`, `files.write`, `files.mkdir`, `files.move`, `files.copy`,
+`files.delete` and `files.roots`, carrying the same parameters in the request
+body. The pipe already required the account's SSH credentials, so those
+actions carry no signature — but the `[daemon.files]` policy still applies, so
+the pipe cannot reach outside the configured roots either.
+
+Not served, deliberately: permission/ownership changes (`chmod`, `chown`) and
+archive create/extract. The file manager performs those over SSH today, and a
+browser build without SSH reports them unavailable rather than silently
+downgrading.
+
+The API is reachable where the daemon is reachable: directly over HTTP(S), and
+over the stdio pipe for a client that already has SSH. There is no cloud-relayed
+file transport (the terminal has one; files do not), so a browser client needs
+an endpoint it can dial — the same TLS-fronted address the rest of the daemon
+API is served at.
 
 ### Snapshot endpoints
 
@@ -694,6 +814,14 @@ The same rule must exist for the SSH user that runs the daemon in `stdio`
 transport mode. MaidKit deploys all of this automatically when an action
 selects a run-as user.
 
+The file API runs as the daemon account under the unit's sandbox, so a
+`daemon.files.roots` entry must be somewhere that account can actually read and
+write. `ProtectSystem=full` leaves `/srv` and `/var` writable while `/etc` is
+writable only through the existing `ReadWritePaths=/etc/maidcafe`, and
+`ProtectHome=true` hides `/home` and `/root` entirely — a root under either is
+rejected at startup, which is deliberate: the alternative is a root that
+validates and then fails every request.
+
 ## CI artifacts
 
 GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/build.yml):
@@ -736,3 +864,15 @@ an operator TLS front it is plain `ws://`, so a dedicated
 `daemon.terminal.secret` is what keeps a leaked metrics secret from becoming a
 shell. A cloud-relayed session additionally passes through the cloud, which
 terminates TLS and can therefore read the session; the direct endpoint does not.
+
+The file API is the same trade in a different shape, with two differences. It
+accepts the credential in a `token` query parameter — but only on the
+raw-content read route, where a browser can carry nothing else: a leak of that
+URL therefore reads a file and cannot change one, since every mutation needs a
+header credential and a JSON body additionally needs a signature it cannot
+produce. That URL is still as sensitive as the credential, which is why the API
+has its own switch, its own optional secret, an explicit root allowlist and a
+separate write gate. And it is confined twice: lexically to
+`daemon.files.roots` and by `os.Root` against symlinks, so a link planted
+inside a root cannot be used to read or write outside it. The API runs as the
+daemon account and never elevates.

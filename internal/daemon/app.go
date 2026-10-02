@@ -22,6 +22,7 @@ import (
 
 type App struct {
 	cfg             config.DaemonConfig
+	audit           *AuditLogger
 	executor        *WebhookExecutor
 	ops             *nativeOpRunner
 	metrics         *MetricsCollector
@@ -104,6 +105,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	jobs := newJobRunner(executor, ops, publisherBox, logger)
 	app := &App{
 		cfg:        cfg,
+		audit:      audit,
 		executor:   executor,
 		ops:        ops,
 		metrics:    metrics,
@@ -453,6 +455,31 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// so interval/limit/cloud changes apply without a restart.
 	router.GET("/api/v1/config", authorizeMetrics, app.handleGetConfig)
 	router.PATCH("/api/v1/config", authorizeMetrics, app.handlePatchConfig)
+	// File API: the SFTP operations a browser cannot make. Registered without
+	// authorizeMetrics because a browser cannot set an Authorization header on
+	// a download or an image request; each handler authenticates itself and
+	// accepts the credential as a Bearer header, a query token or a
+	// subprotocol token. Each mount also accepts the alternate verbs so a
+	// client with only one HTTP verb is not locked out of an operation it is
+	// otherwise allowed to make.
+	mountFile := func(handler gin.HandlerFunc, path string, methods ...string) {
+		for _, method := range methods {
+			router.Handle(method, path, handler)
+		}
+	}
+	mountFile(app.handleFileRoots, "/api/v1/files/roots", http.MethodGet, http.MethodPost)
+	mountFile(app.handleFileList, "/api/v1/files/list", http.MethodGet, http.MethodPost)
+	mountFile(app.handleFileStat, "/api/v1/files/stat", http.MethodGet, http.MethodPost)
+	mountFile(app.handleFileRead, "/api/v1/files/read", http.MethodGet, http.MethodPost)
+	// One path, two directions: GET returns a raw window of the file, PUT
+	// replaces the whole file with the request body.
+	mountFile(app.handleFileContent, "/api/v1/files/content", http.MethodGet)
+	mountFile(app.handleFileWriteRaw, "/api/v1/files/content", http.MethodPut, http.MethodPost)
+	mountFile(app.handleFileWrite, "/api/v1/files/write", http.MethodPost, http.MethodPut)
+	mountFile(app.handleFileMkdir, "/api/v1/files/mkdir", http.MethodPost, http.MethodPut)
+	mountFile(app.handleFileMove, "/api/v1/files/move", http.MethodPost, http.MethodPut)
+	mountFile(app.handleFileCopy, "/api/v1/files/copy", http.MethodPost, http.MethodPut)
+	mountFile(app.handleFileDelete, "/api/v1/files/delete", http.MethodPost, http.MethodDelete)
 	// Captured container logs (disk-backed, pruned by retention): the tail
 	// window for one container, oldest first.
 	router.GET("/api/v1/containers/:id/logs", authorizeMetrics, func(c *gin.Context) {

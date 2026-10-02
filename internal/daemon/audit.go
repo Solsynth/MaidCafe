@@ -25,7 +25,11 @@ type auditEntry struct {
 	Source      string    `json:"source"`
 	// InvokedBy names the caller: a Solarpass handle, a labeled cloud
 	// credential, or the transport ("stdio") when no identity is attached.
-	InvokedBy  string `json:"invoked_by,omitempty"`
+	InvokedBy string `json:"invoked_by,omitempty"`
+	// Target names the resource a non-script operation acted on. File API
+	// entries carry the resolved path (or "from -> to" for a move/copy) here;
+	// script and native operation runs leave it empty.
+	Target     string `json:"target,omitempty"`
 	OK         bool   `json:"ok"`
 	ExitCode   int    `json:"exit_code"`
 	DurationMS int64  `json:"duration_ms"`

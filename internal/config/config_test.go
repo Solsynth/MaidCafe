@@ -281,6 +281,11 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(file, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*DaemonConfig)
@@ -585,6 +590,68 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 					Shells: []string{"/bin/sh"},
 					Relay:  TerminalRelayConfig{Enabled: true, PollWait: time.Minute},
 				}
+			},
+		},
+		{
+			name: "disabled file API ignores shape",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Roots: []string{"relative", "/does/not/exist"}}
+			},
+			ok: true,
+		},
+		{
+			name: "file API enabled without roots rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true}
+			},
+		},
+		{
+			name: "relative file root rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{"srv/data"}}
+			},
+		},
+		{
+			name: "missing file root rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{"/definitely/not/a/directory-xyz"}}
+			},
+		},
+		{
+			name: "duplicate file root rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{dir, dir}}
+			},
+		},
+		{
+			name: "file root directory accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, AllowWrite: true}
+			},
+			ok: true,
+		},
+		{
+			name: "file API secret with whitespace rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, Secret: " padded "}
+			},
+		},
+		{
+			name: "oversized file transfer caps rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, MaxReadBytes: FilesMaxTransferBytes + 1}
+			},
+		},
+		{
+			name: "oversized file list cap rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, MaxListEntries: FilesMaxListEntriesLimit + 1}
+			},
+		},
+		{
+			name: "file root pointing at a file rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []string{file}}
 			},
 		},
 	} {
