@@ -53,3 +53,34 @@ verbs = ["reload", "restart"]
 # [[systemd]]
 # unit = "caddy.service"
 # verbs = ["reload"]
+
+# Package operations. A manager run as root is the largest grant in this file:
+# a package's maintainer scripts run as root, so `install` executes code the
+# operator did not write, from the distribution's repositories. The verbs are
+# therefore granted one at a time, and the manager is declared here — a caller
+# can never choose the binary.
+#
+# Homebrew is absent on purpose: it installs into a user-owned prefix and is
+# designed to run without root.
+#
+# The daemon routes these here only with `[daemon.priv] packages = true`.
+# [packages]
+# manager = "apt"
+# verbs = ["refresh", "upgrade", "install", "remove"]
+
+# Firewall rules. This grant is about exposure rather than about a program: an
+# allow on an administrative port opens it to whoever can reach the host, and
+# `disable` removes every rule at once — which is why it is a verb of its own
+# and not implied by the rule verbs.
+#
+# A rule is a port, a protocol and a source, each validated against its own
+# grammar; there is no way to reach a raw rule or another command.
+#
+# Careful with the port the operator is connected on: a deny on it, or a delete
+# of its allow, locks the host out of the network — including out of this
+# daemon. The firewall does not know or care which port that is.
+#
+# The daemon routes these here only with `[daemon.priv] firewall = true`.
+# [firewall]
+# backend = "ufw"
+# verbs = ["enable", "disable", "allow", "deny", "delete"]

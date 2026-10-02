@@ -312,6 +312,14 @@ type PrivConfig struct {
 	// granted two units also silently kept whatever blanket grant they had,
 	// which is exactly the boundary this replaces.
 	Systemd bool `mapstructure:"systemd"`
+	// Packages routes native package operations through the helper. Same rule
+	// as Systemd: when true the helper is the only path, so an operator who
+	// granted two verbs does not silently keep a blanket package-manager sudo
+	// rule as well.
+	Packages bool `mapstructure:"packages"`
+	// Firewall routes native firewall operations through the helper, on the
+	// same terms.
+	Firewall bool `mapstructure:"firewall"`
 }
 
 // FilesRootConfig declares one directory the file API may touch, and whether
@@ -705,7 +713,7 @@ func validatePriv(cfg PrivConfig, files FilesConfig) error {
 	if cfg.Helper != "" && !filepath.IsAbs(cfg.Helper) {
 		return fmt.Errorf("daemon.priv.helper must be an absolute path")
 	}
-	needsHelper := cfg.Systemd ||
+	needsHelper := cfg.Systemd || cfg.Packages || cfg.Firewall ||
 		slices.ContainsFunc(files.Roots, func(root FilesRootConfig) bool { return root.Privileged })
 	if !needsHelper {
 		return nil
@@ -726,7 +734,7 @@ func validatePriv(cfg PrivConfig, files FilesConfig) error {
 
 // NativeOpNames lists the built-in operations the daemon executes natively
 // (container lifecycle, process kill, systemd unit actions, compose project
-// actions). These slugs are reserved: webhooks and actions may not reuse
+// actions, package operations, firewall rules). These slugs are reserved: webhooks and actions may not reuse
 // them, so the cloud relay — which dispatches by name — stays unambiguous
 // and credential action-name scopes mean the same thing for both kinds.
 var NativeOpNames = []string{
@@ -735,6 +743,8 @@ var NativeOpNames = []string{
 	"process.kill",
 	"systemd.start", "systemd.stop", "systemd.restart", "systemd.reload",
 	"systemd.enable", "systemd.disable",
+	"package.refresh", "package.upgrade", "package.install", "package.remove",
+	"firewall.enable", "firewall.disable", "firewall.allow", "firewall.deny", "firewall.delete",
 	"compose.up", "compose.stop", "compose.restart", "compose.pull", "compose.recreate",
 }
 

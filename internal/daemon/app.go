@@ -101,7 +101,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	ops.SetScriptTimeout(cfg.ScriptTimeout)
 	priv := newPrivRunner()
 	if priv != nil {
-		ops.SetPrivilegedPolicy(cfg.Priv.Helper, cfg.Priv.Systemd, priv)
+		ops.SetPrivilegedPolicy(cfg.Priv, priv)
 	}
 	watchedStore := newWatchedProcessStore(cfg.WatchedProcessesFile, cfg.WatchedProcesses)
 	historyDir := ""
@@ -452,6 +452,32 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router.POST("/api/v1/systemd/:unit/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
 		return "systemd." + c.Param("action"), opParams{target: c.Param("unit")}
 	}, nil))
+	router.POST("/api/v1/packages/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		return "package." + c.Param("action"), opParams{}
+	}, func(values map[string]any, p *opParams) {
+		if name, ok := values["name"].(string); ok {
+			p.name = name
+		}
+	}))
+	// The firewall rule travels in the body rather than the path: three fields
+	// with their own grammars do not fit one path segment, and the transports
+	// that are not HTTP carry everything in the body anyway.
+	router.POST("/api/v1/firewall/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
+		return "firewall." + c.Param("action"), opParams{}
+	}, func(values map[string]any, p *opParams) {
+		if port, ok := values["port"].(string); ok {
+			p.port = port
+		}
+		if protocol, ok := values["protocol"].(string); ok {
+			p.protocol = protocol
+		}
+		if source, ok := values["source"].(string); ok {
+			p.source = source
+		}
+		if action, ok := values["rule_action"].(string); ok {
+			p.ruleAction = action
+		}
+	}))
 	router.POST("/api/v1/compose/:project/:action", authorizeMetrics, app.nativeOpHandler(ops, func(c *gin.Context) (string, opParams) {
 		return "compose." + c.Param("action"), opParams{target: c.Param("project")}
 	}, func(values map[string]any, p *opParams) {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
+	"src.solsynth.dev/solsynth/maidcafe/internal/privfs"
 )
 
 // Native host operations: typed, validated mutations the daemon executes
@@ -95,6 +97,15 @@ var nativeOpDisplayNames = map[string]string{
 	"systemd.reload":    "Reload systemd unit",
 	"systemd.enable":    "Enable systemd unit",
 	"systemd.disable":   "Disable systemd unit",
+	"package.refresh":   "Refresh package indexes",
+	"package.upgrade":   "Upgrade packages",
+	"package.install":   "Install package",
+	"package.remove":    "Remove package",
+	"firewall.enable":   "Enable firewall",
+	"firewall.disable":  "Disable firewall",
+	"firewall.allow":    "Allow firewall rule",
+	"firewall.deny":     "Deny firewall rule",
+	"firewall.delete":   "Delete firewall rule",
 	"compose.up":        "Compose up",
 	"compose.stop":      "Compose stop",
 	"compose.restart":   "Compose restart",
@@ -136,6 +147,16 @@ type opParams struct {
 	pid       int
 	force     bool
 	directory string
+	// name is the package for a package operation.
+	name string
+	// port, protocol and source are one firewall rule.
+	port     string
+	protocol string
+	source   string
+	// ruleAction is the allow/deny a firewall delete has to name. ufw
+	// identifies a rule by its full text, so deleting an allow and deleting a
+	// deny are different rules.
+	ruleAction string
 }
 
 // nativeParamsFromValues builds opParams from a decoded JSON body (the cloud
@@ -161,6 +182,13 @@ func nativeParamsFromValues(slug string, values map[string]any) opParams {
 	case strings.HasPrefix(slug, "compose."):
 		p.target, _ = values["project"].(string)
 		p.directory, _ = values["directory"].(string)
+	case strings.HasPrefix(slug, "package."):
+		p.name, _ = values["name"].(string)
+	case strings.HasPrefix(slug, "firewall."):
+		p.port, _ = values["port"].(string)
+		p.protocol, _ = values["protocol"].(string)
+		p.source, _ = values["source"].(string)
+		p.ruleAction, _ = values["rule_action"].(string)
 	}
 	return p
 }
@@ -170,6 +198,11 @@ type opAttempt struct {
 	command string
 	args    []string
 	cwd     string
+	// env is appended to the inherited environment. apt needs
+	// DEBIAN_FRONTEND; without it a package with a conffile or debconf prompt
+	// waits on a terminal that is not there, and the op hangs until it times
+	// out with nothing to show for it.
+	env []string
 }
 
 // nativeOpRunner executes native operations through the executor's
@@ -181,9 +214,12 @@ type opAttempt struct {
 type opPrivPolicy struct {
 	helper string
 	runner *privRunner
-	// systemd routes systemd actions through the helper, and makes the helper
-	// the only path for them: see [config.PrivConfig.Systemd].
-	systemd bool
+	// systemd, packages and firewall route one family of operations through
+	// the helper, and make the helper the only path for that family: see
+	// [config.PrivConfig.Systemd].
+	systemd  bool
+	packages bool
+	firewall bool
 }
 
 type nativeOpRunner struct {
@@ -203,12 +239,18 @@ func (r *nativeOpRunner) SetScriptTimeout(timeout time.Duration) {
 
 // SetPrivilegedPolicy records how native operations may reach root. Called at
 // construction and on every reload.
-func (r *nativeOpRunner) SetPrivilegedPolicy(helper string, systemd bool, runner *privRunner) {
+func (r *nativeOpRunner) SetPrivilegedPolicy(priv config.PrivConfig, runner *privRunner) {
 	if runner == nil {
 		r.priv.Store(nil)
 		return
 	}
-	r.priv.Store(&opPrivPolicy{helper: helper, runner: runner, systemd: systemd})
+	r.priv.Store(&opPrivPolicy{
+		helper:   priv.Helper,
+		runner:   runner,
+		systemd:  priv.Systemd,
+		packages: priv.Packages,
+		firewall: priv.Firewall,
+	})
 }
 
 // systemdHelperAttempt builds the attempt that runs a systemd action through the
@@ -228,6 +270,79 @@ func (r *nativeOpRunner) systemdHelperAttempt(verb, unit string) (opAttempt, boo
 		return opAttempt{}, false
 	}
 	return opAttempt{command: argv[0], args: argv[1:]}, true
+}
+
+// packageHelperAttempt builds the attempt that runs a package operation
+// through the helper, or returns false when package operations are not routed
+// there. The manager is the helper's to choose: the daemon passes a verb and a
+// name and nothing else, so a caller cannot point a root invocation at a
+// different package manager.
+func (r *nativeOpRunner) packageHelperAttempt(verb, name string) (opAttempt, bool) {
+	policy := r.priv.Load()
+	if policy == nil || !policy.packages || policy.runner == nil {
+		return opAttempt{}, false
+	}
+	args := []string{"packages", verb}
+	if name != "" {
+		args = append(args, name)
+	}
+	argv := policy.runner.argv(policy.helper, args...)
+	if len(argv) == 0 {
+		return opAttempt{}, false
+	}
+	return opAttempt{command: argv[0], args: argv[1:]}, true
+}
+
+// firewallHelperAttempt builds the attempt that runs a firewall operation
+// through the helper, on the same terms as the package one: the backend and
+// the rule grammar are the helper's to decide.
+func (r *nativeOpRunner) firewallHelperAttempt(verb string, params opParams) (opAttempt, bool) {
+	policy := r.priv.Load()
+	if policy == nil || !policy.firewall || policy.runner == nil {
+		return opAttempt{}, false
+	}
+	args := []string{"firewall", verb}
+	if verb == "allow" || verb == "deny" || verb == "delete" {
+		if verb == "delete" {
+			args = append(args, params.ruleAction)
+		}
+		args = append(args, params.port, normalizeProtocol(params.protocol), normalizeSource(params.source))
+	}
+	argv := policy.runner.argv(policy.helper, args...)
+	if len(argv) == 0 {
+		return opAttempt{}, false
+	}
+	return opAttempt{command: argv[0], args: argv[1:]}, true
+}
+
+// detectPackageManager returns the first manager installed on this host, in
+// the preference order the managers themselves are ranked in.
+//
+// Only the first is taken. A second candidate would mean retrying a failed
+// install with a different manager, and the same name is a different package
+// on a different distribution — so the retry could install something nobody
+// asked for.
+func detectPackageManager() (string, bool) {
+	for _, manager := range privfs.PackageManagerPreference() {
+		argv, err := privfs.PackageCommand(manager, "refresh", "")
+		if err != nil {
+			continue
+		}
+		if _, err := exec.LookPath(argv[0]); err == nil {
+			return manager, true
+		}
+	}
+	return "", false
+}
+
+// detectFirewallBackend returns the first backend installed on this host.
+func detectFirewallBackend() (string, bool) {
+	for _, backend := range privfs.FirewallBackendPreference() {
+		if _, err := exec.LookPath(privfs.FirewallBinaryFor(backend)); err == nil {
+			return backend, true
+		}
+	}
+	return "", false
 }
 
 // dispatch validates [slug] and [params], builds the command attempts and
@@ -306,6 +421,87 @@ func (r *nativeOpRunner) dispatch(
 		if sudo := r.sudoAttempt(); sudo != nil {
 			attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{"systemctl"}, args...)...)})
 		}
+	case strings.HasPrefix(slug, "package."):
+		verb := strings.TrimPrefix(slug, "package.")
+		if !privfs.ValidPackageVerb(verb) {
+			return bad("unknown package action")
+		}
+		name := strings.TrimSpace(params.name)
+		switch verb {
+		case "install", "remove":
+			if !privfs.ValidPackageName(name) {
+				return bad("invalid package name")
+			}
+		default:
+			if name != "" {
+				return bad("this package action takes no package name")
+			}
+		}
+		targetLabel = name
+		if targetLabel == "" {
+			targetLabel = verb
+		}
+		if helperAttempt, ok := r.packageHelperAttempt(verb, name); ok {
+			attempts = append(attempts, helperAttempt)
+			break
+		}
+		manager, ok := detectPackageManager()
+		if !ok {
+			return bad("no package manager is installed on this host")
+		}
+		argv, err := privfs.PackageCommand(manager, verb, name)
+		if err != nil {
+			return bad("invalid package action")
+		}
+		env := privfs.PackageEnv(manager)
+		if path, err := exec.LookPath(argv[0]); err == nil {
+			attempts = append(attempts, opAttempt{command: path, args: argv[1:], env: env})
+			if sudo := r.sudoAttempt(); sudo != nil {
+				attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, argv[1:]...)...), env: env})
+			}
+		}
+	case strings.HasPrefix(slug, "firewall."):
+		verb := strings.TrimPrefix(slug, "firewall.")
+		if !privfs.ValidFirewallVerb(verb) {
+			return bad("unknown firewall action")
+		}
+		var rule privfs.FirewallRule
+		if verb == "allow" || verb == "deny" || verb == "delete" {
+			action := verb
+			if verb == "delete" {
+				action = strings.TrimSpace(params.ruleAction)
+			}
+			parsed, err := privfs.ParseFirewallRule(action, params.port, params.protocol, params.source)
+			if err != nil {
+				return bad(err.Error())
+			}
+			rule = parsed
+			targetLabel = rule.String()
+		} else {
+			targetLabel = verb
+		}
+		if helperAttempt, ok := r.firewallHelperAttempt(verb, params); ok {
+			attempts = append(attempts, helperAttempt)
+			break
+		}
+		backend, ok := detectFirewallBackend()
+		if !ok {
+			return bad("no supported firewall is installed on this host")
+		}
+		commands, err := privfs.FirewallCommand(backend, verb, rule)
+		if err != nil {
+			return bad(err.Error())
+		}
+		for _, argv := range commands {
+			path, err := exec.LookPath(argv[0])
+			if err != nil {
+				return bad(fmt.Sprintf("%s is not installed on this host", argv[0]))
+			}
+			attempts = append(attempts, opAttempt{command: path, args: argv[1:]})
+			if sudo := r.sudoAttempt(); sudo != nil {
+				attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, argv[1:]...)...)})
+			}
+		}
 	case strings.HasPrefix(slug, "compose."):
 		verb := strings.TrimPrefix(slug, "compose.")
 		cliArgs, known := nativeComposeVerbs[verb]
@@ -351,6 +547,25 @@ func (r *nativeOpRunner) sudoAttempt() []string {
 		return nil
 	}
 	return []string{"sudo", "-n"}
+}
+
+// normalizeProtocol and normalizeSource turn an absent firewall field into the
+// explicit "any" the helper's grammar expects, so no argument in the helper's
+// argv is ever an empty string.
+func normalizeProtocol(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "any"
+	}
+	return value
+}
+
+func normalizeSource(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "any"
+	}
+	return value
 }
 
 // validNativeDirectory checks an absolute compose working directory with no
@@ -499,6 +714,9 @@ func (r *nativeOpRunner) publishFailure(slug, displayName, target string, respon
 func runOpOnce(ctx context.Context, attempt opAttempt) (stdout, stderr string, exitCode int, err error) {
 	cmd := exec.CommandContext(ctx, attempt.command, attempt.args...)
 	cmd.Dir = attempt.cwd
+	if len(attempt.env) > 0 {
+		cmd.Env = append(os.Environ(), attempt.env...)
+	}
 	cmd.WaitDelay = execPipeWaitDelay
 	outBuf, errBuf := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
 	cmd.Stdout, cmd.Stderr = outBuf, errBuf

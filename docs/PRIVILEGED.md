@@ -32,25 +32,35 @@ graph LR
   D -->|sudo -n maidkit-priv fs write profile rel mode| H[maidkit-priv<br/>root]
   P[/etc/maidkit/priv.toml<br/>root:root 0644/] --> H
   H -->|os.Root, symlink-proof| F[declared directories]
+  H -->|systemctl, one granted unit| U[granted units]
+  H -->|apt-get, one validated name| K[packages]
+  H -->|ufw / firewall-cmd, one validated rule| W[firewall]
   H -->|JSON line on stderr| A[journal / daemon audit]
 ```
 
 1. **`maidkit-priv`** — a small root-capable binary
    (`cmd/maidkit-priv`, logic in `internal/privfs`). It performs a fixed set of
-   operations, and none of them takes a path or a binary from its caller: a
-   file operation names a *profile* it resolves against its own file, and a
-   systemd operation names a *unit* an operator granted.
-2. **`/etc/maidkit/priv.toml`** — the profile file, owned by root and writable
+   operations in four families — files, systemd units, packages and firewall
+   rules — and none of them takes a path, a binary or a flag from its caller: a
+   file operation names a *profile* it resolves against its own file, a systemd
+   operation names a *unit* an operator granted, a package operation names a
+   *package* in the manager the grant declared, and a firewall operation names a
+   *rule* built from three validated fields.
+2. **`/etc/maidkit/priv.toml`** — the grant file, owned by root and writable
    only by root. It maps a profile name to a directory and to the modes that
-   may be used there. This file, not the sudoers rule, is the authorization
-   boundary.
-3. **The sudoers rule** — one line per mutating verb, printed by
+   may be used there, lists the systemd units and verbs, declares the package
+   manager and its verbs, and declares the firewall backend and its verbs. This
+   file, not the sudoers rule, is the authorization boundary.
+3. **The sudoers rule** — one line per command, printed by
    `maidkit-priv sudoers`:
 
    ```sudoers
    maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv fs write *
    maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv fs mkdir *
    maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv fs remove *
+   maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv systemd *
+   maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv packages *
+   maidcafe ALL=(root) NOPASSWD: /usr/local/libexec/maidkit-priv firewall *
    ```
 
    The trailing wildcard is safe precisely because the helper re-validates
@@ -69,6 +79,15 @@ maidkit-priv fs remove <profile> <relative-path>
 
 # one granted systemd unit action
 maidkit-priv systemd <verb> <unit>
+
+# package operations; <name> only for install and remove
+maidkit-priv packages <refresh|upgrade>
+maidkit-priv packages <install|remove> <name>
+
+# firewall operations; the rule's fields are always all present
+maidkit-priv firewall <enable|disable>
+maidkit-priv firewall <allow|deny> <port> <protocol> <source>
+maidkit-priv firewall delete <action> <port> <protocol> <source>
 
 maidkit-priv fs profiles          # list every grant in the file
 maidkit-priv sudoers [account]    # print the rule to install
@@ -108,6 +127,16 @@ modes = ["0644"]
 [[systemd]]
 unit = "nginx.service"
 verbs = ["reload", "restart"]
+
+# The package manager and the verbs it may receive.
+[packages]
+manager = "apt"
+verbs = ["refresh", "upgrade"]
+
+# The firewall backend and the verbs it may receive.
+[firewall]
+backend = "ufw"
+verbs = ["allow", "delete"]
 ```
 
 Every entry is validated before any operation runs:
@@ -128,6 +157,13 @@ Every entry is validated before any operation runs:
   verbs the daemon's native systemd operations use. A unit name must not begin
   with a dash: `-H.service` would otherwise reach systemctl's option parser as
   the `--host` option rather than as a unit. Units are unique within the file.
+- `[packages]` names a manager from `apt`, `dnf`, `yum`, `pacman`, `zypper`,
+  `apk`, `xbps`, and a non-empty subset of `refresh`, `upgrade`, `install`,
+  `remove`. Homebrew is not among them: it installs into a user-owned prefix and
+  is designed to run without root, so routing it through a root helper would
+  grant more than it needs.
+- `[firewall]` names a backend from `ufw`, `firewalld`, and a non-empty subset
+  of `enable`, `disable`, `allow`, `deny`, `delete`.
 
 ## Confinement
 
@@ -144,6 +180,21 @@ Two independent layers, exactly like the unprivileged file API:
 
 `fs remove` unlinks single files only. Removing a directory tree is not
 something a profile authorizes.
+
+The other three families are confined by their grant and by their argument
+grammar rather than by a directory:
+
+- **systemd** — the unit comes from a list an operator wrote, and the verb from
+  that entry's list. Neither is derived from the request.
+- **packages** — the manager is declared, so no caller can choose the binary,
+  and the package name must match the distributions' own name grammar. There is
+  no way to reach a flag, a subcommand, a version pin or a second operand.
+- **firewall** — a rule is a port, a protocol and a source, each parsed on its
+  own. There is no way to name an option, a chain, a file or another command.
+
+Every argument is validated in the helper as well as in the daemon. The daemon's
+checks exist so a caller gets an answer before a privilege boundary is crossed;
+the helper's are the ones that count, because the helper is what runs as root.
 
 ## Enabling it for the daemon
 
@@ -167,6 +218,35 @@ profile = "nginx"          # must exist in /etc/maidkit/priv.toml
 allowlist and the helper's allowlist are joined by an operator's decision
 instead of by a naming coincidence. A privileged root must also be listed in
 the helper's profile file: two operators' decisions, two files, one grant.
+
+The host-wide families are switched on one at a time, and each has the same
+shape and the same consequence:
+
+```toml
+[daemon.priv]
+helper = "/usr/local/libexec/maidkit-priv"
+systemd  = true    # [[systemd]] entries decide which units and verbs
+packages = true    # [packages] decides the manager and the verbs
+firewall = true    # [firewall] decides the backend and the verbs
+
+# files are switched on per root instead:
+[daemon.files]
+enabled = true
+allowWrite = true
+[[daemon.files.roots]]
+path = "/etc/nginx"
+privileged = true
+profile = "nginx"
+```
+
+Each switch only affects its own family, and within a family the helper is
+**the only path** once it is on: a refusal from it is an error, not a fallback
+to a blanket `sudo -n systemctl`, `sudo -n apt-get` or `sudo -n ufw` rule.
+Falling back would mean an operator who granted two units also silently kept
+whatever broader grant the host happened to have, which is the boundary this
+replaces. Turning a switch on is therefore a real change to a host that
+already worked by way of the blanket rule — those operations stop working
+until the corresponding grant exists.
 
 Details worth knowing:
 
@@ -223,10 +303,13 @@ from it. Options, in order of preference:
 sudo install -d -o root -g root -m 0755 /usr/local/libexec /etc/maidkit
 sudo install -o root -g root -m 0755 maidkit-priv /usr/local/libexec/maidkit-priv
 
-# 2. The profiles. This is the file that decides what the helper can reach.
+# 2. The grants. This is the file that decides what the helper can reach: file
+#    profiles, systemd units, the package manager and the firewall backend.
+#    Every grant is commented out in the example; uncomment what this host
+#    needs.
 sudo install -o root -g root -m 0644 config.priv.example.toml /etc/maidkit/priv.toml
 sudo -e /etc/maidkit/priv.toml
-maidkit-priv fs profiles        # parses the file and lists what it grants
+maidkit-priv fs profiles        # parses the file and lists all four families
 
 # 3. The sudoers rule. `sudoers` prints it, so the rule and the helper cannot
 #    drift apart.
@@ -235,9 +318,9 @@ sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidkit-priv \
 sudo visudo -c
 ```
 
-Order matters: install the profiles and the sudoers rule **before** declaring a
-privileged root in the daemon configuration, because the daemon validates that
-the helper exists at config load.
+Order matters: install the grants and the sudoers rule **before** switching a
+family on in the daemon configuration, because the daemon validates that the
+helper exists at config load.
 
 ## Auditing
 
@@ -248,6 +331,16 @@ The daemon captures it, journals it, and records its own audit entry:
 {"time":"2026-08-15T12:00:00Z","event":"privfs","verb":"write","profile":"nginx",
  "path":"sites-enabled/app.conf","mode":"0644","bytes":512,
  "sha256":"…","ok":true,"euid":0,"invoker":"maidcafe","invoker_uid":"998"}
+```
+
+A host-wide operation records the same way, with the fields that say which
+grant was used rather than which path:
+
+```json
+{"time":"2026-08-15T12:00:01Z","event":"privfs","verb":"install","package":"nginx",
+ "manager":"apt","ok":true,"euid":0,"invoker":"maidcafe","invoker_uid":"998"}
+{"time":"2026-08-15T12:00:02Z","event":"privfs","verb":"allow","backend":"ufw",
+ "rule":"allow 443/tcp from 10.0.0.0/8","ok":true,"euid":0,"invoker":"maidcafe"}
 ```
 
 The identity fields come from **sudo's own environment** (`SUDO_USER`,
@@ -269,12 +362,18 @@ it*. Neither alone answers an incident question; together they do.
   root can write is a way to hand it to another account.
 - **No recursive delete, no archive extraction.** Both are ways to make a small
   grant act on an unbounded set of paths.
-- **No package or firewall operations yet.** They are the natural next verbs,
-  and the same shape applies: a declared operation with validated arguments,
-  never a binary, a unit file or a rule from the caller. Both are
-  root-equivalent — a package's maintainer scripts run as root, and a firewall
-  rule can redirect traffic — so each deserves its own opt-in rather than
-  riding along with file or systemd grants.
+- **No `nix`, `snap`, `flatpak` or per-language managers.** They are more
+  package managers, and each would need its own argument grammar checked rather
+  than assumed. Absent is the honest state until one is verified.
+- **No raw firewall rules.** A rule is a port, a protocol and a source. There is
+  no way to reach a chain, a table, a file, an `iptables` invocation or a
+  command to run on reload, and no way to name the backend from a caller: it is
+  declared in this file.
+- **No version pins, architecture qualifiers or remote packages.** A package
+  name is the distribution's own name for a package and nothing more, so
+  `nginx=1.2.3`, `nginx:amd64`, `./nginx.deb` and `https://…/nginx.deb` are all
+  refusals. Each of them names a *source* rather than a package, which is the
+  operator's decision to make in the repositories, not a caller's.
 
 ## Systemd actions
 
@@ -318,15 +417,112 @@ Enabling this is a real grant: `systemctl restart` on a unit an operator chose
 is what they authorized, and a unit file's `ExecStart` runs as root, so keep the
 list to the units a client actually needs and prefer `reload` to `restart`.
 
+## Package actions
+
+The daemon's package operations had the same shape of problem as its systemd
+ones, and a bigger blast radius: `apt-get install` run as root executes a
+package's maintainer scripts as root, so a name that reaches the package manager
+*is* a way to run code. Two things had to be true before it was safe to route
+these through the helper at all.
+
+First, the manager is declared, not chosen:
+
+```toml
+[daemon.priv]
+packages = true
+
+# /etc/maidkit/priv.toml
+[packages]
+manager = "apt"
+verbs = ["refresh", "upgrade", "install", "remove"]
+```
+
+A caller passes a verb and, for `install` and `remove`, a name. It cannot pass a
+binary, a flag or a second operand, and it cannot make the helper reach a
+different manager than the one an operator wrote down.
+
+Second, the name is a name and not a *source*. The accepted grammar is the
+distributions' own, so everything that names somewhere else to get a package
+from is refused:
+
+| Refused | Why it is not just a name |
+| --- | --- |
+| `./nginx.deb`, `/tmp/nginx.deb` | apt installs a local file — root execution of a file the caller chose |
+| `https://…/nginx.deb` | the same, fetched from a host the caller chose |
+| `nginx=1.2.3` | a version pin, i.e. a different source than the repositories' current one |
+| `nginx:amd64` | an architecture qualifier; `name:release` is apt's release selector |
+| `nginx@1.2.3` | pacman's version syntax |
+| `-y`, `--allow-unauthenticated` | an option, whatever precedes it on the command line |
+
+What survives is the plain name a package is installed by. A caller who wants a
+specific version gets the repositories' current one — which is the version the
+operator's own `upgrade` grant would have moved it to anyway.
+
+`refresh` and `upgrade` are separate verbs because they are separate decisions:
+refreshing indexes changes nothing installed, and upgrading every package on a
+host is not implied by granting install.
+
+## Firewall actions
+
+A firewall rule is not a program invocation; it is a change to what the host
+accepts from the network. The grant is therefore about exposure:
+
+```toml
+[daemon.priv]
+firewall = true
+
+# /etc/maidkit/priv.toml
+[firewall]
+backend = "ufw"
+verbs = ["allow", "delete"]
+```
+
+`disable` is a verb of its own rather than something the rule verbs imply, and
+it removes every rule at once. `enable` and `disable` are the only verbs that
+take no rule.
+
+A rule is three validated fields — a port (a number, a `start:end` range, or a
+ufw service name), a protocol (`tcp`, `udp` or `any`), and a source (`any`, an
+address or a CIDR block). The backend is declared here, the same way the package
+manager is, so a caller cannot point a root invocation at a different tool. The
+command is built as argv, never through a shell.
+
+Two backend differences are real and are refusals rather than quiet
+substitutions:
+
+- **firewalld needs an explicit protocol.** A rich rule matches on a port *and*
+  a protocol, so `any` would have to become two rules. Guessing which is how a
+  rule ends up meaning something nobody asked for, so it is refused.
+- **A deny is a rich rule.** firewalld has no "closed port" object, so an allow
+  with no source is the plain `--add-port` everyone else writes, and everything
+  else is a rich rule. Deleting reproduces whatever the add produced, because
+  removing a port rule does not remove a rich rule.
+- **A rich rule with no source is emitted once per family.** A rich rule without
+  a `family` defaults to IPv4, and a deny that leaves IPv6 open is not a deny.
+
+The one hazard the helper cannot remove is the operator's own: denying the port
+they are connected on, or deleting the rule that allows it, locks the host out
+of the network — including out of this daemon, which is reached over it. ufw is
+asked not to confirm (`--force`), because there is no terminal to confirm with,
+and neither tool is given a stdin that could answer a prompt.
+
 ## Testing
 
 `internal/privfs` tests cover the parser, the mode and profile rules, the
 escape attempts (`..`, absolute paths, a symlink pointing out of the profile),
-the content cap and the exit codes. `internal/daemon/files_priv_test.go` drives
-the daemon's routing against a stand-in helper that reproduces the real argv
-and exit-code contract, including the two failures operators actually hit: a
-missing sudoers rule (`403`, naming the rule to install) and the helper not
-being granted root.
+the content cap and the exit codes. `internal/privfs/hostops_test.go` covers the
+two host-wide families: every manager's and every backend's command shape is
+pinned as a table, the package-name grammar is checked against the names that
+name a source rather than a package, and the firewall rule grammar against the
+addresses and protocols it must refuse.
+
+`internal/daemon/files_priv_test.go` and `internal/daemon/hostops_test.go` drive
+the daemon's routing against a stand-in helper that reproduces the real argv and
+exit-code contract, including the two failures operators actually hit: a missing
+sudoers rule (`403`, naming the rule to install) and the helper not being
+granted root. The fallback path — the one a host without the helper uses — is
+driven with `PATH` narrowed to a single stand-in manager, so the choice of
+manager is the test's rather than the machine's.
 
 The genuinely privileged path — a real `sudo -n`, a root-owned profile file and
 root-owned targets — cannot be exercised by an unprivileged test run: the helper
@@ -337,9 +533,18 @@ configuration generated by MaidKit, reports both roots, serves an ordinary root
 and routes a privileged one to the helper (with `privileged: true` in the audit
 entry and the helper's own refusal when no rule matches).
 
-**Not yet verified:** the elevation itself. Nothing in this repository's test
-suite has ever run a write as root through the helper. The runbook below is the
-one remaining step, and it is deliberately short.
+**Not yet verified:** the elevation itself, on any family. Nothing in this
+repository's test suite has ever run as root through the helper, and no package
+manager or firewall backend has been run by it: their command shapes are pinned
+as tables and exercised against stand-in binaries, which checks that the argv is
+what it should be, not that the real tool accepts it. The `--` the package and
+systemctl invocations put before their operand is the sharpest example — every
+one of those tools parses with `getopt_long`, where `--` is the standard
+end-of-options marker, but that is an argument from convention rather than a
+run. The name pattern is what actually makes the argument safe, so a tool that
+rejected `--` would fail loudly rather than quietly.
+
+The runbook below is the remaining step, and it is deliberately short.
 
 ## Verifying the privileged path on a real host
 
@@ -450,7 +655,51 @@ EOF
 # the refusal names the granted ones.
 ```
 
-Without a granted unit there is nothing to act on, so this half is verified by
-the helper's own tests (`internal/privfs`) and by the daemon's routing tests
-against a stand-in helper, and its end-to-end check belongs on the same host as
-the file runbook above.
+Add the two host-wide families to the same file, then check each against the
+real tool:
+
+```sh
+sudo tee -a /etc/maidkit/priv.toml >/dev/null <<'EOF'
+
+[packages]
+manager = "apt"          # or whatever this host runs
+verbs = ["refresh"]
+
+[firewall]
+backend = "ufw"
+verbs = ["allow", "deny", "delete"]
+EOF
+# with [daemon.priv] packages = true and firewall = true:
+
+curl -sS -X POST "http://127.0.0.1:8747/api/v1/packages/refresh" \
+  -H 'Authorization: Bearer <metrics-secret>' -H "X-MaidCafe-Signature: <hmac>" \
+  -d '{}'
+# expected: apt's own output, exit 0, and the helper's audit line naming
+#   manager:"apt"
+
+# A name that names a source rather than a package is refused before anything
+# runs, whichever family is granted.
+curl -sS -X POST "http://127.0.0.1:8747/api/v1/packages/install" \
+  -H 'Authorization: Bearer <metrics-secret>' -H "X-MaidCafe-Signature: <hmac>" \
+  -d '{"name":"./local.deb"}'
+# expected: 400, "invalid package name"
+
+curl -sS -X POST "http://127.0.0.1:8747/api/v1/firewall/allow" \
+  -H 'Authorization: Bearer <metrics-secret>' -H "X-MaidCafe-Signature: <hmac>" \
+  -d '{"port":"8080","protocol":"tcp","source":"any"}'
+# expected: exit 0, `ufw status` now shows the rule, and the audit line records
+#   rule:"allow 8080/tcp"
+
+# The granted verbs are the boundary, not the request.
+curl -sS -X POST "http://127.0.0.1:8747/api/v1/firewall/disable" \
+  -H 'Authorization: Bearer <metrics-secret>' -H "X-MaidCafe-Signature: <hmac>" -d '{}'
+# expected: 502, the helper refusing with "verb "disable" is not granted"
+
+# Do not run the delete against the port you are connected on.
+```
+
+Without a granted unit, manager or rule there is nothing to act on, so these
+halves are verified by the helper's own tests (`internal/privfs/hostops_test.go`)
+and by the daemon's routing tests against a stand-in helper. Their end-to-end
+check belongs on the same host as the file runbook above, and it is the one
+place where the real tools' own argument handling is exercised.

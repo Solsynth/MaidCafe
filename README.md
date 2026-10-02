@@ -619,26 +619,30 @@ configuration over SSH and restarts the service when needed.
 ### Native host operations
 
 The daemon also executes typed mutations directly — container lifecycle,
-process kill, systemd unit actions and compose project actions — mirroring
-what MaidKit's SSH layer can do, so a managed host can be operated through the
-daemon (locally over HTTP, over the SSH stdio pipe, or remotely through the
-cloud relay) without a workstation SSH session. Unlike script actions, native
-ops never interpolate caller input into a shell: targets are validated against
-the same patterns MaidKit enforces client-side, and commands run directly with
-`exec.CommandContext` (no `sh -c`). Root-owned resources are reached with a
-`sudo -n` retry mirroring the collectors; under the shipped systemd unit's
-`NoNewPrivileges` that retry is inert, so such ops fail with a clear error and
-MaidKit falls back to SSH.
+process kill, systemd unit actions, compose project actions, package
+operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a
+managed host can be operated through the daemon (locally over HTTP, over the
+SSH stdio pipe, or remotely through the cloud relay) without a workstation SSH
+session. Unlike script actions, native ops never interpolate caller input into
+a shell: targets are validated against the same patterns MaidKit enforces
+client-side, and commands run directly with `exec.CommandContext` (no `sh -c`).
+Root-owned resources are reached with a `sudo -n` retry mirroring the
+collectors; under the shipped systemd unit's `NoNewPrivileges` that retry is
+inert, so such ops fail with a clear error and MaidKit falls back to SSH. A
+host that installs the privileged helper can route a family through it instead
+— see [Privileged operations](docs/PRIVILEGED.md).
 
 ```text
 POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove
 POST /api/v1/processes/:pid/kill
 POST /api/v1/systemd/:unit/:action    action = start|stop|restart|reload|enable|disable
 POST /api/v1/compose/:project/:action action = up|stop|restart|pull|recreate
+POST /api/v1/packages/:action         action = refresh|upgrade|install|remove
+POST /api/v1/firewall/:action         action = enable|disable|allow|deny|delete
 ```
 
-All four are authenticated with the metrics secret and a body signature, like
-the actions route. `POST /api/v1/containers/:id/remove` accepts `{"force":
+All are authenticated with the metrics secret and a body signature, like the
+actions route. `POST /api/v1/containers/:id/remove` accepts `{"force":
 true}` (mapped to `rm -f`); `POST /api/v1/compose/:project/:action` requires
 `{"directory": "<absolute path>"}` — compose resolves its file from the
 working directory, so the path must hold the compose file. Container ops
@@ -646,10 +650,30 @@ resolve the runtime with the shared probe (podman first) and fall back to the
 other runtime when the container is not found there. Every run is appended to
 the audit log under its slug (`container.restart`, `process.kill`, …).
 
+The package and firewall routes carry their operands in the body:
+
+```json
+{"name": "nginx"}                                   // install and remove only
+{"port": "443", "protocol": "tcp", "source": "any"} // allow, deny and delete
+{"rule_action": "allow"}                            // delete only
+```
+
+A package name must be the distribution's own name for a package — a `.deb`
+path, a URL, a version pin (`nginx=1.2.3`), an architecture qualifier
+(`nginx:amd64`) and a leading-dash argument are all refused, because each names
+a *source* rather than a package. A firewall rule is a port (a number, a
+`start:end` range or a ufw service name), a protocol (`tcp`, `udp` or `any`)
+and a source (`any`, an address or a CIDR block); `delete` also needs the
+action it is deleting, because ufw identifies a rule by its full text. The
+manager and the backend are not caller-selectable: without the helper they are
+detected from what the host has installed, and with it they come from the
+helper's own grant file.
+
 The slugs are also valid through the cloud relay (`POST
 /api/daemons/:id/webhook-requests` with `name: container.restart` and the
 identity in the body: `{"id": "…"}`, `{"pid": 123}`, `{"unit": "…"}`,
-`{"project": "…", "directory": "…"}`) and over the SSH stdio pipe (request
+`{"project": "…", "directory": "…"}`, `{"name": "nginx"}`, `{"port": "443",
+"protocol": "tcp", "source": "any"}`) and over the SSH stdio pipe (request
 `action` = the slug, same body). They are reported to the cloud on every
 metrics tick, so the cloud page lists them as invocable, and the slugs are
 reserved — a webhook or action may not use one, keeping the relay name space

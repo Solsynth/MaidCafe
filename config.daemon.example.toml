@@ -209,6 +209,18 @@ path = "/srv"
 #   unit = "nginx.service"
 #   verbs = ["restart", "reload"]
 systemd = false
+
+# Route package operations through the helper. Off by default, and on the same
+# terms as systemd: the helper's own [packages] table declares the manager and
+# the verbs, and a refusal from it is an error rather than a fallback to a
+# blanket `sudo -n apt-get` rule. `install` runs a package's maintainer scripts
+# as root, so grant the verbs one at a time.
+packages = false
+
+# Route firewall operations through the helper. Off by default. The helper's
+# own [firewall] table declares the backend and the rules' verbs; a rule is a
+# port, a protocol and a source, never a raw rule or another command.
+firewall = false
 # Allow the mutating operations (write, mkdir, move, copy, delete). Leave off
 # to publish a read-only view of a tree.
 allowWrite = false

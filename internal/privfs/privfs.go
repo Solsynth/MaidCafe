@@ -111,8 +111,10 @@ type UnitGrant struct {
 
 // Set is the loaded profile file.
 type Set struct {
-	byName map[string]*Profile
-	units  map[string]*UnitGrant
+	byName   map[string]*Profile
+	units    map[string]*UnitGrant
+	packages *PackageGrant
+	firewall *FirewallGrant
 }
 
 // systemdUnitPattern is the unit name a grant may name. It matches the daemon's
@@ -149,14 +151,22 @@ func SystemdVerbs() string {
 // environment is one more thing an attacker could influence.
 var systemctlPaths = []string{"/usr/bin/systemctl", "/bin/systemctl"}
 
-// FindSystemctl returns the systemctl binary to run.
-func FindSystemctl() (string, error) {
-	for _, candidate := range systemctlPaths {
+// findExecutable returns the first candidate that exists and is executable.
+// Every external command the helper runs is resolved this way: an absolute
+// path from a fixed list, never a name from PATH, because the helper runs as
+// root and PATH is one more thing a caller could influence.
+func findExecutable(candidates []string, name string) (string, error) {
+	for _, candidate := range candidates {
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("systemctl was not found in %s", strings.Join(systemctlPaths, ", "))
+	return "", fmt.Errorf("%s was not found in %s", name, strings.Join(candidates, ", "))
+}
+
+// FindSystemctl returns the systemctl binary to run.
+func FindSystemctl() (string, error) {
+	return findExecutable(systemctlPaths, "systemctl")
 }
 
 // Options controls loading. RequireRootOwner is the production setting: the
@@ -178,6 +188,17 @@ type fileConfig struct {
 		Unit  string   `mapstructure:"unit"`
 		Verbs []string `mapstructure:"verbs"`
 	} `mapstructure:"systemd"`
+	// Packages and Firewall are pointers so an absent table is distinguishable
+	// from an empty one: an empty table is a mistake to report, an absent one
+	// is a grant that was simply not made.
+	Packages *struct {
+		Manager string   `mapstructure:"manager"`
+		Verbs   []string `mapstructure:"verbs"`
+	} `mapstructure:"packages"`
+	Firewall *struct {
+		Backend string   `mapstructure:"backend"`
+		Verbs   []string `mapstructure:"verbs"`
+	} `mapstructure:"firewall"`
 }
 
 // LoadSet reads and fully validates the profile file. Every rejection here is
@@ -234,8 +255,22 @@ func LoadSet(configPath string, opts Options) (*Set, error) {
 		}
 		set.units[grant.Unit] = grant
 	}
-	if len(set.byName) == 0 && len(set.units) == 0 {
-		return nil, fmt.Errorf("%s declares no profiles and no systemd units", configPath)
+	if parsed.Packages != nil {
+		grant, err := buildPackageGrant(parsed.Packages.Manager, parsed.Packages.Verbs)
+		if err != nil {
+			return nil, fmt.Errorf("packages: %w", err)
+		}
+		set.packages = grant
+	}
+	if parsed.Firewall != nil {
+		grant, err := buildFirewallGrant(parsed.Firewall.Backend, parsed.Firewall.Verbs)
+		if err != nil {
+			return nil, fmt.Errorf("firewall: %w", err)
+		}
+		set.firewall = grant
+	}
+	if len(set.byName) == 0 && len(set.units) == 0 && set.packages == nil && set.firewall == nil {
+		return nil, fmt.Errorf("%s declares no profiles, systemd units, packages or firewall", configPath)
 	}
 	return set, nil
 }
@@ -285,6 +320,12 @@ func (s *Set) GrantedUnits() []string {
 	sort.Strings(units)
 	return units
 }
+
+// Packages returns the package grant, or nil when none was declared.
+func (s *Set) Packages() *PackageGrant { return s.packages }
+
+// Firewall returns the firewall grant, or nil when none was declared.
+func (s *Set) Firewall() *FirewallGrant { return s.firewall }
 
 // CheckVerb reports whether the grant authorizes [verb].
 func (g *UnitGrant) CheckVerb(verb string) error {
@@ -628,7 +669,15 @@ type Entry struct {
 	Verb    string `json:"verb"`
 	Profile string `json:"profile,omitempty"`
 	// Unit is the systemd unit a systemd action targeted.
-	Unit      string `json:"unit,omitempty"`
+	Unit string `json:"unit,omitempty"`
+	// Package and Manager describe a package operation: the name a caller
+	// supplied and the manager the grant declared.
+	Package string `json:"package,omitempty"`
+	Manager string `json:"manager,omitempty"`
+	// Backend and Rule describe a firewall operation: the declared backend and
+	// the rendered rule, so the audit line says which port was opened to whom.
+	Backend   string `json:"backend,omitempty"`
+	Rule      string `json:"rule,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Mode      string `json:"mode,omitempty"`
 	Bytes     int    `json:"bytes,omitempty"`

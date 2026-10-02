@@ -138,7 +138,7 @@ func (a *App) applyReload(cfg config.DaemonConfig) {
 	// The privileged-helper policy is reloadable, so an operator can route
 	// systemd actions through the helper, or stop doing so, without a restart.
 	if a.priv != nil {
-		a.ops.SetPrivilegedPolicy(cfg.Priv.Helper, cfg.Priv.Systemd, a.priv)
+		a.ops.SetPrivilegedPolicy(cfg.Priv, a.priv)
 	}
 	a.runtimes.SetRuntimes(cfg.Runtimes)
 	a.runtimes.SetLimit(cfg.ProcessesLimit)

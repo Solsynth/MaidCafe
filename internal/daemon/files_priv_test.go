@@ -481,7 +481,7 @@ exit 3
 		executor.SetAuditLogger(NewAuditLogger(cfg.AuditPath, nil))
 		runner := &nativeOpRunner{executor: executor, runtimes: func(context.Context) map[string]string { return nil }}
 		runner.SetScriptTimeout(cfg.ScriptTimeout)
-		runner.SetPrivilegedPolicy(helper, systemd, &privRunner{})
+		runner.SetPrivilegedPolicy(config.PrivConfig{Helper: helper, Systemd: systemd}, &privRunner{})
 		return runner
 	}
 
