@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -453,15 +454,46 @@ func parseLogLines(out []byte) []containerLogLine {
 }
 
 // runCommandBounded runs one command with bounded output capture, mirroring
-// runCommand but sized for log tails.
+// runCommand but sized for log tails. Both streams land in one buffer, in
+// arrival order: a runtime's `logs` writes a container's own stderr to its
+// stderr, so a tail that read stdout alone would silently drop every line an
+// application logged to stderr. The captured output is returned even on a
+// non-zero exit, because what the runtime said is the useful part of a failure.
 func runCommandBounded(ctx context.Context, name string, args ...string) ([]byte, error) {
 	execCtx, cancel := context.WithTimeout(ctx, collectorExecTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(execCtx, name, args...)
-	outBuf, errBuf := &limitedBuffer{limit: containerLogTailBytes}, &limitedBuffer{limit: containerLogTailBytes}
-	cmd.Stdout, cmd.Stderr = outBuf, errBuf
-	if err := cmd.Run(); err != nil {
-		return nil, err
+	combined := &combinedBuffer{limit: containerLogTailBytes}
+	cmd.Stdout, cmd.Stderr = combined, combined
+	err := cmd.Run()
+	return []byte(combined.String()), err
+}
+
+// combinedBuffer collects a command's two output streams into one bounded
+// buffer. os/exec writes them from separate goroutines, so the buffer is
+// guarded; the limit bounds a container that logs faster than the daemon
+// reads.
+type combinedBuffer struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *combinedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit > 0 && b.buf.Len() < b.limit {
+		remaining := b.limit - b.buf.Len()
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		_, _ = b.buf.Write(p)
 	}
-	return []byte(outBuf.String()), nil
+	return len(p), nil
+}
+
+func (b *combinedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

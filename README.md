@@ -92,7 +92,10 @@ GET /health
   (`logs --since`) on the logs cadence, appended to per-container JSONL files
   (rotated at 512 KiB, one generation, pruned by `metricsRetentionDays`) and
   pushed to SSE `logs` subscribers; `GET /api/v1/containers/:id/logs` returns
-  the tail window.
+  the tail window, and `?source=runtime` a live tail from the runtime.
+- Per-container detail reads: `GET /api/v1/containers/:id/inspect` (the
+  runtime's inspect payload) and `GET /api/v1/containers/:id/stats` (a
+  normalized resource sample), alongside the container's lifecycle actions.
 - Hot reload: the daemon watches its config file and the action/alarm/job
   fragment directories, `systemctl reload`/SIGHUP re-reads them, and
   `PATCH /api/v1/config` patches a safe subset of `[daemon]` keys — in every
@@ -612,6 +615,36 @@ All four are authenticated with the same metrics secret and cost one
 collection on demand; repeated calls are rate-limited by the shared probe
 cache.
 
+### Container detail
+
+Beyond the list, the daemon answers the per-container questions a panel asks,
+one container at a time. Every one of them resolves its container the same way
+— by full id, id prefix or name, through the daemon's own container snapshot —
+so an unknown container is `404`, a runtime that refuses is `502` with the
+runtime's own message, and a request never has to guess which runtime holds
+what:
+
+- `GET /api/v1/containers/:id/inspect` — the runtime's own inspect payload
+  (`inspect`), passed through unmodified as `{container, name, runtime,
+  inspect}`. It includes the container's environment, so it is served only to a
+  caller holding the daemon credentials.
+- `GET /api/v1/containers/:id/stats` — a one-shot resource sample (`stats
+  --no-stream`), normalized across the two runtimes: `cpu_percent`,
+  `memory_usage_bytes`, `memory_limit_bytes`, `memory_percent`,
+  `network_input_bytes`, `network_output_bytes`, `block_input_bytes`,
+  `block_output_bytes`, `pids`. A measurement the runtime cannot report (a
+  rootless runtime prints `--`) is `null`, never `0`.
+- `GET /api/v1/containers/:id/logs?lines=N` — the tail window, oldest first.
+  `source=captured` (the default) is the daemon's own disk-backed history and
+  survives a container restart; `source=runtime` asks the runtime directly
+  (`logs --tail N --timestamps`), which also answers for a container the daemon
+  never tailed — one whose `logsInterval` is `0`, or one that started a moment
+  ago. Both what an application writes to stdout and what it writes to stderr
+  are included; `lines` is `1..1000`, default `200`.
+
+Like the snapshots, all of these are authenticated with the metrics secret and
+each costs one runtime command.
+
 Webhook secrets are separate from the metrics secret. The daemon does not
 provide an HTTP configuration API; MaidKit updates the managed TOML
 configuration over SSH and restarts the service when needed.
@@ -620,17 +653,17 @@ configuration over SSH and restarts the service when needed.
 
 The daemon also executes typed mutations directly — container lifecycle,
 process kill, systemd unit actions, compose project actions, package
-operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a
-managed host can be operated through the daemon (locally over HTTP, over the
-SSH stdio pipe, or remotely through the cloud relay) without a workstation SSH
-session. Unlike script actions, native ops never interpolate caller input into
-a shell: targets are validated against the same patterns MaidKit enforces
-client-side, and commands run directly with `exec.CommandContext` (no `sh -c`).
-Root-owned resources are reached with a `sudo -n` retry mirroring the
-collectors; under the shipped systemd unit's `NoNewPrivileges` that retry is
-inert, so such ops fail with a clear error and MaidKit falls back to SSH. A
-host that installs the privileged helper can route a family through it instead
-— see [Privileged operations](docs/PRIVILEGED.md).
+operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a managed host can be operated through the daemon (locally over HTTP,
+over the SSH stdio pipe, or remotely through the cloud relay) without a
+workstation SSH session. Unlike script actions, native ops never interpolate
+caller input into a shell: targets are validated against the same patterns
+MaidKit enforces client-side, and commands run directly with
+`exec.CommandContext` (no `sh -c`). Root-owned resources are reached with a
+`sudo -n` retry mirroring the collectors; under the shipped systemd unit's
+`NoNewPrivileges` that retry is inert, so such ops fail with a clear error and
+MaidKit falls back to SSH. A host that installs the privileged helper can route
+a family through it instead — see
+[Privileged operations](docs/PRIVILEGED.md).
 
 ```text
 POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove
@@ -710,7 +743,9 @@ notifyOnFailure = true
 - The daemon tails every running container on `daemon.logsInterval` (default
   `30s`, `0` disables) with `<runtime> logs --since <cursor> --timestamps <id>`
   (initial run backfills the last 200 lines), reusing the runtime probe and
-  `sudo -n` retry. New lines are:
+  `sudo -n` retry. Both streams are captured: a runtime's `logs` writes what an
+  application logged to stderr to its own stderr, so a tail that read only
+  stdout would drop every line such an application wrote. New lines are:
 
 - appended to per-container JSONL files under `daemon.logsDir` (default
   `/var/lib/maidcafe/logs`), rotated at 512 KiB with one generation and
@@ -718,7 +753,9 @@ notifyOnFailure = true
 - pushed to SSE `logs` subscribers as `{"container": "<id>", "lines":
   [{"ts": ..., "line": ...}]}` frames;
 - served by `GET /api/v1/containers/:id/logs?lines=N` (1–1000, default 200)
-  as the tail window, oldest first;
+  as the tail window, oldest first. `?source=runtime` answers with a live
+  `logs --tail N` read from the runtime instead — the same shape, with
+  `source` naming which one answered;
 - uploaded to the cloud only when `logsUploadEnabled = true`, batched every
   `logsUploadInterval` (default `30s`) up to `logsUploadBatchLines` (default
   100), through the daemon-secret endpoint `POST

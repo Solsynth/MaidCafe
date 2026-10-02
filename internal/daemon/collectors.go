@@ -270,6 +270,13 @@ func (c *ContainersCollector) marshal() ([]byte, error) {
 	return json.Marshal(containersPayload{Runtimes: []containersRuntimePayload{}})
 }
 
+// runtimePaths exposes the shared runtime probe's name -> binary path map, so
+// the detail reads and the update checker address the very runtime the
+// container list came from instead of probing the host again.
+func (c *ContainersCollector) runtimePaths(ctx context.Context) map[string]string {
+	return c.probe.probePathSnapshot(ctx)
+}
+
 // isPodmanDockerShim reports whether the docker binary at path is really
 // podman: distro podman-docker shims answer `--version` with podman's own
 // version string, while a real docker reports "Docker version ...".

@@ -307,6 +307,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		}
 		c.Data(http.StatusOK, "application/json; charset=utf-8", data)
 	})
+	// Per-container detail: inspect, stats and a live log tail, plus the
+	// published-image comparison the update badge is built from. The list stays
+	// the cheap view; these cost a runtime command and are asked for one
+	// container at a time.
+	router.GET("/api/v1/containers/:id/inspect", authorizeMetrics, app.handleContainerInspect)
+	router.GET("/api/v1/containers/:id/stats", authorizeMetrics, app.handleContainerStats)
 	// One-shot database health snapshot (same payload as the
 	// `databaseMetrics` SSE event).
 	router.GET("/api/v1/database-metrics", authorizeMetrics, func(c *gin.Context) {
@@ -516,19 +522,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	mountFile(app.handleFileCopy, "/api/v1/files/copy", http.MethodPost, http.MethodPut)
 	mountFile(app.handleFileDelete, "/api/v1/files/delete", http.MethodPost, http.MethodDelete)
 	// Captured container logs (disk-backed, pruned by retention): the tail
-	// window for one container, oldest first.
-	router.GET("/api/v1/containers/:id/logs", authorizeMetrics, func(c *gin.Context) {
-		lines := 200
-		if raw := strings.TrimSpace(c.Query("lines")); raw != "" {
-			parsed, parseErr := strconv.Atoi(raw)
-			if parseErr != nil || parsed < 1 || parsed > containerLogRingLines {
-				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": fmt.Sprintf("lines must be between 1 and %d", containerLogRingLines)})
-				return
-			}
-			lines = parsed
-		}
-		c.JSON(http.StatusOK, gin.H{"container": c.Param("id"), "lines": app.logs.store.Snapshot(c.Param("id"), lines)})
-	})
+	// window for one container, oldest first. `?source=runtime` asks the
+	// runtime for a live tail instead.
+	router.GET("/api/v1/containers/:id/logs", authorizeMetrics, app.handleContainerLogs)
 	router.GET("/api/v1/audit", authorizeMetrics, func(c *gin.Context) {
 		limit := 50
 		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
