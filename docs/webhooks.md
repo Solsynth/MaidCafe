@@ -13,11 +13,11 @@ namespace — names must be unique across both kinds — and run through the sam
 executor. A name matches `[A-Za-z0-9._-]+` and the command path is absolute.
 
 Beyond configured hooks, the daemon also executes **native operations**
-(container lifecycle, process kill, systemd unit actions, compose project
-actions, package operations, firewall rules) directly, with the same transport
-channels — see the "Native host operations" section of the README. Their slugs
-(`container.restart`, `process.kill`, …) are reserved and cannot be used for
-webhook or action names.
+(container lifecycle and image updates, process kill, systemd unit actions,
+compose project actions, package operations, firewall rules) directly, with the
+same transport channels — see the "Native host operations" section of the
+README. Their slugs (`container.restart`, `container.update`, `process.kill`,
+…) are reserved and cannot be used for webhook or action names.
 
 There are two ways to invoke a hook:
 

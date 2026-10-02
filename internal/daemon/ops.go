@@ -31,10 +31,10 @@ import (
 // under the shipped systemd unit's NoNewPrivileges that retry is inert, so
 // such ops fail with a clear error and MaidKit falls back to SSH.
 
-// composeOpTimeout bounds compose actions, which are slow by nature (pulls,
-// recreates). The daemon-wide scriptTimeout stays the default for the other
-// native ops.
-const composeOpTimeout = 5 * time.Minute
+// slowOpTimeout bounds the native operations that are slow by nature — compose
+// pulls and recreates, and image pulls. The daemon-wide scriptTimeout stays
+// the default for everything else.
+const slowOpTimeout = 5 * time.Minute
 
 // Native op validation patterns, kept identical to the MaidKit client so both
 // channels accept exactly the same targets.
@@ -90,6 +90,8 @@ var nativeOpDisplayNames = map[string]string{
 	"container.unpause": "Unpause container",
 	"container.kill":    "Kill container",
 	"container.remove":  "Remove container",
+	"container.pull":    "Pull container image",
+	"container.update":  "Update container",
 	"process.kill":      "Kill process",
 	"systemd.start":     "Start systemd unit",
 	"systemd.stop":      "Stop systemd unit",
@@ -203,6 +205,16 @@ type opAttempt struct {
 	// waits on a terminal that is not there, and the op hangs until it times
 	// out with nothing to show for it.
 	env []string
+}
+
+// opStage is one step of a native operation: the alternative attempts that
+// accomplish it (the direct call, its `sudo -n` variant, the alternate
+// runtime). Most operations are one stage; `container.update` is two — pull
+// the image, then recreate the container on it — because the second step is
+// only meaningful once the first has succeeded, which is a different relation
+// from the alternatives within a stage.
+type opStage struct {
+	attempts []opAttempt
 }
 
 // nativeOpRunner executes native operations through the executor's
@@ -357,12 +369,66 @@ func (r *nativeOpRunner) dispatch(
 	invokedBy string,
 ) (executionResponse, int, *requestError) {
 	var attempts []opAttempt
+	// stages carries an operation's steps. Single-stage operations fill
+	// [attempts] and are wrapped below; a multi-stage operation (an update:
+	// pull, then recreate) appends its stages here and leaves attempts empty.
+	var stages []opStage
 	targetLabel := ""
 	timeout := time.Duration(r.scriptTimeout.Load())
 	bad := func(message string) (executionResponse, int, *requestError) {
 		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: message}
 	}
+	failed := func(err error) (executionResponse, int, *requestError) {
+		return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: err.Error()}
+	}
 	switch {
+	case slug == "container.pull" || slug == "container.update":
+		// Both need the container's own configuration, so they resolve it
+		// first — which runtime holds it, what image it was created from, and
+		// its compose identity — and are refused when that answer is missing
+		// rather than attempted blindly.
+		if !nativeContainerRefPattern.MatchString(params.target) {
+			return bad("invalid container reference")
+		}
+		targetLabel = params.target
+		if timeout < slowOpTimeout {
+			timeout = slowOpTimeout
+		}
+		resolved, err := resolveOpContainer(ctx, r.runtimes(ctx), params.target)
+		if err != nil {
+			return failed(err)
+		}
+		// The reference is validated but not rewritten: `podman pull <ref>` has
+		// to resolve a short name exactly as the container's own creation did,
+		// which is the host's registry configuration's decision, not the
+		// daemon's. (The update *check* uses the registry the image was actually
+		// pulled from, which its digest records.)
+		if _, err := parseImageReference(resolved.ImageRef); err != nil {
+			return bad("container image reference is unusable: " + err.Error())
+		}
+		if slug == "container.pull" {
+			// A pull is about the image, not the container it was read from.
+			targetLabel = resolved.ImageRef
+			attempts = r.runtimePullAttempts(resolved.Path, resolved.ImageRef)
+			break
+		}
+		compose, err := composeUpdateTargetFromLabels(resolved.Labels)
+		if err != nil {
+			// Docker cannot recreate a plain `docker run` container from its own
+			// configuration, and replaying inspect into a `run` argv would
+			// silently drop whatever the daemon does not model — a container
+			// that comes back missing a device, a sysctl or a network alias is
+			// worse than one that was not touched. A container whose lifecycle
+			// is declared in compose is recreated by compose, which is the
+			// runtime's own answer to this and needs no reconstruction.
+			return bad(fmt.Sprintf(
+				"%s (runtime %s); the daemon recreates only compose-managed containers — pull the image with container.pull and recreate this one on the host",
+				err.Error(), resolved.Runtime))
+		}
+		stages = append(stages,
+			opStage{attempts: r.composeAttempts(resolved.Path, compose, "pull", compose.Service)},
+			opStage{attempts: r.composeAttempts(resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
+		)
 	case strings.HasPrefix(slug, "container."):
 		verb := strings.TrimPrefix(slug, "container.")
 		cliVerb, known := nativeContainerVerbs[verb]
@@ -512,8 +578,8 @@ func (r *nativeOpRunner) dispatch(
 			return bad("invalid compose project or directory")
 		}
 		targetLabel = params.target
-		if timeout < composeOpTimeout {
-			timeout = composeOpTimeout
+		if timeout < slowOpTimeout {
+			timeout = slowOpTimeout
 		}
 		for _, runtime := range []string{"podman", "docker"} {
 			path, ok := r.runtimes(ctx)[runtime]
@@ -529,11 +595,176 @@ func (r *nativeOpRunner) dispatch(
 	default:
 		return bad("unknown operation")
 	}
-	if len(attempts) == 0 {
-		return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: "no container runtime available"}
+	if len(stages) == 0 {
+		if len(attempts) == 0 {
+			return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: "no container runtime available"}
+		}
+		stages = []opStage{{attempts: attempts}}
 	}
-	response, status := r.executeNative(ctx, slug, nativeOpDisplayNames[slug], targetLabel, attempts, timeout, source, invokedBy)
+	response, status := r.executeNative(ctx, slug, nativeOpDisplayNames[slug], targetLabel, stages, timeout, source, invokedBy)
 	return response, status, nil
+}
+
+// resolveOpContainer finds [target] on one of the probed runtimes (podman
+// first) and reads its inspect payload. A container that no runtime has is
+// reported as such: pulling the wrong image, or recreating the wrong
+// container, is worse than a clear error.
+func resolveOpContainer(ctx context.Context, runtimes map[string]string, target string) (opContainerResolution, error) {
+	var lastErr error
+	for _, runtime := range []string{"podman", "docker"} {
+		path, ok := runtimes[runtime]
+		if !ok {
+			continue
+		}
+		info, err := inspectContainer(ctx, path, target)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if info.ImageRef == "" {
+			// A container created from an image ID carries no reference, so
+			// there is nothing to pull and nothing to compare against.
+			return opContainerResolution{}, fmt.Errorf("container %s records no image reference", target)
+		}
+		return opContainerResolution{
+			Runtime: runtime, Path: path, ImageRef: info.ImageRef, Labels: info.Labels,
+		}, nil
+	}
+	if lastErr != nil {
+		return opContainerResolution{}, fmt.Errorf("resolve container %s: %w", target, lastErr)
+	}
+	return opContainerResolution{}, fmt.Errorf("no container runtime available")
+}
+
+// opContainerResolution is what a pull or an update needs to know about the
+// container it was asked for.
+type opContainerResolution struct {
+	Runtime  string
+	Path     string
+	ImageRef string
+	Labels   map[string]string
+}
+
+// composeUpdateTarget is the compose identity a container's labels declare.
+type composeUpdateTarget struct {
+	Project   string
+	Service   string
+	Directory string
+	Files     []string
+}
+
+// composeUpdateTargetFromLabels reads the compose identity out of a
+// container's labels. docker compose records the project, service, working
+// directory and config files; podman compose records the same facts under its
+// own label prefix. Everything is validated before it reaches an argv: these
+// values come from the host's own container configuration, and a `compose up`
+// in a directory of the labels' choosing is exactly the interpolation this
+// package refuses to do.
+func composeUpdateTargetFromLabels(labels map[string]string) (composeUpdateTarget, error) {
+	target := composeUpdateTarget{
+		Project:   composeLabel(labels, "project"),
+		Service:   composeLabel(labels, "service"),
+		Directory: composeLabel(labels, "project.working_dir"),
+	}
+	for _, file := range strings.Split(composeLabel(labels, "project.config_files"), ",") {
+		if file = strings.TrimSpace(file); file != "" {
+			target.Files = append(target.Files, file)
+		}
+	}
+	if target.Project == "" || target.Service == "" {
+		return composeUpdateTarget{}, fmt.Errorf("the container is not compose-managed")
+	}
+	if !nativeProjectPattern.MatchString(target.Project) || !nativeProjectPattern.MatchString(target.Service) {
+		return composeUpdateTarget{}, fmt.Errorf("the container's compose labels name an invalid project or service")
+	}
+	if !validNativeDirectory(target.Directory) {
+		return composeUpdateTarget{}, fmt.Errorf("the container's compose labels record no usable working directory")
+	}
+	for _, file := range target.Files {
+		if !validNativeDirectory(file) {
+			return composeUpdateTarget{}, fmt.Errorf("the container's compose labels record an invalid compose file path")
+		}
+	}
+	return target, nil
+}
+
+// composeLabel reads one compose fact, accepting either runtime's prefix.
+func composeLabel(labels map[string]string, key string) string {
+	for _, prefix := range []string{"com.docker.compose.", "io.podman.compose."} {
+		if value := strings.TrimSpace(labels[prefix+key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// composeAttempts builds one compose step for [target] against the runtime that
+// holds the container, with the same `sudo -n` variant every native operation
+// carries. The compose file list comes from the container's own labels when
+// they record it, so the step reads the same file the container was created
+// from even when the project directory holds several.
+func (r *nativeOpRunner) composeAttempts(path string, target composeUpdateTarget, args ...string) []opAttempt {
+	base := []string{"compose", "--ansi", "never", "-p", target.Project}
+	for _, file := range target.Files {
+		base = append(base, "-f", file)
+	}
+	base = append(base, args...)
+	attempts := []opAttempt{{command: path, args: base, cwd: target.Directory}}
+	if sudo := r.sudoAttempt(); sudo != nil {
+		attempts = append(attempts, opAttempt{
+			command: sudo[0], args: append(sudo[1:], append([]string{path}, base...)...), cwd: target.Directory,
+		})
+	}
+	return attempts
+}
+
+// runtimePullAttempts builds the pull for [imageRef] on the runtime that holds
+// the container. Only that runtime is asked: the image has to land in the store
+// the container runs from, so the alternate runtime would be the wrong answer,
+// not a fallback.
+func (r *nativeOpRunner) runtimePullAttempts(path, imageRef string) []opAttempt {
+	args := []string{"pull", imageRef}
+	attempts := []opAttempt{{command: path, args: args}}
+	if sudo := r.sudoAttempt(); sudo != nil {
+		attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, args...)...)})
+	}
+	return attempts
+}
+
+// runStage runs one stage's alternative attempts in order and returns the
+// first that succeeds. A stage where every attempt failed reports the first
+// attempt's output and exit code: the `sudo -n` or alternate-runtime variant is
+// an implementation detail, so the direct attempt's message is the one an
+// operator should see.
+func runStage(ctx context.Context, attempts []opAttempt) (string, string, int, error) {
+	var stdout, stderr string
+	var exitCode int
+	var primaryErr error
+	for _, attempt := range attempts {
+		attemptStdout, attemptStderr, attemptExit, err := runOpOnce(ctx, attempt)
+		if err == nil {
+			return attemptStdout, attemptStderr, 0, nil
+		}
+		if primaryErr == nil {
+			primaryErr = err
+			stdout, stderr, exitCode = attemptStdout, attemptStderr, attemptExit
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			break
+		}
+	}
+	return stdout, stderr, exitCode, primaryErr
+}
+
+// appendStageOutput joins one stage's output onto what earlier stages produced.
+func appendStageOutput(builder *strings.Builder, next string) {
+	if next == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n")
+	}
+	builder.WriteString(next)
 }
 
 // sudoAttempt returns the sudo -n prefix when the daemon is not root and
@@ -574,17 +805,20 @@ func validNativeDirectory(value string) bool {
 	return value != "" && !strings.Contains(value, "..") && nativeDirectoryPattern.MatchString(value)
 }
 
-// executeNative runs [attempts] in order under one concurrency slot and one
+// executeNative runs [stages] in order under one concurrency slot and one
 // timeout budget, recording a single audit entry and updating the execution
-// counters. A failed attempt retries with the next (e.g. the sudo or
-// alternate-runtime variant); the first attempt's failure stays the primary
-// signal when every attempt fails, mirroring the collectors.
+// counters. Within a stage a failed attempt retries with the next (the sudo or
+// alternate-runtime variant), and the first attempt's failure stays the primary
+// signal when every one fails, mirroring the collectors; a stage that fails
+// ends the operation, because a later stage depends on it. A multi-stage
+// operation reports every stage's output, since what was downloaded and what
+// was recreated are both worth showing.
 func (r *nativeOpRunner) executeNative(
 	ctx context.Context,
 	slug string,
 	displayName string,
 	target string,
-	attempts []opAttempt,
+	stages []opStage,
 	timeout time.Duration,
 	source string,
 	invokedBy string,
@@ -596,8 +830,8 @@ func (r *nativeOpRunner) executeNative(
 		return executionResponse{Name: slug}, http.StatusTooManyRequests
 	}
 	started := time.Now()
-	// A zero timeout disables the deadline; compose ops keep their explicit
-	// 5m bound so they never run unbounded.
+	// A zero timeout disables the deadline; compose and image operations keep
+	// their explicit 5m bound so they never run unbounded.
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout <= 0 {
@@ -606,36 +840,25 @@ func (r *nativeOpRunner) executeNative(
 		runCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	var response executionResponse
-	response.Name = slug
-	var primaryErr error
-	var primaryStdout, primaryStderr string
-	for _, attempt := range attempts {
-		stdout, stderr, exitCode, err := runOpOnce(runCtx, attempt)
-		if err == nil {
-			response.OK = true
-			response.ExitCode = 0
-			response.Stdout = stdout
-			response.Stderr = stderr
-			// A later attempt succeeded; the earlier failure is irrelevant.
-			primaryErr = nil
-			break
-		}
-		if primaryErr == nil {
-			primaryErr = err
-			primaryStdout = stdout
-			primaryStderr = stderr
+	response := executionResponse{Name: slug}
+	var stdout, stderr strings.Builder
+	var failure error
+	for _, stage := range stages {
+		stageStdout, stageStderr, exitCode, err := runStage(runCtx, stage.attempts)
+		appendStageOutput(&stdout, stageStdout)
+		appendStageOutput(&stderr, stageStderr)
+		if err != nil {
+			failure = err
 			response.ExitCode = exitCode
-		}
-		if runCtx.Err() == context.DeadlineExceeded {
 			break
 		}
 	}
-	if primaryErr != nil {
-		response.OK = false
-		response.Stdout = primaryStdout
-		response.Stderr = primaryStderr
+	response.OK = failure == nil
+	if failure == nil {
+		response.ExitCode = 0
 	}
+	response.Stdout = stdout.String()
+	response.Stderr = stderr.String()
 	duration := time.Since(started)
 	if r.executor.audit != nil {
 		r.executor.audit.Record(auditEntry{
@@ -653,7 +876,7 @@ func (r *nativeOpRunner) executeNative(
 		})
 	}
 	status := http.StatusOK
-	if primaryErr != nil {
+	if failure != nil {
 		r.executor.counts.failures.Add(1)
 		status = http.StatusBadGateway
 		if runCtx.Err() == context.DeadlineExceeded {
@@ -662,7 +885,7 @@ func (r *nativeOpRunner) executeNative(
 	} else {
 		r.executor.counts.successes.Add(1)
 	}
-	if primaryErr != nil && source != "job" {
+	if failure != nil && source != "job" {
 		r.publishFailure(slug, displayName, target, response, source, invokedBy, duration)
 	}
 	return response, status

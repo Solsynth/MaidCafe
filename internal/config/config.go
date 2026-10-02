@@ -738,13 +738,15 @@ func validatePriv(cfg PrivConfig, files FilesConfig) error {
 }
 
 // NativeOpNames lists the built-in operations the daemon executes natively
-// (container lifecycle, process kill, systemd unit actions, compose project
-// actions, package operations, firewall rules). These slugs are reserved: webhooks and actions may not reuse
-// them, so the cloud relay — which dispatches by name — stays unambiguous
-// and credential action-name scopes mean the same thing for both kinds.
+// (container lifecycle and image updates, process kill, systemd unit actions,
+// compose project actions, package operations, firewall rules). These slugs are
+// reserved: webhooks and actions may not reuse them, so the cloud relay — which
+// dispatches by name — stays unambiguous and credential action-name scopes mean
+// the same thing for both kinds.
 var NativeOpNames = []string{
 	"container.start", "container.stop", "container.restart",
 	"container.pause", "container.unpause", "container.kill", "container.remove",
+	"container.pull", "container.update",
 	"process.kill",
 	"systemd.start", "systemd.stop", "systemd.restart", "systemd.reload",
 	"systemd.enable", "systemd.disable",

@@ -99,7 +99,8 @@ GET /health
 - Container update checks: on `updateCheckInterval` the daemon compares each
   container's pulled digest with the one its registry publishes for the tag, so
   `GET /api/v1/updates` answers "is this container outdated?" without pulling
-  anything.
+  anything. `container.pull` fetches the container's image and
+  `container.update` recreates a compose-managed container on it.
 - Hot reload: the daemon watches its config file and the action/alarm/job
   fragment directories, `systemctl reload`/SIGHUP re-reads them, and
   `PATCH /api/v1/config` patches a safe subset of `[daemon]` keys — in every
@@ -704,10 +705,11 @@ configuration over SSH and restarts the service when needed.
 
 ### Native host operations
 
-The daemon also executes typed mutations directly — container lifecycle,
-process kill, systemd unit actions, compose project actions, package
-operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a
-managed host can be operated through the daemon (locally over HTTP, over the SSH stdio pipe, or remotely through the cloud relay) without a
+The daemon also executes typed mutations directly — container lifecycle and
+image updates, process kill, systemd unit actions, compose project actions,
+package operations and firewall rules — mirroring what MaidKit's SSH layer can
+do, so a managed host can be operated through the daemon (locally over HTTP,
+over the SSH stdio pipe, or remotely through the cloud relay) without a
 workstation SSH session. Unlike script actions, native ops never interpolate
 caller input into a shell: targets are validated against the same patterns
 MaidKit enforces client-side, and commands run directly with
@@ -719,7 +721,7 @@ a family through it instead — see
 [Privileged operations](docs/PRIVILEGED.md).
 
 ```text
-POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove
+POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove|pull|update
 POST /api/v1/processes/:pid/kill
 POST /api/v1/systemd/:unit/:action    action = start|stop|restart|reload|enable|disable
 POST /api/v1/compose/:project/:action action = up|stop|restart|pull|recreate
@@ -735,6 +737,42 @@ working directory, so the path must hold the compose file. Container ops
 resolve the runtime with the shared probe (podman first) and fall back to the
 other runtime when the container is not found there. Every run is appended to
 the audit log under its slug (`container.restart`, `process.kill`, …).
+
+#### Updating a container
+
+`container.pull` and `container.update` are the quick actions behind the update
+badge. Both read the container's own configuration first — which runtime holds
+it, and the image reference it was created from — instead of taking an image
+name from the caller, and a pull is passed to the runtime exactly as the
+container records it, so a short name resolves through the host's registry
+configuration the same way the container's creation did.
+
+- `container.pull` runs `pull <reference>` on the runtime that holds the
+  container, with the usual `sudo -n` variant. That is the whole operation: it
+  makes the newest image available locally without touching what is running.
+- `container.update` is a two-step operation: pull the service's image, then
+  recreate the container so it runs that image. Both steps report their output.
+  It only handles **compose-managed** containers, whose identity comes from
+  their labels (`com.docker.compose.*`, or podman compose's
+  `io.podman.compose.*`): the step is
+  `compose -p <project> [-f <file>…] pull <service>` followed by
+  `compose … up -d --force-recreate <service>`, run in the project directory the
+  labels record, with every label value validated before it reaches an argv.
+  `--force-recreate` is deliberate: the caller asked for the update, so the
+  container must end up on the pulled image even when compose cannot tell the
+  image changed.
+- A container that is not compose-managed is refused (`400`) with the reason.
+  Neither runtime can recreate a plain `docker run` container from its own
+  configuration, and replaying `inspect` into a `run` argv silently drops
+  whatever the daemon does not model — a container that comes back missing a
+  device, a sysctl or a network alias is worse than one that was not touched.
+  `container.pull` still works for those: pull, then recreate it where its
+  lifecycle is declared.
+
+Both run under the executor's concurrency slot and audit trail like every other
+native op, with a 5 minute bound (a pull is slow by nature), so they are also
+available as scheduled jobs and through the cloud relay:
+`name: container.update` with `{"id": "web"}` in the body.
 
 The package and firewall routes carry their operands in the body:
 

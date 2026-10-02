@@ -366,3 +366,115 @@ func TestNativeOpFailurePublishesNativeChannel(t *testing.T) {
 		t.Fatalf("expected still 1 notification, got %d", len(notifications))
 	}
 }
+
+func TestContainerPullOpResolvesImageAndPulls(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_RUNTIME_CALLS", calls)
+	path := fakeRuntimeBinary(t, fakeRuntimeScript(composeLabels(t.TempDir())))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "container.pull", opParams{target: "web"}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusOK || !response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	got := strings.Join(recordedRuntimeCalls(t, calls), "|")
+	// The container's own reference is used as-is: the runtime resolves a short
+	// name through the host's registry configuration, and so must a pull.
+	if got != "pull|docker.io/library/nginx:1.25" {
+		t.Fatalf("recorded calls = %q, want the container's own image reference", got)
+	}
+}
+
+func TestContainerUpdateOpRecreatesComposeContainer(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_RUNTIME_CALLS", calls)
+	workingDir := t.TempDir()
+	path := fakeRuntimeBinary(t, fakeRuntimeScript(composeLabels(workingDir)))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "container.update", opParams{target: "web"}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusOK || !response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	file := filepath.Join(workingDir, "compose.yml")
+	got := strings.Join(recordedRuntimeCalls(t, calls), "|")
+	want := strings.Join([]string{
+		"cwd=" + workingDir,
+		strings.Join([]string{"compose", "--ansi", "never", "-p", "app", "-f", file, "pull", "web"}, "|"),
+		"cwd=" + workingDir,
+		strings.Join([]string{"compose", "--ansi", "never", "-p", "app", "-f", file, "up", "-d", "--force-recreate", "web"}, "|"),
+	}, "|")
+	if got != want {
+		t.Fatalf("recorded calls =\n%s\nwant\n%s", got, want)
+	}
+	// Both stages report their output: the pull and the recreate each ran.
+	if strings.Count(response.Stdout, "Composed") != 2 {
+		t.Fatalf("update output = %q, want both stages", response.Stdout)
+	}
+}
+
+func TestContainerUpdateOpRefusesUnmanagedContainer(t *testing.T) {
+	path := fakeRuntimeBinary(t, fakeRuntimeScript(`{}`))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	_, _, requestErr := runner.dispatch(
+		context.Background(), "container.update", opParams{target: "web"}, "test", "tester",
+	)
+	if requestErr == nil || requestErr.status != http.StatusBadRequest {
+		t.Fatalf("unmanaged update = %+v, want 400", requestErr)
+	}
+	if !strings.Contains(requestErr.message, "not compose-managed") {
+		t.Fatalf("message = %q", requestErr.message)
+	}
+}
+
+func TestContainerUpdateOpRefusesWithoutWorkingDirectory(t *testing.T) {
+	labels := `{"com.docker.compose.project":"app","com.docker.compose.service":"web"}`
+	path := fakeRuntimeBinary(t, fakeRuntimeScript(labels))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	_, _, requestErr := runner.dispatch(
+		context.Background(), "container.update", opParams{target: "web"}, "test", "tester",
+	)
+	if requestErr == nil || requestErr.status != http.StatusBadRequest {
+		t.Fatalf("update without a working directory = %+v, want 400", requestErr)
+	}
+	if !strings.Contains(requestErr.message, "working directory") {
+		t.Fatalf("message = %q", requestErr.message)
+	}
+}
+
+func TestContainerPullOpReportsUnresolvableContainer(t *testing.T) {
+	// A runtime that refuses every inspect: the operation must fail instead of
+	// pulling an image the daemon could not identify.
+	path := fakeRuntimeBinary(t, "#!/bin/sh\necho 'Error: no such container' >&2\nexit 125\n")
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	_, _, requestErr := runner.dispatch(
+		context.Background(), "container.pull", opParams{target: "web"}, "test", "tester",
+	)
+	if requestErr == nil || requestErr.status != http.StatusBadGateway {
+		t.Fatalf("unresolvable pull = %+v, want 502", requestErr)
+	}
+	if !strings.Contains(requestErr.message, "no such container") {
+		t.Fatalf("message = %q, want the runtime's own words", requestErr.message)
+	}
+}
+
+func TestContainerPullOpRejectsInvalidReference(t *testing.T) {
+	path := fakeRuntimeBinary(t, fakeRuntimeScript(composeLabels(t.TempDir())))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	for _, target := range []string{"-rf", "bad id", ""} {
+		_, _, requestErr := runner.dispatch(
+			context.Background(), "container.pull", opParams{target: target}, "test", "tester",
+		)
+		if requestErr == nil || requestErr.status != http.StatusBadRequest {
+			t.Fatalf("target %q = %+v, want 400", target, requestErr)
+		}
+	}
+}
