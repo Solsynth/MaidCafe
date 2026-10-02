@@ -19,6 +19,13 @@ jobsDir = "/etc/maidcafe/jobs"
 # metricsRetentionDays). 0 disables log tracking.
 logsDir = "/var/lib/maidcafe/logs"
 logsInterval = "30s"
+# Cadence at which the daemon compares every container's image against its
+# registry, so GET /api/v1/updates can answer "is this container outdated?"
+# without a client waiting on a registry. It reads manifest metadata only — it
+# never pulls — and reaches registries over HTTPS with the daemon account's own
+# runtime credential when one is stored. 0 disables the cadence; an on-demand
+# check for one container still works.
+updateCheckInterval = "6h"
 # Upload is opt-in because logs may contain credentials or user data. The
 # daemon batches lines and sends them to POST /api/daemons/:id/logs.
 logsUploadEnabled = false

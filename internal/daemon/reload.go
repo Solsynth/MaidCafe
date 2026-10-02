@@ -45,15 +45,16 @@ type reloadableConfig struct {
 }
 
 type reloadableIntervals struct {
-	metrics    time.Duration
-	stream     time.Duration
-	containers time.Duration
-	images     time.Duration
-	processes  time.Duration
-	systemd    time.Duration
-	runtimes   time.Duration
-	database   time.Duration
-	logs       time.Duration
+	metrics     time.Duration
+	stream      time.Duration
+	containers  time.Duration
+	images      time.Duration
+	processes   time.Duration
+	systemd     time.Duration
+	runtimes    time.Duration
+	database    time.Duration
+	logs        time.Duration
+	updateCheck time.Duration
 }
 
 func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
@@ -85,15 +86,16 @@ func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
 		files:                cfg.Files,
 		priv:                 cfg.Priv,
 		intervals: reloadableIntervals{
-			metrics:    cfg.MetricsInterval,
-			stream:     cfg.StreamInterval,
-			containers: cfg.ContainersInterval,
-			images:     cfg.ImagesInterval,
-			processes:  cfg.ProcessesInterval,
-			systemd:    cfg.SystemdInterval,
-			runtimes:   cfg.RuntimesInterval,
-			database:   cfg.DatabaseMetricsInterval,
-			logs:       cfg.LogsInterval,
+			metrics:     cfg.MetricsInterval,
+			stream:      cfg.StreamInterval,
+			containers:  cfg.ContainersInterval,
+			images:      cfg.ImagesInterval,
+			processes:   cfg.ProcessesInterval,
+			systemd:     cfg.SystemdInterval,
+			runtimes:    cfg.RuntimesInterval,
+			database:    cfg.DatabaseMetricsInterval,
+			logs:        cfg.LogsInterval,
+			updateCheck: cfg.UpdateCheckInterval,
 		},
 	}
 }

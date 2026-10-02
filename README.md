@@ -96,6 +96,10 @@ GET /health
 - Per-container detail reads: `GET /api/v1/containers/:id/inspect` (the
   runtime's inspect payload) and `GET /api/v1/containers/:id/stats` (a
   normalized resource sample), alongside the container's lifecycle actions.
+- Container update checks: on `updateCheckInterval` the daemon compares each
+  container's pulled digest with the one its registry publishes for the tag, so
+  `GET /api/v1/updates` answers "is this container outdated?" without pulling
+  anything.
 - Hot reload: the daemon watches its config file and the action/alarm/job
   fragment directories, `systemctl reload`/SIGHUP re-reads them, and
   `PATCH /api/v1/config` patches a safe subset of `[daemon]` keys — in every
@@ -641,9 +645,58 @@ what:
   never tailed — one whose `logsInterval` is `0`, or one that started a moment
   ago. Both what an application writes to stdout and what it writes to stderr
   are included; `lines` is `1..1000`, default `200`.
+- `GET /api/v1/containers/:id/update-check` — whether the image's registry
+  publishes something newer than this container runs, checking now when the
+  cached answer is older than a minute.
+- `GET /api/v1/updates` — every cached update answer in one request, with
+  `interval_seconds` (the cadence they are refreshed on) and no registry
+  traffic at all.
 
 Like the snapshots, all of these are authenticated with the metrics secret and
-each costs one runtime command.
+each costs one runtime command (the update check costs a registry request too).
+
+#### Update checks
+
+A container's update status is the comparison of two digests: the one the
+runtime recorded when it pulled the image, and the one the image's registry
+publishes for that tag right now.
+
+```json
+{
+  "container": "abcdef…", "name": "web", "runtime": "podman",
+  "image": "docker.io/library/nginx:1.25",
+  "checked_at": "2024-05-01T10:00:00Z",
+  "outdated": true,
+  "pinned": false,
+  "restart_required": false,
+  "local_digest": "sha256:aaaa…", "remote_digest": "sha256:bbbb…"
+}
+```
+
+- `outdated` is `null` when the question cannot be answered, and `error` says
+  why (an unreachable registry, a private repository read anonymously, an image
+  that was built or imported on the host and so has no registry digest). A
+  blank badge is honest; a wrong "up to date" is not.
+- `pinned` marks a container created from a digest-pinned reference, which is
+  never outdated — the digest is what the operator asked for.
+- `restart_required` marks a container that is already behind the image the
+  local store holds, so recreating it applies an image that is already there.
+- A local platform digest that is still a member of the tag's multi-platform
+  index counts as current: the tag gained another platform, not a new image for
+  this host.
+- Checks read manifest metadata over HTTPS from the Docker Registry HTTP API
+  v2 (`/v2/<repository>/manifests/<tag>`), following the registry's bearer
+  challenge, and use the daemon account's own `docker`/`containers` auth file
+  when it holds a credential for that registry. Nothing is pulled, nothing is
+  written to the image store, and no credential is ever sent in the clear: a
+  plain-HTTP registry is reported as an error rather than dialled, and the
+  token endpoint the registry names has to use the same scheme as the registry
+  itself.
+- The comparison runs on `daemon.updateCheckInterval` (default `6h`, `0`
+  disables it) for every container the daemon can see, one at a time, so a host
+  restarting often does not re-check every registry on every boot (the first
+  round waits 30s). On-demand checks are floored at one minute per container, so
+  a button cannot drive one registry request per click.
 
 Webhook secrets are separate from the metrics secret. The daemon does not
 provide an HTTP configuration API; MaidKit updates the managed TOML
@@ -653,8 +706,8 @@ configuration over SSH and restarts the service when needed.
 
 The daemon also executes typed mutations directly — container lifecycle,
 process kill, systemd unit actions, compose project actions, package
-operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a managed host can be operated through the daemon (locally over HTTP,
-over the SSH stdio pipe, or remotely through the cloud relay) without a
+operations and firewall rules — mirroring what MaidKit's SSH layer can do, so a
+managed host can be operated through the daemon (locally over HTTP, over the SSH stdio pipe, or remotely through the cloud relay) without a
 workstation SSH session. Unlike script actions, native ops never interpolate
 caller input into a shell: targets are validated against the same patterns
 MaidKit enforces client-side, and commands run directly with
@@ -798,7 +851,8 @@ keys — intervals, `processesLimit`, `scriptTimeout`, `maxBodyBytes`,
 `maxConcurrentRuns`, `runtimes`, `watchedProcesses`, `cloudUrl`,
 `cloudSecret` — into `config.toml` (preserving every other line verbatim),
 then hot-reloads; a failed reload restores the previous file. Unsupported or
-invalid keys are rejected with `400` before any write.
+invalid keys are rejected with `400` before any write. Every interval is
+patchable, `updateCheckInterval` included.
 
 Restart-required settings — `transport`, `listen`, `metricsSecret`, storage
 paths, audit path — are read-only over the API, and patching them is
@@ -1002,6 +1056,16 @@ an operator TLS front it is plain `ws://`, so a dedicated
 `daemon.terminal.secret` is what keeps a leaked metrics secret from becoming a
 shell. A cloud-relayed session additionally passes through the cloud, which
 terminates TLS and can therefore read the session; the direct endpoint does not.
+
+Update checks are the one daemon feature that talks to a third party on its own
+initiative: they request a manifest from the registry an image names, over
+HTTPS, on the check cadence. They read the daemon account's own runtime auth
+file for that registry when one exists — the same credential a `podman pull` or
+`docker pull` run by that account would use — and never log it, never send it
+anywhere but the registry's own token endpoint, and never send it over plain
+HTTP: a registry dialled over TLS can only name a token endpoint over TLS.
+`updateCheckInterval = 0` turns the cadence off entirely, and each container can
+still be checked on demand.
 
 A privileged file root does not widen that boundary; it narrows the daemon's own
 reach. The daemon never holds root: it runs `maidkit-priv` through a

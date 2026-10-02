@@ -138,6 +138,7 @@ var patchableDaemonKeys = map[string]patchRule{
 	"runtimesInterval":        patchDurationRule,
 	"databaseMetricsInterval": patchDurationRule,
 	"logsInterval":            patchDurationRule,
+	"updateCheckInterval":     patchDurationRule,
 	"logsUploadInterval":      patchDurationRule,
 	"scriptTimeout":           patchDurationRule,
 	"processesLimit":          patchIntRule(1, 500),
@@ -209,6 +210,7 @@ type redactedConfigView struct {
 	SystemdInterval      string   `json:"systemd_interval"`
 	RuntimesInterval     string   `json:"runtimes_interval"`
 	LogsInterval         string   `json:"logs_interval"`
+	UpdateCheckInterval  string   `json:"update_check_interval"`
 	ProcessesLimit       int      `json:"processes_limit"`
 	ScriptTimeout        string   `json:"script_timeout"`
 	MaxBodyBytes         int64    `json:"max_body_bytes"`
@@ -243,6 +245,7 @@ func newRedactedConfigView(cfg config.DaemonConfig) redactedConfigView {
 		SystemdInterval:      cfg.SystemdInterval.String(),
 		RuntimesInterval:     cfg.RuntimesInterval.String(),
 		LogsInterval:         cfg.LogsInterval.String(),
+		UpdateCheckInterval:  cfg.UpdateCheckInterval.String(),
 		ProcessesLimit:       cfg.ProcessesLimit,
 		ScriptTimeout:        cfg.ScriptTimeout.String(),
 		MaxBodyBytes:         cfg.MaxBodyBytes,

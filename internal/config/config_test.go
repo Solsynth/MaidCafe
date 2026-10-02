@@ -49,6 +49,7 @@ command = "/bin/cat"
 		cfg.Daemon.SystemdInterval != 30*time.Second ||
 		cfg.Daemon.RuntimesInterval != 10*time.Second ||
 		cfg.Daemon.LogsInterval != 30*time.Second ||
+		cfg.Daemon.UpdateCheckInterval != 6*time.Hour ||
 		len(cfg.Daemon.Runtimes) != 8 ||
 		cfg.Daemon.Runtimes[0] != "java" ||
 		cfg.Daemon.Runtimes[7] != "php" ||

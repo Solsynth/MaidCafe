@@ -107,26 +107,27 @@ func recordedRuntimeCalls(t *testing.T, path string) []string {
 	return lines
 }
 
-// detailTestConfig is the minimum daemon configuration the detail endpoints
-// need, with the background cadences pushed out so a test drives only the
-// endpoint it is testing.
+// detailTestConfig is the minimum daemon configuration the detail and update
+// endpoints need, with the background cadences pushed out so a test drives only
+// the endpoint or check it is testing.
 func detailTestConfig() config.DaemonConfig {
 	return config.DaemonConfig{
-		ID:                 "detail-host",
-		Version:            "v9.9.9",
-		Transport:          "http",
-		Listen:             "127.0.0.1:0",
-		MetricsSecret:      "metrics-secret",
-		MetricsInterval:    time.Hour,
-		StreamInterval:     time.Second,
-		ContainersInterval: time.Hour,
-		LogsInterval:       0,
-		Runtimes:           []string{"java"},
-		ProcessesLimit:     50,
-		RequestTimeout:     5 * time.Second,
-		ScriptTimeout:      time.Second,
-		MaxBodyBytes:       4096,
-		MaxConcurrentRuns:  1,
+		ID:                  "detail-host",
+		Version:             "v9.9.9",
+		Transport:           "http",
+		Listen:              "127.0.0.1:0",
+		MetricsSecret:       "metrics-secret",
+		MetricsInterval:     time.Hour,
+		StreamInterval:      time.Second,
+		ContainersInterval:  time.Hour,
+		LogsInterval:        0,
+		UpdateCheckInterval: 6 * time.Hour,
+		Runtimes:            []string{"java"},
+		ProcessesLimit:      50,
+		RequestTimeout:      5 * time.Second,
+		ScriptTimeout:       time.Second,
+		MaxBodyBytes:        4096,
+		MaxConcurrentRuns:   1,
 	}
 }
 

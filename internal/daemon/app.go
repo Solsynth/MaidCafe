@@ -39,6 +39,7 @@ type App struct {
 	logs            *LogsCollector
 	logAlerts       *logAlertEvaluator
 	logUpload       *logUploadBuffer
+	updateCheck     *updateChecker
 	watched         *watchedProcessStore
 	jobs            *jobRunner
 	terminal        *terminalManager
@@ -140,6 +141,9 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	app.logAlerts.SetAlerts(cfg.LogAlerts)
 	app.rt.Store(newReloadableConfig(cfg))
+	// The update checker resolves containers through the app's own container
+	// snapshot, so it is wired after construction.
+	app.updateCheck = newUpdateChecker(app.containersForRead, newRegistryClient())
 	app.relay = NewWebhookRelay(publisherBox, executor, ops, logger)
 	// The relayed terminal is outbound, so it works in the stdio transport too;
 	// it only exists when the operator enabled it and the daemon has a cloud to
@@ -313,6 +317,10 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// container at a time.
 	router.GET("/api/v1/containers/:id/inspect", authorizeMetrics, app.handleContainerInspect)
 	router.GET("/api/v1/containers/:id/stats", authorizeMetrics, app.handleContainerStats)
+	router.GET("/api/v1/containers/:id/update-check", authorizeMetrics, app.handleContainerUpdateCheck)
+	// Cached update statuses for every container, in one request and without
+	// touching a registry.
+	router.GET("/api/v1/updates", authorizeMetrics, app.handleContainerUpdates)
 	// One-shot database health snapshot (same payload as the
 	// `databaseMetrics` SSE event).
 	router.GET("/api/v1/database-metrics", authorizeMetrics, func(c *gin.Context) {
@@ -797,6 +805,48 @@ func (a *App) startStreamCollectors(ctx context.Context) {
 	// show usage even while no client is connected.
 	a.runHistoryCollector(ctx, func(rt *reloadableConfig) time.Duration { return rt.intervals.runtimes }, a.runtimes.recordHistory)
 	a.runLogsCollector(ctx)
+	a.runUpdateChecker(ctx)
+}
+
+// runUpdateChecker refreshes the published-image comparison on
+// `daemon.updateCheckInterval` (0 disables the cadence, and an on-demand check
+// still works). Unlike the stream collectors this is not gated on subscribers:
+// the answer is a badge a client reads whenever it opens a page, so the daemon
+// keeps it current rather than making the first reader wait for a registry.
+func (a *App) runUpdateChecker(ctx context.Context) {
+	if a.updateCheck == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		// The first round is delayed so a host that restarts often does not
+		// re-check every registry on every boot; while the cadence is disabled
+		// the deadline keeps moving, so re-enabling it starts from the delay
+		// again instead of firing immediately.
+		next := time.Now().Add(updateCheckStartupDelay)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				rt := a.rt.Load()
+				if rt == nil {
+					continue
+				}
+				interval := rt.intervals.updateCheck
+				if interval <= 0 {
+					next = now.Add(updateCheckStartupDelay)
+					continue
+				}
+				if now.Before(next) {
+					continue
+				}
+				a.updateCheck.CheckAll(ctx, interval)
+				next = time.Now().Add(interval)
+			}
+		}
+	}()
 }
 
 // runHistoryCollector ticks a recording callback at interval without the

@@ -163,6 +163,11 @@ type DaemonConfig struct {
 	// new lines to the disk store and the SSE stream. 0 disables log
 	// tracking.
 	LogsInterval time.Duration `mapstructure:"logsInterval"`
+	// UpdateCheckInterval is the cadence at which the daemon compares each
+	// container's image against its registry (`GET /api/v1/updates`). 0
+	// disables the cadence; an on-demand check for one container still works.
+	// The check makes registry requests but never pulls.
+	UpdateCheckInterval time.Duration `mapstructure:"updateCheckInterval"`
 	// Runtimes is the ordered list of runtime groups the runtimes collector
 	// reports, in wire order. Unknown entries are skipped by old clients.
 	Runtimes []string `mapstructure:"runtimes"`
@@ -786,6 +791,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.jobsDir", "/etc/maidcafe/jobs")
 	viper.SetDefault("daemon.logsDir", "/var/lib/maidcafe/logs")
 	viper.SetDefault("daemon.logsInterval", 30*time.Second)
+	viper.SetDefault("daemon.updateCheckInterval", 6*time.Hour)
 	viper.SetDefault("daemon.cloudUrl", "https://mk.solsynth.dev")
 	viper.SetDefault("daemon.cloudSecret", "")
 	viper.SetDefault("daemon.metricsInterval", time.Minute)
@@ -1239,6 +1245,9 @@ func (c *Config) ValidateDaemon() error {
 	}
 	if c.Daemon.LogsInterval < 0 {
 		return fmt.Errorf("daemon.logsInterval must not be negative")
+	}
+	if c.Daemon.UpdateCheckInterval < 0 {
+		return fmt.Errorf("daemon.updateCheckInterval must not be negative")
 	}
 	if c.Daemon.RuntimesInterval < 0 {
 		return fmt.Errorf("daemon.runtimesInterval must not be negative")
