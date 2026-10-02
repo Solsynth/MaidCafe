@@ -429,6 +429,8 @@ type MetricInput struct {
 	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
+	HealthScore        int       `json:"health_score"`
+	HealthStatus       string    `json:"health_status"`
 }
 
 // LogInput is one container log line uploaded by a daemon. The daemon
@@ -504,6 +506,8 @@ type MetricView struct {
 	NetTxBytes         uint64    `json:"net_tx_bytes"`
 	WebhookExecutions  uint64    `json:"webhook_executions"`
 	WebhookFailures    uint64    `json:"webhook_failures"`
+	HealthScore        int       `json:"health_score"`
+	HealthStatus       string    `json:"health_status"`
 }
 type NotificationInput struct {
 	Kind     string          `json:"kind"`
@@ -628,10 +632,54 @@ func (s *Service) ListMetrics(ctx context.Context, accountID, daemonID string, l
 	}
 	out := make([]MetricView, len(rows))
 	for i, row := range rows {
-		out[i] = MetricView{ID: row.ID, DaemonID: row.DaemonID, SentAt: row.SentAt, ReceivedAt: row.ReceivedAt, UptimeSeconds: row.UptimeSeconds, ProcessMemoryBytes: row.ProcessMemoryBytes, CPUPercent: row.CPUPercent, CPUCount: row.CPUCount, Load1: row.Load1, Load5: row.Load5, Load15: row.Load15, MemoryUsedPercent: row.MemoryUsedPercent, MemoryUsedBytes: row.MemoryUsedBytes, MemoryTotalBytes: row.MemoryTotalBytes, SwapTotalKb: row.SwapTotalKb, SwapFreeKb: row.SwapFreeKb, DiskTotalKb: row.DiskTotalKb, DiskAvailableKb: row.DiskAvailableKb, NetRxBytes: row.NetRxBytes, NetTxBytes: row.NetTxBytes, WebhookExecutions: row.WebhookExecutions, WebhookFailures: row.WebhookFailures}
+		out[i] = MetricView{ID: row.ID, DaemonID: row.DaemonID, SentAt: row.SentAt, ReceivedAt: row.ReceivedAt, UptimeSeconds: row.UptimeSeconds, ProcessMemoryBytes: row.ProcessMemoryBytes, CPUPercent: row.CPUPercent, CPUCount: row.CPUCount, Load1: row.Load1, Load5: row.Load5, Load15: row.Load15, MemoryUsedPercent: row.MemoryUsedPercent, MemoryUsedBytes: row.MemoryUsedBytes, MemoryTotalBytes: row.MemoryTotalBytes, SwapTotalKb: row.SwapTotalKb, SwapFreeKb: row.SwapFreeKb, DiskTotalKb: row.DiskTotalKb, DiskAvailableKb: row.DiskAvailableKb, NetRxBytes: row.NetRxBytes, NetTxBytes: row.NetTxBytes, WebhookExecutions: row.WebhookExecutions, WebhookFailures: row.WebhookFailures, HealthScore: row.HealthScore, HealthStatus: row.HealthStatus}
 	}
 	return out, nil
 }
+
+// DaemonHealthView is the daemon's most recently reported health, taken from
+// the newest stored metric sample. Stale mirrors the cloud heartbeat rule:
+// a report older than DefaultDaemonDisconnectAfter no longer describes the
+// host's current state.
+type DaemonHealthView struct {
+	DaemonID    string    `json:"daemon_id"`
+	Score       int       `json:"score"`
+	Status      string    `json:"status"`
+	EvaluatedAt time.Time `json:"evaluated_at"`
+	ReceivedAt  time.Time `json:"received_at"`
+	Stale       bool      `json:"stale"`
+}
+
+// DaemonHealth returns the health evaluation carried by the daemon's newest
+// metric. ErrNotFound when the daemon has never reported a metric.
+func (s *Service) DaemonHealth(ctx context.Context, accountID, daemonID string) (DaemonHealthView, error) {
+	if _, err := s.daemonForAccount(ctx, accountID, daemonID); err != nil {
+		return DaemonHealthView{}, err
+	}
+	var row database.DaemonMetric
+	err := s.db.WithContext(ctx).Where("daemon_id = ?", daemonID).Order("sent_at desc").First(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return DaemonHealthView{}, ErrNotFound
+		}
+		return DaemonHealthView{}, err
+	}
+	status := strings.TrimSpace(row.HealthStatus)
+	if status == "" {
+		// Metrics ingested before health reporting existed carry no status.
+		status = "unknown"
+	}
+	now := time.Now().UTC()
+	return DaemonHealthView{
+		DaemonID:    row.DaemonID,
+		Score:       row.HealthScore,
+		Status:      status,
+		EvaluatedAt: row.SentAt,
+		ReceivedAt:  row.ReceivedAt,
+		Stale:       now.Sub(row.ReceivedAt) > DefaultDaemonDisconnectAfter,
+	}, nil
+}
+
 func (s *Service) GetDaemon(ctx context.Context, accountID, id string) (DaemonView, error) {
 	d, err := s.daemonForAccount(ctx, accountID, id)
 	if err != nil {
@@ -821,10 +869,15 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 	}
 	if input.SentAt.IsZero() || input.UptimeSeconds < 0 || input.ProcessMemoryBytes < 0 ||
 		input.CPUPercent < 0 || input.CPUPercent > 100 ||
-		input.MemoryUsedPercent < 0 || input.MemoryUsedPercent > 100 {
+		input.MemoryUsedPercent < 0 || input.MemoryUsedPercent > 100 ||
+		input.HealthScore < 0 || input.HealthScore > 100 {
 		return fmt.Errorf("invalid metric")
 	}
 	now := time.Now().UTC()
+	healthStatus := strings.TrimSpace(input.HealthStatus)
+	if len(healthStatus) > 16 {
+		healthStatus = healthStatus[:16]
+	}
 
 	// Workspace quotas: polling_interval_seconds throttles the report rate;
 	// metrics_retention_days rejects data outside the storage window.
@@ -852,6 +905,7 @@ func (s *Service) IngestMetric(ctx context.Context, id, secret string, input Met
 		DiskTotalKb: input.DiskTotalKb, DiskAvailableKb: input.DiskAvailableKb,
 		NetRxBytes: input.NetRxBytes, NetTxBytes: input.NetTxBytes,
 		WebhookExecutions: input.WebhookExecutions, WebhookFailures: input.WebhookFailures,
+		HealthScore: input.HealthScore, HealthStatus: healthStatus,
 	}).Error; err != nil {
 		return err
 	}

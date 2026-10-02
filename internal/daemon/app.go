@@ -207,6 +207,14 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router.GET("/api/v1/metrics", authorizeMetrics, func(c *gin.Context) {
 		c.JSON(http.StatusOK, app.metrics.Collect())
 	})
+	// Overview health: the same sample scored by evaluateHealth, with every
+	// dimension's value, threshold and message. The score also rides the
+	// metric payload itself (health_score/health_status) for the stream, stdio
+	// and the cloud; this endpoint adds the per-dimension detail.
+	router.GET("/api/v1/health", authorizeMetrics, func(c *gin.Context) {
+		sample := app.metrics.Collect()
+		c.JSON(http.StatusOK, evaluateHealth(sample, sample.SentAt))
+	})
 	router.GET("/api/v1/stream", authorizeMetrics, func(c *gin.Context) {
 		handleStream(c, app.hub, app.rt.Load())
 	})

@@ -1037,3 +1037,79 @@ func TestIngestAndListContainerStatus(t *testing.T) {
 		t.Fatalf("compose filter expected 2, got %d", len(filtered))
 	}
 }
+
+// TestDaemonHealthReflectsNewestMetric covers the health view: it reads the
+// newest metric's embedded score, reports unknown for metrics that predate
+// health reporting, fails closed on ownership, and rejects out-of-range scores.
+func TestDaemonHealthReflectsNewestMetric(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// A metric ingested before health reporting existed carries no status.
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{SentAt: now.Add(-time.Minute), UptimeSeconds: 1}); err != nil {
+		t.Fatal(err)
+	}
+	early, err := svc.DaemonHealth(ctx, "account-a", daemon.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if early.Status != "unknown" {
+		t.Fatalf("legacy metric health status = %q, want unknown", early.Status)
+	}
+	if early.Stale {
+		t.Fatal("fresh metric reported stale")
+	}
+
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{
+		SentAt: now, UptimeSeconds: 2, HealthScore: 63, HealthStatus: "degraded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	health, err := svc.DaemonHealth(ctx, "account-a", daemon.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.Score != 63 || health.Status != "degraded" {
+		t.Fatalf("health view = %+v, want 63/degraded", health)
+	}
+	if !health.EvaluatedAt.Equal(now) {
+		t.Fatalf("health evaluated_at = %v, want %v", health.EvaluatedAt, now)
+	}
+
+	history, err := svc.ListMetrics(ctx, "account-a", daemon.ID, 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history[0].HealthScore != 63 || history[0].HealthStatus != "degraded" {
+		t.Fatalf("metric view lost health: %+v", history[0])
+	}
+
+	if _, err := svc.DaemonHealth(ctx, "account-b", daemon.ID); err != ErrForbidden {
+		t.Fatalf("foreign account read = %v, want forbidden", err)
+	}
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, MetricInput{
+		SentAt: now.Add(time.Second), HealthScore: 101,
+	}); err == nil {
+		t.Fatal("out-of-range health score accepted")
+	}
+}
+
+// TestDaemonHealthWithoutMetricsIsNotFound keeps the health route from
+// inventing a score for a daemon that has never reported.
+func TestDaemonHealthWithoutMetricsIsNotFound(t *testing.T) {
+	svc, db, _, _ := testService(t)
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.DaemonHealth(ctx, "account-a", daemon.ID); err != ErrNotFound {
+		t.Fatalf("health for empty daemon = %v, want not found", err)
+	}
+}

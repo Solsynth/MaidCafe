@@ -42,6 +42,11 @@ type MetricsPayload struct {
 	NetTxBytes         uint64      `json:"net_tx_bytes"`
 	WebhookExecutions  uint64      `json:"webhook_executions"`
 	WebhookFailures    uint64      `json:"webhook_failures"`
+	// HealthScore/HealthStatus are the daemon's own evaluation of this same
+	// sample (evaluateHealth). They ride along with every published metric, so
+	// the cloud stores host health without a second, unpaced request.
+	HealthScore  int    `json:"health_score"`
+	HealthStatus string `json:"health_status"`
 }
 
 // DiskUsage is one mounted filesystem's capacity snapshot. AvailableKb is the
@@ -356,7 +361,7 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 	if uptime, err := host.Uptime(); err == nil {
 		uptimeSeconds = int64(uptime)
 	}
-	return MetricsPayload{
+	payload := MetricsPayload{
 		SentAt:             time.Now().UTC(),
 		HostID:             m.hostID,
 		UptimeSeconds:      uptimeSeconds,
@@ -379,6 +384,13 @@ func (m *MetricsCollector) Collect() MetricsPayload {
 		WebhookExecutions:  successes + failures,
 		WebhookFailures:    failures,
 	}
+	// Health is derived from the sample in place so every consumer of the
+	// payload — SSE frames, stdio, the history store and the cloud publish —
+	// carries one consistent score computed from the same numbers.
+	report := evaluateHealth(payload, payload.SentAt)
+	payload.HealthScore = report.Score
+	payload.HealthStatus = report.Status
+	return payload
 }
 
 // usedMemory computes used bytes and the used percentage from gopsutil's

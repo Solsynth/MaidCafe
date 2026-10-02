@@ -49,6 +49,11 @@ type DaemonMetric struct {
 	NetTxBytes         uint64
 	WebhookExecutions  uint64
 	WebhookFailures    uint64
+	// HealthScore/HealthStatus are the daemon's own evaluation of the sample
+	// (0..100 and healthy|degraded|critical). They are stored with the metric
+	// so health history and the latest score need no separate ingest route.
+	HealthScore  int
+	HealthStatus string `gorm:"size:16"`
 }
 
 type DaemonAction struct {

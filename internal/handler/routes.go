@@ -38,6 +38,7 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc,
 	user.GET("/daemons/:id/logs", listDaemonLogs(svc))
 	user.GET("/daemons/:id/containers", listDaemonContainers(svc))
 	user.GET("/daemons/:id/metrics", listMetrics(svc))
+	user.GET("/daemons/:id/health", daemonHealth(svc))
 	user.GET("/daemons/:id", getDaemon(svc))
 	user.PATCH("/daemons/:id", updateDaemon(svc))
 	user.POST("/daemons/:id/rotate-secret", rotateSecret(svc))
@@ -255,6 +256,20 @@ func listMetrics(s *cloud.Service) gin.HandlerFunc {
 		c.JSON(http.StatusOK, out)
 	}
 }
+
+// daemonHealth serves the host overview score the daemon reported with its
+// newest metric.
+func daemonHealth(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.DaemonHealth(c, accountID(c), c.Param("id"))
+		if err != nil {
+			serviceStatus(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+
 func listNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		out, err := s.ListNotificationPreferences(

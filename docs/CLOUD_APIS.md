@@ -108,8 +108,12 @@ responses.
   "net_rx_bytes": 100,
   "net_tx_bytes": 200,
   "webhook_executions": 42,
-  "webhook_failures": 1
+  "webhook_failures": 1,
+  "health_score": 84,
+  "health_status": "degraded"
 }
+```
+
 The daemon reports the full sample (including the load, swap, disk and
 network extras) every `metricsInterval`; the cloud stores it, stamps
 `last_seen_at` on the daemon, and clears a prior `disconnected_at` state.
@@ -332,6 +336,28 @@ curl 'http://localhost:8080/api/daemons/d0f2f0c2-.../metrics?limit=50&before=202
 | --- | --- | --- | --- |
 | `limit` | int | `100` | `1..100` |
 | `before` | RFC 3339 | — | exclusive cursor on `sent_at` |
+
+#### `GET /api/daemons/:id/health`
+
+Read the daemon's latest host health score, taken from the newest metric
+sample's embedded evaluation (see the Metric resource). `200` returns:
+
+```json
+{
+  "daemon_id": "d0f2f0c2-...",
+  "score": 84,
+  "status": "degraded",
+  "evaluated_at": "2026-08-15T12:00:00Z",
+  "received_at": "2026-08-15T12:00:01Z",
+  "stale": false
+}
+```
+
+`status` is `healthy`, `degraded`, `critical`, or `unknown` for a metric
+ingested before the daemon reported health. `stale` mirrors the cloud
+heartbeat rule: the report is older than `cloud.daemonDisconnectAfter` and no
+longer describes the host's current state. `404` when the daemon has never
+reported a metric; `403` when the caller is not a member of its workspace.
 
 #### `GET /api/daemons/:id/alarms`
 Removed: daemon metric alarms are configured on the daemon (its own config and
@@ -733,6 +759,8 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../metrics \
 | `process_memory_bytes` | `>= 0` |
 | `cpu_percent` | `0..100` |
 | `memory_used_percent` | `0..100` |
+| `health_score` | `0..100` (`0` when the daemon predates health reporting) |
+| `health_status` | `healthy`, `degraded` or `critical`; empty means unknown |
 Ingestion records `last_seen_at` on the daemon and clears `disconnected_at`;
 when it clears a prior disconnect, the cloud emits one `daemon.reconnected`
 notification. Daemon metric alarm thresholds are evaluated daemon-side; the

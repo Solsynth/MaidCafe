@@ -154,6 +154,10 @@ lets the user define those action presets.
 ### Optional cloud publishing from the daemon
 
 - Publishes metrics on every `metricsInterval` tick.
+- Scores host health locally (CPU, memory, swap, disk, load, process memory,
+  webhook failures) and embeds the score in every metric it publishes as
+  `health_score`/`health_status`, so the cloud stores health history without a
+  second request.
 - Publishes configured action metadata on every metrics tick.
 - When `logsUploadEnabled = true`, batches captured container log lines to
   `POST /api/daemons/:id/logs`; failed uploads remain in a bounded daemon-local
@@ -190,6 +194,7 @@ registered daemon secret instead; a daemon secret cannot access user routes.
 | `POST` | `/api/daemons/:id/rotate-secret` | Rotate the one-time secret |
 | `DELETE` | `/api/daemons/:id` | Disable daemon and delete its metrics |
 | `POST` | `/api/daemons/:id/metrics` | Ingest daemon metrics |
+| `GET` | `/api/daemons/:id/health` | Read the daemon's latest host health score |
 | `POST` | `/api/daemons/:id/logs` | Ingest a bounded batch of container log lines |
 | `POST` | `/api/daemons/:id/notifications` | Create a daemon notification |
 
@@ -254,6 +259,7 @@ Metrics and configured actions use the daemon metrics secret:
 ```text
 GET /health
 GET /api/v1/metrics
+GET /api/v1/health
 POST /api/v1/actions/:name
 GET /api/v1/audit?limit=N
 Authorization: Bearer <metrics-secret>
@@ -273,6 +279,41 @@ keeping one generation (`audit.jsonl.1`). Logging is best-effort: an
 unwritable path disables it with a warning and never affects execution.
 `GET /api/v1/audit?limit=N` returns the newest entries (default 50, max 500)
 newest first, authenticated with the metrics secret.
+
+### Overview health
+
+`GET /api/v1/health` evaluates the daemon's current metric sample and returns a
+scored overview of host health, authenticated with the metrics secret:
+
+```json
+{
+  "score": 84,
+  "status": "degraded",
+  "evaluated_at": "2026-08-15T12:00:00Z",
+  "host_id": "9e4b...",
+  "checks": [
+    {"name": "cpu", "status": "ok", "score": 100, "value": 12.3, "unit": "percent", "warn": 75, "crit": 95},
+    {"name": "memory", "status": "warning", "score": 33.3, "value": 90, "unit": "percent", "warn": 80, "crit": 95,
+     "message": "Memory at 90.0% (warn 80.0%, crit 95.0%)"}
+  ],
+  "issues": ["Memory at 90.0% (warn 80.0%, crit 95.0%)"]
+}
+```
+
+Every dimension scores 0..100: 100 while at or below `warn`, decaying linearly
+to 0 at `crit`. The report `score` is the weight-renormalized average of the
+applicable dimensions — CPU (0.22), memory (0.24), disk (0.20, worst mount),
+load per core (0.14), swap (0.10), daemon process memory (0.05) and webhook
+failure ratio (0.05). A dimension that does not apply (no swap, no webhook runs,
+no disk data) is marked `skipped` and excluded from the average. `status` bands
+the score: `healthy` at 90 or above, `degraded` at 70 or above, otherwise
+`critical`.
+
+The same evaluation is embedded in every metric sample as `health_score` and
+`health_status`, so the SSE `metric` frames, the stdio `metrics` action, the
+local history files and the cloud all carry one score computed in one place.
+The thresholds are built in, not configurable: per-condition paging stays with
+`[[daemon.alarms]]`; this endpoint is the overview.
 
 ### Realtime event stream
 

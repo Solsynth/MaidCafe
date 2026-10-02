@@ -968,3 +968,88 @@ func TestHTTPNativeContainerEndpoint(t *testing.T) {
 		t.Fatalf("second restart status = %d", resp.StatusCode)
 	}
 }
+
+// TestHealthOverviewEndpoint covers the overview health route: it requires the
+// metrics secret, returns the scored report for the live host, and the score it
+// reports is the same one carried by the metric payload.
+func TestHealthOverviewEndpoint(t *testing.T) {
+	cfg := config.DaemonConfig{
+		ID:                "host-health",
+		HostID:            "host-health",
+		Version:           "v1.2.3",
+		Transport:         "http",
+		Listen:            "127.0.0.1:0",
+		MetricsSecret:     "metrics-secret",
+		MetricsInterval:   time.Hour,
+		StreamInterval:    time.Hour,
+		Runtimes:          []string{"java"},
+		ProcessesLimit:    50,
+		RequestTimeout:    5 * time.Second,
+		ScriptTimeout:     time.Second,
+		MaxBodyBytes:      1024,
+		MaxConcurrentRuns: 1,
+		AuditPath:         filepath.Join(t.TempDir(), "audit.jsonl"),
+	}
+	app, err := NewApp(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	defer app.Shutdown(ctx)
+	baseURL := "http://" + app.ListenAddr()
+
+	unauthorized, err := http.Get(baseURL + "/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized health status = %d", unauthorized.StatusCode)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer metrics-secret")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d", response.StatusCode)
+	}
+	var report HealthReport
+	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if report.HostID != "host-health" {
+		t.Fatalf("report host id = %q", report.HostID)
+	}
+	if report.Status != HealthHealthy && report.Status != HealthDegraded && report.Status != HealthCritical {
+		t.Fatalf("report status = %q", report.Status)
+	}
+	if report.Score < 0 || report.Score > 100 {
+		t.Fatalf("report score out of range: %d", report.Score)
+	}
+	if len(report.Checks) == 0 {
+		t.Fatal("report carries no checks")
+	}
+	for _, check := range report.Checks {
+		if check.Unit == "" || check.Name == "" {
+			t.Fatalf("check missing identity: %+v", check)
+		}
+	}
+	// The metric payload embeds the same evaluation, so the stream and the
+	// cloud ingest never disagree with this endpoint.
+	sample := app.metrics.Collect()
+	if sample.HealthScore != report.Score || sample.HealthStatus != report.Status {
+		t.Fatalf("metric health %d/%s disagrees with report %d/%s",
+			sample.HealthScore, sample.HealthStatus, report.Score, report.Status)
+	}
+}

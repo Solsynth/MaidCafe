@@ -202,3 +202,50 @@ func TestCloudPublisherDoesNotConsumePaceSlotOnFailedMetric(t *testing.T) {
 		t.Fatalf("metric posts after transient failure = %d, want 2", metricPosts)
 	}
 }
+
+// TestCloudPublisherUploadsHealthScore proves the whole upload path end to
+// end: the daemon posts a metric carrying its health score and the cloud's
+// strict decoder accepts the health fields, stores them, and serves them back.
+func TestCloudPublisherUploadsHealthScore(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, nil, relayWorkspaces{})
+	cloudServer := httptest.NewServer(server.NewRouter(nil, svc, nil))
+	t.Cleanup(cloudServer.Close)
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := relayDaemonConfig(daemon.ID, cloudServer.URL, daemon.Secret, "/bin/true")
+	publisher, err := NewCloudPublisher(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher.PublishMetrics(ctx, MetricsPayload{
+		SentAt: time.Now().UTC(), HostID: "host", UptimeSeconds: 10,
+		HealthScore: 63, HealthStatus: HealthDegraded,
+	})
+
+	health, err := svc.DaemonHealth(ctx, "account-a", daemon.ID)
+	if err != nil {
+		t.Fatalf("uploaded health not stored: %v", err)
+	}
+	if health.Score != 63 || health.Status != HealthDegraded {
+		t.Fatalf("stored health = %+v, want 63/degraded", health)
+	}
+	history, err := svc.ListMetrics(ctx, "account-a", daemon.ID, 100, nil)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("metric history: %v %#v", err, history)
+	}
+	if history[0].HealthScore != 63 || history[0].HealthStatus != HealthDegraded {
+		t.Fatalf("metric lost health fields: %+v", history[0])
+	}
+}

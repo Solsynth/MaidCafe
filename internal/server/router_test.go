@@ -255,3 +255,50 @@ func TestRouterRegistersTerminalRoutes(t *testing.T) {
 		t.Fatalf("unauthenticated browser socket route %d %s", rec.Code, rec.Body)
 	}
 }
+
+// TestDaemonHealthUserRoute proves the overview health route is registered,
+// requires authentication, and serves the score embedded in the newest metric.
+func TestDaemonHealthUserRoute(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
+	router := NewRouter(nil, svc, routeAuthenticator{})
+
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestMetric(ctx, daemon.ID, daemon.Secret, cloud.MetricInput{
+		SentAt: time.Now(), UptimeSeconds: 1, HealthScore: 87, HealthStatus: "degraded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	unauth := httptest.NewRecorder()
+	router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/daemons/"+daemon.ID+"/health", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated health route %d", unauth.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/daemons/"+daemon.ID+"/health", nil)
+	req.Header.Set("Authorization", "Bearer solar-token")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health route %d %s", rec.Code, rec.Body)
+	}
+	var view cloud.DaemonHealthView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Score != 87 || view.Status != "degraded" || view.DaemonID != daemon.ID {
+		t.Fatalf("health view mismatch: %+v", view)
+	}
+}
