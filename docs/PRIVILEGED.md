@@ -272,24 +272,43 @@ Details worth knowing:
 
 ## The systemd sandbox
 
-Worth knowing before enabling a privileged root: `maidkit-priv` is a child
-process of the daemon, so it runs inside the unit's mount namespace.
-`ProtectSystem=full` (the shipped unit) makes `/etc` read-only for the helper
-exactly as it does for the daemon, so a privileged root under `/etc` needs that
-path added to `ReadWritePaths`, and sudo needs its setuid bit, which means
-`NoNewPrivileges=false` — the same relaxation that run-as actions already
-require.
+Worth knowing before enabling any family: `maidkit-priv` is a child process of
+the daemon, so it runs inside the unit's mount namespace. **The sandbox, not the
+grant, is what will block a privileged operation first.**
+
+`NoNewPrivileges=true` (the shipped unit) makes sudo's setuid bit inert, so
+*every* family needs `NoNewPrivileges=false` before the helper can run as root
+at all — the same relaxation run-as actions already require.
+
+`ProtectSystem=full` then makes `/etc`, `/usr` and `/boot` read-only for the
+helper exactly as it does for the daemon, so each family also needs the paths it
+writes added to `ReadWritePaths`:
+
+| Family | Paths the tool writes |
+| --- | --- |
+| a privileged file root | the root's own directory, e.g. `/etc/nginx` |
+| `systemd` | `/etc/systemd/system` (a unit edit), plus `/run/systemd` |
+| `packages` | `/var/lib/dpkg` or `/var/lib/rpm`, `/var/cache/apt` or `/var/cache/dnf`, `/etc/apt` or `/etc/yum.repos.d` |
+| `firewall` (ufw) | `/etc/ufw`, `/var/lib/ufw` |
+| `firewall` (firewalld) | `/etc/firewalld`, `/run/firewalld` |
+
+Those lists are the tools' own storage, not this project's invention, and they
+are why a host that wants package management through the daemon is usually
+better served by `ProtectSystem=` being relaxed to `true` (which keeps `/usr`
+read-only but leaves the rest writable) than by enumerating them.
 
 That relaxation is namespace-wide: the daemon's own process can then write the
-path too. In that configuration the helper's guarantee is *authorization* rather
-than containment — a client can only reach the path through the validated,
+paths too. In that configuration the helper's guarantee is *authorization*
+rather than containment — a client can only reach a path through the validated,
 profiled, audited helper — but the daemon process itself is no longer blocked
 from it. Options, in order of preference:
 
-1. Put privileged roots on paths the unit does not need to sandbox, so no
-   relaxation is required.
-2. Accept the relaxation and treat the daemon account as able to write that
-   path; the helper still keeps the API's own surface narrow and every call
+1. Avoid the relaxation. Leave `NoNewPrivileges=true` and take the operations
+   over SSH instead — the daemon's native path is a convenience, not a
+   requirement, and the client already falls back to it. This is the only option
+   that keeps the daemon unprivileged in every sense.
+2. Accept the relaxation and treat the daemon account as able to write those
+   paths; the helper still keeps the API's own surface narrow and every call
    audited.
 3. Give the helper its own systemd unit outside the daemon's namespace, so the
    daemon keeps its sandbox and still reaches root through a broker. This is the

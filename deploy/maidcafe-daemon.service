@@ -30,7 +30,15 @@ PrivateDevices=true
 # root through the maidkit-priv helper, which runs inside this namespace: a
 # root under a path this unit makes read-only (ProtectSystem covers /etc and
 # /usr) must be listed here as well, and NoNewPrivileges must be false for
-# sudo. See docs/PRIVILEGED.md.
+# sudo.
+#
+# The same applies to the other three privileged families the helper serves —
+# systemd units, packages and firewall rules — and each writes more than a
+# file root does: package management writes /var/lib/dpkg and /var/cache/apt,
+# ufw writes /etc/ufw, firewalld writes /etc/firewalld. That list is the tools'
+# own storage, and it is why a host using those families is usually better
+# served by ProtectSystem=true than by enumerating them. See
+# docs/PRIVILEGED.md, "The systemd sandbox".
 ReadWritePaths=/etc/maidcafe
 NoNewPrivileges=true
 RestrictSUIDSGID=true
