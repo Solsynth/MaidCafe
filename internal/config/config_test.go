@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -717,6 +718,71 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+// TestLoadAcceptsBothFilesRootShapes pins the compatibility guarantee: the
+// bare-path form the first released example wrote must keep loading, because a
+// config that fails to decode takes the whole daemon down — including on a host
+// that has not enabled the API at all.
+func TestLoadAcceptsBothFilesRootShapes(t *testing.T) {
+	root := t.TempDir()
+	base := `
+[daemon]
+id = "host-1"
+metricsSecret = "metrics-secret"
+metricsInterval = "1m"
+streamInterval = "1s"
+runtimes = ["java"]
+processesLimit = 50
+`
+	legacy := writeConfig(t, fmt.Sprintf(base+"[daemon.files]\nenabled = false\nroots = [%q]\n", root))
+	cfg, err := Load(legacy)
+	if err != nil {
+		t.Fatalf("legacy string roots failed to load: %v", err)
+	}
+	if cfg.Daemon.Files.Enabled || len(cfg.Daemon.Files.Roots) != 1 || cfg.Daemon.Files.Roots[0].Path != root {
+		t.Fatalf("legacy roots decoded as %+v", cfg.Daemon.Files.Roots)
+	}
+
+	// Enabled with the legacy form: still a plain, unprivileged root.
+	legacyEnabled := writeConfig(t, fmt.Sprintf(base+"[daemon.files]\nenabled = true\nallowWrite = true\nroots = [%q]\n", root))
+	cfg, err = Load(legacyEnabled)
+	if err != nil {
+		t.Fatalf("enabled legacy roots failed to load: %v", err)
+	}
+	if err := (&Config{Daemon: cfg.Daemon}).ValidateDaemon(); err != nil {
+		t.Fatalf("enabled legacy roots failed validation: %v", err)
+	}
+	if len(cfg.Daemon.Files.Roots) != 1 || cfg.Daemon.Files.Roots[0].Privileged {
+		t.Fatalf("legacy root decoded as %+v", cfg.Daemon.Files.Roots)
+	}
+
+	// The current shape, including a privileged root, is unchanged.
+	current := writeConfig(t, fmt.Sprintf(base+`
+[daemon.files]
+enabled = true
+
+[[daemon.files.roots]]
+path = %q
+
+[[daemon.files.roots]]
+path = %q
+privileged = false
+`, root, root))
+	cfg, err = Load(current)
+	if err != nil {
+		t.Fatalf("current roots failed to load: %v", err)
+	}
+	if len(cfg.Daemon.Files.Roots) != 2 || cfg.Daemon.Files.Roots[0].Path != root {
+		t.Fatalf("current roots decoded as %+v", cfg.Daemon.Files.Roots)
+	}
+
+	// A malformed entry is a validation error naming the path, not a decode
+	// error naming nothing.
+	mixed := writeConfig(t, fmt.Sprintf(base+"[daemon.files]\nenabled = true\nroots = [%q, 7]\n", root))
+	if _, err := Load(mixed); err == nil {
+		t.Fatal("a numeric root entry loaded")
 	}
 }
 

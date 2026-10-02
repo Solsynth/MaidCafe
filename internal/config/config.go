@@ -591,6 +591,34 @@ func validateTerminal(cfg TerminalConfig) error {
 	return nil
 }
 
+// normalizeFilesRoots accepts the older `roots = ["/srv/app"]` form alongside
+// the current `[[daemon.files.roots]]` array of tables.
+//
+// The string form predates per-root privileges and is what the first released
+// example wrote, so a host whose operator copied that example must keep
+// starting. Decoding it as a bare path is exactly what it meant; anything else
+// is left alone for [validateFiles] to reject with a real message, rather than
+// failing here as an opaque unmarshal error that names no key.
+func normalizeFilesRoots() {
+	raw, ok := viper.Get("daemon.files.roots").([]any)
+	if !ok {
+		return
+	}
+	normalized := make([]any, 0, len(raw))
+	changed := false
+	for _, entry := range raw {
+		if path, isString := entry.(string); isString {
+			normalized = append(normalized, map[string]any{"path": path})
+			changed = true
+			continue
+		}
+		normalized = append(normalized, entry)
+	}
+	if changed {
+		viper.Set("daemon.files.roots", normalized)
+	}
+}
+
 // validateFiles checks the opt-in file API policy. Shape and limits are
 // checked whenever they are set; the presence rules (roots) only apply when
 // the API is enabled, so a disabled-but-present table never blocks startup.
@@ -768,6 +796,7 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 	applyEnvAliases()
+	normalizeFilesRoots()
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
