@@ -286,6 +286,10 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	helper := filepath.Join(dir, "maidkit-priv")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*DaemonConfig)
@@ -595,7 +599,7 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 		{
 			name: "disabled file API ignores shape",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Roots: []string{"relative", "/does/not/exist"}}
+				d.Files = FilesConfig{Roots: []FilesRootConfig{{Path: "relative"}, {Path: "/does/not/exist"}}}
 			},
 			ok: true,
 		},
@@ -608,51 +612,98 @@ func TestDaemonValidatesHookExecutionSettings(t *testing.T) {
 		{
 			name: "relative file root rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{"srv/data"}}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: "srv/data"}}}
 			},
 		},
 		{
 			name: "missing file root rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{"/definitely/not/a/directory-xyz"}}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: "/definitely/not/a/directory-xyz"}}}
 			},
 		},
 		{
 			name: "duplicate file root rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{dir, dir}}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir}, {Path: dir}}}
 			},
 		},
 		{
 			name: "file root directory accepted",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, AllowWrite: true}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir}}, AllowWrite: true}
 			},
 			ok: true,
 		},
 		{
 			name: "file API secret with whitespace rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, Secret: " padded "}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir}}, Secret: " padded "}
 			},
 		},
 		{
 			name: "oversized file transfer caps rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, MaxReadBytes: FilesMaxTransferBytes + 1}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir}}, MaxReadBytes: FilesMaxTransferBytes + 1}
 			},
 		},
 		{
 			name: "oversized file list cap rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{dir}, MaxListEntries: FilesMaxListEntriesLimit + 1}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir}}, MaxListEntries: FilesMaxListEntriesLimit + 1}
 			},
 		},
 		{
 			name: "file root pointing at a file rejected",
 			mutate: func(d *DaemonConfig) {
-				d.Files = FilesConfig{Enabled: true, Roots: []string{file}}
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: file}}}
 			},
+		},
+		{
+			name: "privileged file root without profile rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{
+					Enabled:          true,
+					Roots:            []FilesRootConfig{{Path: dir, Privileged: true}},
+					PrivilegedHelper: helper,
+				}
+			},
+		},
+		{
+			name: "profile without privileged rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{Enabled: true, Roots: []FilesRootConfig{{Path: dir, Profile: "nginx"}}}
+			},
+		},
+		{
+			name: "malformed profile name rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{
+					Enabled:          true,
+					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "Nginx Prod"}},
+					PrivilegedHelper: helper,
+				}
+			},
+		},
+		{
+			name: "missing privileged helper rejected",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{
+					Enabled:          true,
+					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
+					PrivilegedHelper: filepath.Join(dir, "absent-helper"),
+				}
+			},
+		},
+		{
+			name: "privileged file root accepted",
+			mutate: func(d *DaemonConfig) {
+				d.Files = FilesConfig{
+					Enabled:          true,
+					Roots:            []FilesRootConfig{{Path: dir, Privileged: true, Profile: "nginx"}},
+					PrivilegedHelper: helper,
+				}
+			},
+			ok: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

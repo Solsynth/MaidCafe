@@ -15,6 +15,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
+	"src.solsynth.dev/solsynth/maidcafe/internal/privfs"
 )
 
 type Config struct {
@@ -265,14 +266,19 @@ type FilesConfig struct {
 	// metricsSecret; setting it keeps a leaked metrics secret from granting
 	// file access.
 	Secret string `mapstructure:"secret"`
-	// Roots is the allowlist of absolute directories the API may touch.
+	// Roots is the allowlist of directories the API may touch.
 	// Required when Enabled; paths outside every root are refused. A root
 	// itself cannot be deleted through the API.
-	Roots []string `mapstructure:"roots"`
+	Roots []FilesRootConfig `mapstructure:"roots"`
 	// AllowWrite permits the mutating operations (write, mkdir, move, copy,
 	// delete). Off by default, so an operator can publish a read-only view of
 	// a directory tree.
 	AllowWrite bool `mapstructure:"allowWrite"`
+	// PrivilegedHelper is the root-installed helper the daemon runs through
+	// sudo to write inside a privileged root. Empty uses the installed
+	// default; it is configurable so a distribution can choose its libexec
+	// directory.
+	PrivilegedHelper string `mapstructure:"privilegedHelper"`
 	// MaxReadBytes caps one read request (editor load, download window);
 	// 0 uses FilesDefaultMaxReadBytes. A larger file is still reachable by
 	// paging with offset/limit.
@@ -285,6 +291,28 @@ type FilesConfig struct {
 	MaxListEntries int `mapstructure:"maxListEntries"`
 }
 
+// FilesRootConfig declares one directory the file API may touch, and whether
+// writing to it needs root.
+//
+// A privileged root is how a browser client edits files the daemon account
+// cannot write (an nginx or Caddy configuration, a systemd unit). The daemon
+// itself still runs unprivileged: it runs the maidkit-priv helper through
+// sudo, and the helper resolves Profile against its own root-owned profile
+// file, so the daemon can only reach directories an operator declared in both
+// places. Reads are never privileged — the daemon account must be able to read
+// the directory for the API to serve it at all.
+type FilesRootConfig struct {
+	// Path is an absolute, existing directory.
+	Path string `mapstructure:"path"`
+	// Privileged routes the mutating operations through the helper.
+	Privileged bool `mapstructure:"privileged"`
+	// Profile names the helper profile that authorizes them. Required when
+	// Privileged; it is deliberately explicit rather than derived from the
+	// path, so the two allowlists are joined by an operator's decision and not
+	// by a naming coincidence.
+	Profile string `mapstructure:"profile"`
+}
+
 // File API bounds shared by config validation and the daemon's file runner.
 // A zero value in FilesConfig means "use the default"; the limits exist so an
 // operator can raise them deliberately rather than by accident.
@@ -294,6 +322,10 @@ const (
 	FilesMaxTransferBytes      = 1 << 30 // 1 GiB per request
 	FilesDefaultMaxListEntries = 5000
 	FilesMaxListEntriesLimit   = 100000
+
+	// FilesDefaultPrivilegedHelper is the installed maidkit-priv path, used
+	// when daemon.files.privilegedHelper is empty.
+	FilesDefaultPrivilegedHelper = "/usr/local/libexec/maidkit-priv"
 )
 
 // LogAlertConfig declares one daemon-side regex alert. A matching new log
@@ -575,6 +607,9 @@ func validateFiles(cfg FilesConfig) error {
 	if cfg.MaxListEntries < 0 || cfg.MaxListEntries > FilesMaxListEntriesLimit {
 		return fmt.Errorf("daemon.files.maxListEntries must be between 1 and %d", FilesMaxListEntriesLimit)
 	}
+	if cfg.PrivilegedHelper != "" && !filepath.IsAbs(cfg.PrivilegedHelper) {
+		return fmt.Errorf("daemon.files.privilegedHelper must be an absolute path")
+	}
 	if !cfg.Enabled {
 		return nil
 	}
@@ -582,24 +617,49 @@ func validateFiles(cfg FilesConfig) error {
 		return fmt.Errorf("daemon.files.roots must not be empty when the file API is enabled")
 	}
 	seen := make(map[string]struct{}, len(cfg.Roots))
+	privileged := 0
 	for i, root := range cfg.Roots {
-		if strings.TrimSpace(root) != root || root == "" {
-			return fmt.Errorf("daemon.files.roots[%d] must be a non-empty absolute path", i)
+		if strings.TrimSpace(root.Path) != root.Path || root.Path == "" {
+			return fmt.Errorf("daemon.files.roots[%d].path must be a non-empty absolute path", i)
 		}
-		if !filepath.IsAbs(root) {
-			return fmt.Errorf("daemon.files.roots[%d] %q must be an absolute path", i, root)
+		if !filepath.IsAbs(root.Path) {
+			return fmt.Errorf("daemon.files.roots[%d].path %q must be an absolute path", i, root.Path)
 		}
-		clean := filepath.Clean(root)
+		clean := filepath.Clean(root.Path)
 		if _, ok := seen[clean]; ok {
-			return fmt.Errorf("daemon.files.roots[%d] %q is duplicated", i, root)
+			return fmt.Errorf("daemon.files.roots[%d].path %q is duplicated", i, root.Path)
 		}
 		seen[clean] = struct{}{}
 		info, err := os.Stat(clean)
 		if err != nil {
-			return fmt.Errorf("daemon.files.roots[%d] %q is not usable: %w", i, root, err)
+			return fmt.Errorf("daemon.files.roots[%d].path %q is not usable: %w", i, root.Path, err)
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("daemon.files.roots[%d] %q is not a directory", i, root)
+			return fmt.Errorf("daemon.files.roots[%d].path %q is not a directory", i, root.Path)
+		}
+		switch {
+		case root.Privileged && !privfs.ValidProfileName(root.Profile):
+			return fmt.Errorf("daemon.files.roots[%d] is privileged and needs a profile name matching [a-z0-9][a-z0-9_-]*", i)
+		case !root.Privileged && root.Profile != "":
+			return fmt.Errorf("daemon.files.roots[%d].profile is only meaningful with privileged = true", i)
+		case root.Privileged:
+			privileged++
+		}
+	}
+	if privileged > 0 {
+		// A privileged root without an installed helper would fail every write
+		// with a permission error from sudo; report it at load instead, where
+		// the operator can still see the configuration being rejected.
+		helper := cfg.PrivilegedHelper
+		if helper == "" {
+			helper = FilesDefaultPrivilegedHelper
+		}
+		info, err := os.Stat(helper)
+		if err != nil {
+			return fmt.Errorf("daemon.files.privilegedHelper %q is not usable: %w", helper, err)
+		}
+		if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("daemon.files.privilegedHelper %q is not an executable file", helper)
 		}
 	}
 	return nil
@@ -680,7 +740,8 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
 	viper.SetDefault("daemon.files.enabled", false)
 	viper.SetDefault("daemon.files.secret", "")
-	viper.SetDefault("daemon.files.roots", []string{})
+	viper.SetDefault("daemon.files.roots", []map[string]any{})
+	viper.SetDefault("daemon.files.privilegedHelper", "")
 	viper.SetDefault("daemon.files.allowWrite", false)
 	viper.SetDefault("daemon.files.maxReadBytes", int64(FilesDefaultMaxReadBytes))
 	viper.SetDefault("daemon.files.maxWriteBytes", int64(FilesDefaultMaxWriteBytes))

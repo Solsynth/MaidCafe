@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -77,7 +78,7 @@ func isFileActionSlug(name string) bool {
 // The parameters arrive as the JSON body object; the audit entry records the
 // transport ("stdio") as the actor, because the pipe itself carries no
 // identity.
-func (a *App) runStdioFileAction(action string, body []byte) (any, *requestError) {
+func (a *App) runStdioFileAction(ctx context.Context, action string, body []byte) (any, *requestError) {
 	policy, policyErr := a.filePolicyFrom()
 	if policyErr != nil {
 		return nil, &requestError{status: policyErr.status, message: policyErr.message}
@@ -89,11 +90,11 @@ func (a *App) runStdioFileAction(action string, body []byte) (any, *requestError
 			return nil, &requestError{status: http.StatusBadRequest, message: "invalid JSON body"}
 		}
 		if err := fileBodyFromValues(values, &req, action); err != nil {
-			a.recordFileOp(fileSourceStdio, action, "stdio", req.Path, err, time.Now())
+			a.recordFileOp(fileSourceStdio, action, "stdio", req.Path, false, err, time.Now())
 			return nil, &requestError{status: err.status, message: err.message}
 		}
 	}
-	result, err := a.runFileAction(policy, fileSourceStdio, action, "stdio", req)
+	result, err := a.runFileAction(ctx, policy, fileSourceStdio, action, "stdio", req)
 	if err != nil {
 		return nil, &requestError{status: err.status, message: err.message}
 	}
@@ -116,9 +117,19 @@ type filePolicy struct {
 	maxRead    int64
 	maxWrite   int64
 	maxList    int
-	// allowed is the cleaned root allowlist. It is not named roots so the
-	// listing method can keep that name.
-	allowed []string
+	// roots is the cleaned root allowlist, each with its privilege policy. It
+	// is not named "allowed" so the listing method can keep that name.
+	roots []fileRoot
+}
+
+// fileRoot is one configured root: the cleaned directory plus how writes to it
+// are authorized. A privileged root is written through maidkit-priv, whose own
+// profile file decides which directory that profile name means; the daemon
+// only carries the name.
+type fileRoot struct {
+	path       string
+	privileged bool
+	profile    string
 }
 
 // newFilePolicy resolves the configured limits and cleans the roots. The
@@ -135,7 +146,7 @@ func newFilePolicy(cfg config.FilesConfig) *filePolicy {
 		maxRead:    cfg.MaxReadBytes,
 		maxWrite:   cfg.MaxWriteBytes,
 		maxList:    cfg.MaxListEntries,
-		allowed:    make([]string, 0, len(cfg.Roots)),
+		roots:      make([]fileRoot, 0, len(cfg.Roots)),
 	}
 	if policy.maxRead <= 0 {
 		policy.maxRead = config.FilesDefaultMaxReadBytes
@@ -147,18 +158,25 @@ func newFilePolicy(cfg config.FilesConfig) *filePolicy {
 		policy.maxList = config.FilesDefaultMaxListEntries
 	}
 	for _, root := range cfg.Roots {
-		policy.allowed = append(policy.allowed, filepath.Clean(root))
+		policy.roots = append(policy.roots, fileRoot{
+			path:       filepath.Clean(root.Path),
+			privileged: root.Privileged,
+			profile:    root.Profile,
+		})
 	}
 	return policy
 }
 
 // fileTarget is one request path resolved against the policy: the root it
-// lives in, the root-relative path os.Root operations take, and the clean
-// absolute path the client sees in responses.
+// lives in, the root-relative path os.Root and the helper take, and the clean
+// absolute path the client sees in responses. [privileged] and [profile] come
+// from the root, so a mutation knows how it must be authorized.
 type fileTarget struct {
-	rootPath string
-	rel      string
-	path     string
+	rootPath   string
+	rel        string
+	path       string
+	privileged bool
+	profile    string
 }
 
 // fileEntry is one directory entry or stat record. Mode carries the unix
@@ -177,9 +195,14 @@ type fileEntry struct {
 	TargetType string `json:"target_type,omitempty"`
 }
 
-// fileRootInfo is one entry of the roots response.
+// fileRootInfo is one entry of the roots response. A client needs to know
+// which roots are writable only through the privileged helper, because the
+// operations the helper does not implement (move, copy) are refused there and
+// it should not offer them.
 type fileRootInfo struct {
-	Path string `json:"path"`
+	Path       string `json:"path"`
+	Privileged bool   `json:"privileged"`
+	Profile    string `json:"profile,omitempty"`
 }
 
 type fileRootsResult struct {
@@ -240,24 +263,33 @@ func (p *filePolicy) resolve(raw string) (fileTarget, *fileActionError) {
 		return fileTarget{}, fileError(http.StatusBadRequest, "path must be absolute")
 	}
 	clean := filepath.Clean(raw)
-	best := ""
-	for _, root := range p.allowed {
-		if !pathInside(root, clean) {
+	var best *fileRoot
+	for i := range p.roots {
+		root := &p.roots[i]
+		// The longest matching root wins, so a nested root resolves to the
+		// most specific privilege policy rather than to its parent's.
+		if !pathInside(root.path, clean) {
 			continue
 		}
-		if len(root) > len(best) {
+		if best == nil || len(root.path) > len(best.path) {
 			best = root
 		}
 	}
-	if best == "" {
+	if best == nil {
 		return fileTarget{}, fileError(http.StatusForbidden, "path is outside the allowed roots")
 	}
-	rel := strings.TrimPrefix(clean, best)
+	rel := strings.TrimPrefix(clean, best.path)
 	rel = strings.TrimPrefix(rel, string(os.PathSeparator))
 	if rel == "" {
 		rel = "."
 	}
-	return fileTarget{rootPath: best, rel: rel, path: clean}, nil
+	return fileTarget{
+		rootPath:   best.path,
+		rel:        rel,
+		path:       clean,
+		privileged: best.privileged,
+		profile:    best.profile,
+	}, nil
 }
 
 // pathInside reports whether [target] is [root] itself or sits beneath it.
@@ -296,7 +328,7 @@ func (a *App) filePolicyFrom() (*filePolicy, *fileActionError) {
 // action and carries the resolved path in Target, so the audit log answers
 // "who touched which file" without the stdout/stderr fields scripting runs
 // use.
-func (a *App) recordFileOp(source, action, invokedBy, target string, err *fileActionError, started time.Time) {
+func (a *App) recordFileOp(source, action, invokedBy, target string, privileged bool, err *fileActionError, started time.Time) {
 	if a.audit == nil {
 		return
 	}
@@ -306,6 +338,7 @@ func (a *App) recordFileOp(source, action, invokedBy, target string, err *fileAc
 		Source:     source,
 		InvokedBy:  invokedBy,
 		Target:     target,
+		Privileged: privileged,
 		OK:         err == nil,
 		DurationMS: time.Since(started).Milliseconds(),
 	}
@@ -315,12 +348,15 @@ func (a *App) recordFileOp(source, action, invokedBy, target string, err *fileAc
 	a.audit.Record(entry)
 }
 
-// roots reports the configured roots so a client can seed its browser with
-// the directories it may show.
-func (p *filePolicy) roots() fileRootsResult {
-	result := fileRootsResult{Roots: make([]fileRootInfo, 0, len(p.allowed)), Writable: p.allowWrite}
-	for _, root := range p.allowed {
-		result.Roots = append(result.Roots, fileRootInfo{Path: root})
+// rootInfos reports the configured roots so a client can seed its browser with
+// the directories it may show, including which of them need the privileged
+// helper.
+func (p *filePolicy) rootInfos() fileRootsResult {
+	result := fileRootsResult{Roots: make([]fileRootInfo, 0, len(p.roots)), Writable: p.allowWrite}
+	for _, root := range p.roots {
+		result.Roots = append(result.Roots, fileRootInfo{
+			Path: root.path, Privileged: root.privileged, Profile: root.profile,
+		})
 	}
 	return result
 }
@@ -510,6 +546,12 @@ func (p *filePolicy) write(t fileTarget, data []byte) (fileWriteResult, *fileAct
 	if !p.allowWrite {
 		return fileWriteResult{}, fileError(http.StatusForbidden, "file API is read-only")
 	}
+	if t.privileged {
+		// Reaching here would mean the dispatch forgot to route a privileged
+		// root through the helper, which would silently write as the daemon
+		// account instead. Refuse rather than do the wrong thing.
+		return fileWriteResult{}, fileError(http.StatusInternalServerError, "internal error: privileged root not routed through the helper")
+	}
 	if t.rel == "." {
 		return fileWriteResult{}, fileError(http.StatusBadRequest, "refusing to write a configured root")
 	}
@@ -539,6 +581,9 @@ func (p *filePolicy) write(t fileTarget, data []byte) (fileWriteResult, *fileAct
 func (p *filePolicy) mkdir(t fileTarget, parents bool) (filePathResult, *fileActionError) {
 	if !p.allowWrite {
 		return filePathResult{}, fileError(http.StatusForbidden, "file API is read-only")
+	}
+	if t.privileged {
+		return filePathResult{}, fileError(http.StatusInternalServerError, "internal error: privileged root not routed through the helper")
 	}
 	if t.rel == "." {
 		return filePathResult{}, fileError(http.StatusConflict, "path already exists")
@@ -708,6 +753,9 @@ func (p *filePolicy) delete(t fileTarget, recursive bool) (filePathResult, *file
 	if !p.allowWrite {
 		return filePathResult{}, fileError(http.StatusForbidden, "file API is read-only")
 	}
+	if t.privileged {
+		return filePathResult{}, fileError(http.StatusInternalServerError, "internal error: privileged root not routed through the helper")
+	}
 	if t.rel == "." {
 		return filePathResult{}, fileError(http.StatusBadRequest, "refusing to delete a configured root")
 	}
@@ -798,90 +846,172 @@ func fileStatus(err error) *fileActionError {
 // runFileAction executes one file action against [policy], recording a single
 // audit entry. Both transports share it so stdio and HTTP cannot drift apart
 // in what they accept or what they refuse.
-func (a *App) runFileAction(policy *filePolicy, source, action, invokedBy string, req fileActionRequest) (any, *fileActionError) {
+func (a *App) runFileAction(ctx context.Context, policy *filePolicy, source, action, invokedBy string, req fileActionRequest) (any, *fileActionError) {
 	started := time.Now()
 	target := req.Path
 	if action == fileActionMove || action == fileActionCopy {
 		target = req.From + " -> " + req.To
 	}
-	result, err := a.dispatchFileAction(policy, action, req)
-	a.recordFileOp(source, action, invokedBy, target, err, started)
+	result, privileged, err := a.dispatchFileAction(ctx, policy, action, req)
+	a.recordFileOp(source, action, invokedBy, target, privileged, err, started)
 	return result, err
 }
 
-func (a *App) dispatchFileAction(policy *filePolicy, action string, req fileActionRequest) (any, *fileActionError) {
+// dispatchFileAction resolves and runs one action. It reports whether the
+// action went through the privileged helper, which the audit entry records so
+// an operator can answer "which file changes needed root".
+//
+// A privileged root is routed to the helper for the three operations it
+// implements. move and copy are refused there rather than attempted: a rename
+// inside a root-owned directory needs root too, the helper does not implement
+// it, and silently falling back to the daemon account would turn a supported
+// call into a permission error at best and a partial copy at worst.
+func (a *App) dispatchFileAction(ctx context.Context, policy *filePolicy, action string, req fileActionRequest) (any, bool, *fileActionError) {
 	switch action {
 	case fileActionRoots:
-		return policy.roots(), nil
+		return policy.rootInfos(), false, nil
 	case fileActionList:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.list(target)
+		result, err := policy.list(target)
+		return result, false, err
 	case fileActionStat:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		follow := true
 		if req.Follow != nil {
 			follow = *req.Follow
 		}
 		entry, err := policy.stat(target, follow)
-		if err != nil {
-			return nil, err
-		}
-		return entry, nil
+		return entry, false, err
 	case fileActionRead:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.read(target, req.Offset, req.Limit)
+		result, err := policy.read(target, req.Offset, req.Limit)
+		return result, false, err
 	case fileActionWrite:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		data, decodeErr := base64.StdEncoding.DecodeString(req.Content)
 		if decodeErr != nil {
-			return nil, fileError(http.StatusBadRequest, "content must be base64")
+			return nil, false, fileError(http.StatusBadRequest, "content must be base64")
 		}
-		return policy.write(target, data)
+		result, privileged, err := a.writeFileData(ctx, policy, target, data)
+		return result, privileged, err
 	case fileActionMkdir:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.mkdir(target, req.Parents)
+		if target.privileged {
+			if policyErr := checkPolicyWrite(policy, target, 0); policyErr != nil {
+				return nil, false, policyErr
+			}
+			if privErr := a.privMkdir(ctx, target, privMkdirMode); privErr != nil {
+				return nil, true, privErr
+			}
+			return filePathResult{Path: target.path}, true, nil
+		}
+		result, err := policy.mkdir(target, req.Parents)
+		return result, false, err
 	case fileActionMove:
 		from, err := policy.resolve(req.From)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		to, err := policy.resolve(req.To)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.move(from, to)
+		if from.privileged || to.privileged {
+			return nil, false, errPrivilegedMoveOrCopy
+		}
+		result, err := policy.move(from, to)
+		return result, false, err
 	case fileActionCopy:
 		from, err := policy.resolve(req.From)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		to, err := policy.resolve(req.To)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.copy(from, to, req.Overwrite)
+		if from.privileged || to.privileged {
+			return nil, false, errPrivilegedMoveOrCopy
+		}
+		result, err := policy.copy(from, to, req.Overwrite)
+		return result, false, err
 	case fileActionDelete:
 		target, err := policy.resolve(req.Path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return policy.delete(target, req.Recursive)
+		if target.privileged {
+			if policyErr := checkPolicyWrite(policy, target, 0); policyErr != nil {
+				return nil, false, policyErr
+			}
+			if req.Recursive {
+				return nil, false, fileError(http.StatusNotImplemented,
+					"a privileged root only removes single files; recursive delete is not implemented")
+			}
+			if privErr := a.privRemove(ctx, target); privErr != nil {
+				return nil, true, privErr
+			}
+			return filePathResult{Path: target.path}, true, nil
+		}
+		result, err := policy.delete(target, req.Recursive)
+		return result, false, err
 	default:
-		return nil, fileError(http.StatusBadRequest, "unsupported file action")
+		return nil, false, fileError(http.StatusBadRequest, "unsupported file action")
 	}
+}
+
+// writeFileData is the single write path: the unprivileged os.Root write for an
+// ordinary root, the privileged helper for a privileged one. It is shared by
+// the JSON action and the raw-content route so a privileged root cannot be
+// reachable through one of them only.
+func (a *App) writeFileData(ctx context.Context, policy *filePolicy, target fileTarget, data []byte) (fileWriteResult, bool, *fileActionError) {
+	if target.privileged {
+		if err := checkPolicyWrite(policy, target, int64(len(data))); err != nil {
+			return fileWriteResult{}, false, err
+		}
+		if err := a.privWrite(ctx, target, data, privWriteModeFor(target.path)); err != nil {
+			return fileWriteResult{}, true, err
+		}
+		return fileWriteResult{Path: target.path, Size: int64(len(data))}, true, nil
+	}
+	result, err := policy.write(target, data)
+	return result, false, err
+}
+
+// errPrivilegedMoveOrCopy is the refusal for a move or copy that touches a
+// privileged root. The helper implements write, mkdir and remove; renaming
+// inside a root-owned directory needs root just as much as writing there, so
+// the operation is reported as unimplemented instead of failing halfway.
+var errPrivilegedMoveOrCopy = fileError(http.StatusNotImplemented,
+	"move and copy are not supported inside a privileged root; write the new path and delete the old one")
+
+// checkPolicyWrite applies the write gate and the root itself check that the
+// unprivileged path also enforces, so a privileged root cannot be a way around
+// the read-only switch.
+func checkPolicyWrite(policy *filePolicy, target fileTarget, size int64) *fileActionError {
+	if !policy.allowWrite {
+		return fileError(http.StatusForbidden, "file API is read-only")
+	}
+	if target.rel == "." {
+		return fileError(http.StatusBadRequest, "refusing to modify a configured root")
+	}
+	if policy.maxWrite > 0 && size > policy.maxWrite {
+		return fileError(http.StatusRequestEntityTooLarge, "body exceeds maxWriteBytes (%d)", policy.maxWrite)
+	}
+	return nil
 }

@@ -25,6 +25,12 @@ PrivateDevices=true
 # /etc/maidcafe/actions/run). User-switching actions and the root-visibility
 # sudo -n retries additionally need NoNewPrivileges=false plus a
 # passwordless sudoers rule for the maidcafe user.
+#
+# A privileged file root (daemon.files.roots with privileged = true) reaches
+# root through the maidkit-priv helper, which runs inside this namespace: a
+# root under a path this unit makes read-only (ProtectSystem covers /etc and
+# /usr) must be listed here as well, and NoNewPrivileges must be false for
+# sudo. See docs/PRIVILEGED.md.
 ReadWritePaths=/etc/maidcafe
 NoNewPrivileges=true
 RestrictSUIDSGID=true

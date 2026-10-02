@@ -35,7 +35,7 @@ func TestStdioFileActions(t *testing.T) {
 		AuditPath:         filepath.Join(t.TempDir(), "audit.jsonl"),
 		Files: config.FilesConfig{
 			Enabled:    true,
-			Roots:      []string{root},
+			Roots:      []config.FilesRootConfig{{Path: root}},
 			AllowWrite: true,
 		},
 	}

@@ -112,6 +112,12 @@ GET /health
   `os.Root`, with mutations gated separately by `allowWrite`. Off by default and
   available over the stdio transport as `files.*` actions; see
   [File API](#file-api).
+- Opt-in privileged roots: a root declared `privileged = true` is written as
+  root through the `maidkit-priv` helper, so a browser client can edit an nginx
+  or Caddy configuration the daemon account cannot touch. The helper resolves a
+  *profile name* — never a path — from a root-owned profile file, so a
+  compromised daemon can only reach directories an operator declared in both
+  files. See [Privileged operations](#privileged-operations).
 - Public health endpoint that exposes only daemon mode and ID:
 
 ```text
@@ -252,8 +258,9 @@ as one JSON line per run: timestamp, `name` (API slug), optional
 `ok`, `exit_code`, `duration_ms`, and a truncated failure reason. WebSocket
 terminal sessions land in the same file with `name` and `source` `terminal`,
 one line per session and no transcript. File API calls land there too, with
-the action slug as `name`, `source` `http` or `stdio`, and the resolved path
-in `target` (`from -> to` for a move or copy). The file rotates at 1 MiB
+the action slug as `name`, `source` `http` or `stdio`, the resolved path in
+`target` (`from -> to` for a move or copy), and `privileged: true` when the
+operation went through the `maidkit-priv` helper as root. The file rotates at 1 MiB
 keeping one generation (`audit.jsonl.1`). Logging is best-effort: an
 unwritable path disables it with a warning and never affects execution.
 `GET /api/v1/audit?limit=N` returns the newest entries (default 50, max 500)
@@ -507,9 +514,12 @@ Every call is appended to `daemon.auditPath` with the action slug
 `ok`/`duration_ms`/`error` fields.
 
 - `daemon.files.enabled` (default `false`) — serve the API at all.
-- `daemon.files.roots` — required when enabled; absolute, existing
-  directories. A root the daemon account cannot read is a root the API cannot
-  serve.
+- `daemon.files.roots` — required when enabled; a list of
+  `{ path, privileged, profile }`. `path` must be an absolute, existing
+  directory; a root the daemon account cannot read is a root the API cannot
+  serve. `privileged` routes writes through the helper (see
+  [Privileged operations](#privileged-operations)) and `profile` names the
+  helper profile that authorizes them.
 - `daemon.files.secret` — optional dedicated credential.
 - `daemon.files.allowWrite` (default `false`) — allow mutating operations.
 - `daemon.files.maxReadBytes` / `maxWriteBytes` (default 8 MiB) — per-request
@@ -533,6 +543,53 @@ over the stdio pipe for a client that already has SSH. There is no cloud-relayed
 file transport (the terminal has one; files do not), so a browser client needs
 an endpoint it can dial — the same TLS-fronted address the rest of the daemon
 API is served at.
+
+### Privileged operations
+
+Some of what the file manager edits is not writable by the daemon account: an
+nginx or Caddy configuration, a systemd unit. Declaring such a root
+`privileged` routes its writes through `maidkit-priv`, the one component that
+runs as root:
+
+```toml
+[daemon.files]
+enabled = true
+allowWrite = true
+
+[[daemon.files.roots]]
+path = "/etc/nginx"
+privileged = true
+profile = "nginx"
+```
+
+```sh
+sudo install -o root -g root -m 0755 maidkit-priv /usr/local/libexec/maidkit-priv
+sudo install -o root -g root -m 0644 config.priv.example.toml /etc/maidkit/priv.toml
+sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidkit-priv \
+  < <(maidkit-priv sudoers maidcafe)
+```
+
+```toml
+# /etc/maidkit/priv.toml
+[[profiles]]
+name = "nginx"
+path = "/etc/nginx"
+modes = ["0644", "0640"]
+```
+
+The helper takes a profile **name**, never a path: it resolves that name
+against its own root-owned profile file, which the daemon cannot write. A
+sudoers wildcard is therefore safe, because the helper — not the pattern — is
+the boundary. Writes land through a temporary file renamed into place, confined
+by `os.Root`, and every attempt is journalled with sudo's own record of who
+invoked it. Reads stay unprivileged; `allowWrite = false` still refuses
+privileged writes; `move`, `copy` and recursive delete answer `501` inside a
+privileged root rather than falling back to the daemon account.
+
+[`docs/PRIVILEGED.md`](docs/PRIVILEGED.md) has the full model: why a stored root
+password or root SSH key is worse than this (a password the daemon can read is
+a larger grant than the write it enables), the profile and mode rules, the exit
+codes, and what the helper deliberately refuses.
 
 ### Snapshot endpoints
 
@@ -702,6 +759,11 @@ Example response:
 
 ## Configuration
 
+The daemon's configuration is documented by
+[`config.daemon.example.toml`](config.daemon.example.toml); the privileged
+helper's profile file by [`config.priv.example.toml`](config.priv.example.toml)
+and [`docs/PRIVILEGED.md`](docs/PRIVILEGED.md).
+
 Use [`config.cloud.example.toml`](config.cloud.example.toml) for cloud mode and
 [`config.daemon.example.toml`](config.daemon.example.toml) for daemon mode.
 Configuration is typed TOML loaded through Viper and can also be selected with
@@ -822,6 +884,21 @@ writable only through the existing `ReadWritePaths=/etc/maidcafe`, and
 rejected at startup, which is deliberate: the alternative is a root that
 validates and then fails every request.
 
+A `privileged` root interacts with that sandbox, and the interaction is worth
+understanding before enabling one. `maidkit-priv` is a child of the daemon, so
+it inherits the unit's mount namespace: `ProtectSystem=full` makes `/etc`
+read-only for the helper exactly as it does for the daemon, and a privileged
+root under such a path therefore needs it added to `ReadWritePaths` (plus
+`NoNewPrivileges=false`, since sudo needs its setuid bit — the same relaxation a
+run-as action already requires, and what the installer does when one is
+configured). That grant is namespace-wide, so the daemon's own process gains
+write access to the path too; the helper's guarantees in that configuration are
+the audited, validated, profile-scoped *authorization* — the only way a client
+can reach the path is through it — rather than containment of a compromised
+daemon. Closing that gap means giving the helper its own unit (a privileged
+broker outside this namespace), which is a larger change than this feature;
+until then, prefer privileged roots on paths the unit does not need to sandbox.
+
 ## CI artifacts
 
 GitHub Actions is defined in [`.github/workflows/build.yml`](.github/workflows/build.yml):
@@ -864,6 +941,16 @@ an operator TLS front it is plain `ws://`, so a dedicated
 `daemon.terminal.secret` is what keeps a leaked metrics secret from becoming a
 shell. A cloud-relayed session additionally passes through the cloud, which
 terminates TLS and can therefore read the session; the direct endpoint does not.
+
+A privileged file root does not widen that boundary; it narrows the daemon's own
+reach. The daemon never holds root: it runs `maidkit-priv` through a
+passwordless sudoers rule, and the helper resolves a *profile name* against a
+root-owned profile file the daemon cannot write, so a compromised daemon can
+only reach directories an operator declared in both places. A sudoers rule over
+a general tool would not be a boundary — `sudo tee` writes any path and `sudo
+systemctl` loads any unit file — which is why the grant is over one helper with
+a fixed, validated command surface. See
+[`docs/PRIVILEGED.md`](docs/PRIVILEGED.md).
 
 The file API is the same trade in a different shape, with two differences. It
 accepts the credential in a `token` query parameter — but only on the

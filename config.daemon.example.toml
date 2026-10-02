@@ -173,9 +173,26 @@ enabled = false
 # Absolute, existing directories the API may touch. Required when enabled;
 # paths outside every root are refused, and a root itself can never be written,
 # moved, copied or deleted through the API. The I/O runs through os.Root too,
-# so a symlink inside a root cannot be used to escape it. Operations run as the
-# daemon account and never elevate.
-roots = ["/srv", "/etc/maidcafe"]
+# so a symlink inside a root cannot be used to escape it.
+[[daemon.files.roots]]
+path = "/srv"
+
+# A privileged root is written through the maidkit-priv helper as root, for
+# files the daemon account cannot write (an nginx or Caddy configuration, a
+# systemd unit). `profile` names the helper profile that authorizes it and must
+# exist in /etc/maidkit/priv.toml — the daemon's allowlist and the helper's are
+# joined by two explicit decisions, never by a naming coincidence. Reads stay
+# unprivileged, so the daemon account must still be able to read this directory
+# to list it. See docs/PRIVILEGED.md.
+# [[daemon.files.roots]]
+# path = "/etc/nginx"
+# privileged = true
+# profile = "nginx"
+
+# Where the privileged helper is installed. Empty uses
+# /usr/local/libexec/maidkit-priv; set it only if your distribution puts it
+# elsewhere, and keep the sudoers rule in step (maidkit-priv sudoers prints it).
+# privilegedHelper = "/usr/local/libexec/maidkit-priv"
 # Allow the mutating operations (write, mkdir, move, copy, delete). Leave off
 # to publish a read-only view of a tree.
 allowWrite = false

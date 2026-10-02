@@ -1,0 +1,38 @@
+# Profile file for maidkit-priv, the privileged file helper.
+#
+# Installed as /etc/maidkit/priv.toml with mode 0644 and owner root. This file
+# is the authorization boundary for privileged file writes: the sudoers rule
+# authorizes the helper, and the helper can only reach the directories named
+# here. Keep it root-owned and unwritable by anyone else — a file the daemon's
+# own account could rewrite would be a privilege grant it can edit.
+#
+# Every entry is validated before any operation runs: the path must be absolute
+# and resolve to an existing directory, and the modes may only be 0600, 0640,
+# 0644, 0700, 0750 or 0755. Setuid, setgid and sticky bits are refused because
+# the helper creates files root may execute.
+#
+# Check a change with `maidkit-priv fs profiles`, which parses the file and
+# prints what it grants, before relying on it.
+
+# An nginx configuration tree: the file manager edits sites-enabled,
+# sites-available and snippets. The daemon account can read these files, so
+# only the writes need root.
+[[profiles]]
+name = "nginx"
+path = "/etc/nginx"
+modes = ["0644", "0640"]
+
+# Caddy needs the same treatment for its Caddyfile and any site fragments.
+[[profiles]]
+name = "caddy"
+path = "/etc/caddy"
+modes = ["0644", "0640"]
+
+# systemd units deployed by MaidKit. Keep the path narrow: everything under
+# /etc/systemd/system is loaded by PID 1 as root on the next daemon-reload, so
+# a profile here is a code-execution grant for whoever can reach the daemon.
+# Deliberately commented out until an operator needs it.
+# [[profiles]]
+# name = "systemd-units"
+# path = "/etc/systemd/system"
+# modes = ["0644"]

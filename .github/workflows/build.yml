@@ -110,7 +110,14 @@ jobs:
           binary="maidcafe-daemon${{ matrix.extension }}"
           archive="maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz"
           go build -trimpath -ldflags='-s -w' -o "dist/$binary" ./cmd/daemon
-          tar -C dist -czf "$archive" "$binary"
+          # The privileged file helper ships next to the daemon, but only on
+          # platforms that have sudo and a root account to elevate to.
+          extra=""
+          if [ -z "${{ matrix.extension }}" ]; then
+            go build -trimpath -ldflags='-s -w' -o "dist/maidkit-priv" ./cmd/maidkit-priv
+            extra="maidkit-priv"
+          fi
+          tar -C dist -czf "$archive" "$binary" $extra
 
       - name: Upload compressed daemon binary
         uses: actions/upload-artifact@v4
@@ -157,7 +164,14 @@ jobs:
           binary=maidcafe-daemon
           archive="maidcafe-daemon-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz"
           go build -trimpath -ldflags='-s -w' -o "dist/$binary" ./cmd/daemon
-          tar -C dist -czf "$archive" "$binary"
+          # The privileged file helper ships next to the daemon, but only on
+          # platforms that have sudo and a root account to elevate to.
+          extra=""
+          if [ -z "${{ matrix.extension }}" ]; then
+            go build -trimpath -ldflags='-s -w' -o "dist/maidkit-priv" ./cmd/maidkit-priv
+            extra="maidkit-priv"
+          fi
+          tar -C dist -czf "$archive" "$binary" $extra
 
       - name: Upload compressed rolling daemon binary
         uses: actions/upload-artifact@v4

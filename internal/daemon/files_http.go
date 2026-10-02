@@ -102,7 +102,7 @@ func (a *App) handleFileContent(c *gin.Context) {
 	}
 	target, err := policy.resolve(strings.TrimSpace(c.Query("path")))
 	if err != nil {
-		a.recordFileOp(fileSourceHTTP, fileActionRead, "", strings.TrimSpace(c.Query("path")), err, started)
+		a.recordFileOp(fileSourceHTTP, fileActionRead, "", strings.TrimSpace(c.Query("path")), false, err, started)
 		a.writeFileError(c, err)
 		return
 	}
@@ -118,7 +118,7 @@ func (a *App) handleFileContent(c *gin.Context) {
 	}
 	file, size, window, readErr := policy.openReadWindow(target, offset, limit)
 	if readErr != nil {
-		a.recordFileOp(fileSourceHTTP, fileActionRead, "", target.path, readErr, started)
+		a.recordFileOp(fileSourceHTTP, fileActionRead, "", target.path, false, readErr, started)
 		a.writeFileError(c, readErr)
 		return
 	}
@@ -133,7 +133,7 @@ func (a *App) handleFileContent(c *gin.Context) {
 		// short body, which its own size check catches.
 		return
 	}
-	a.recordFileOp(fileSourceHTTP, fileActionRead, "", target.path, nil, started)
+	a.recordFileOp(fileSourceHTTP, fileActionRead, "", target.path, false, nil, started)
 }
 
 // handleFileWriteRaw accepts the request body itself as the file contents,
@@ -154,7 +154,7 @@ func (a *App) handleFileWriteRaw(c *gin.Context) {
 	rawPath := strings.TrimSpace(c.Query("path"))
 	target, resolveErr := policy.resolve(rawPath)
 	if resolveErr != nil {
-		a.recordFileOp(fileSourceHTTP, fileActionWrite, "", rawPath, resolveErr, started)
+		a.recordFileOp(fileSourceHTTP, fileActionWrite, "", rawPath, false, resolveErr, started)
 		a.writeFileError(c, resolveErr)
 		return
 	}
@@ -167,8 +167,10 @@ func (a *App) handleFileWriteRaw(c *gin.Context) {
 		a.writeFileError(c, fileError(http.StatusRequestEntityTooLarge, "body exceeds maxWriteBytes (%d)", policy.maxWrite))
 		return
 	}
-	result, actionErr := policy.write(target, body)
-	a.recordFileOp(fileSourceHTTP, fileActionWrite, "", target.path, actionErr, started)
+	// The raw route shares the single write path with the JSON one, so a
+	// privileged root is routed through the helper here too.
+	result, privileged, actionErr := a.writeFileData(c.Request.Context(), policy, target, body)
+	a.recordFileOp(fileSourceHTTP, fileActionWrite, "", target.path, privileged, actionErr, started)
 	if actionErr != nil {
 		a.writeFileError(c, actionErr)
 		return
@@ -232,7 +234,7 @@ func (a *App) serveFileAction(c *gin.Context, action string, decorate func(*file
 			return
 		}
 	}
-	result, err := a.runFileAction(policy, fileSourceHTTP, action, "", req)
+	result, err := a.runFileAction(c.Request.Context(), policy, fileSourceHTTP, action, "", req)
 	if err != nil {
 		a.writeFileError(c, err)
 		return

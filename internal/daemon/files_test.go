@@ -24,7 +24,7 @@ func fileDaemon(t *testing.T, root string, mutate func(*config.FilesConfig)) (*A
 	files := config.FilesConfig{
 		Enabled:    true,
 		Secret:     "files-secret",
-		Roots:      []string{root},
+		Roots:      []config.FilesRootConfig{{Path: root}},
 		AllowWrite: true,
 	}
 	if mutate != nil {
@@ -617,7 +617,7 @@ maxConcurrentRuns = 2
 [daemon.files]
 enabled = true
 secret = "files-secret"
-roots = ["` + rootA + `"]
+roots = [{ path = "` + rootA + `" }]
 `)
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -645,7 +645,7 @@ roots = ["` + rootA + `"]
 [daemon.files]
 enabled = true
 secret = "files-secret"
-roots = ["` + rootB + `"]
+roots = [{ path = "` + rootB + `" }]
 allowWrite = true
 `)
 	if err := app.Reload(); err != nil {

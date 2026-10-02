@@ -29,10 +29,15 @@ type auditEntry struct {
 	// Target names the resource a non-script operation acted on. File API
 	// entries carry the resolved path (or "from -> to" for a move/copy) here;
 	// script and native operation runs leave it empty.
-	Target     string `json:"target,omitempty"`
-	OK         bool   `json:"ok"`
-	ExitCode   int    `json:"exit_code"`
-	DurationMS int64  `json:"duration_ms"`
+	Target string `json:"target,omitempty"`
+	// Privileged marks an operation that ran as root: a file API call inside a
+	// privileged root, which goes through the maidkint-priv helper. An auditor
+	// asking "what did this daemon do as root" needs it, and it is the only
+	// field that distinguishes such a call from an ordinary write.
+	Privileged bool  `json:"privileged,omitempty"`
+	OK         bool  `json:"ok"`
+	ExitCode   int   `json:"exit_code"`
+	DurationMS int64 `json:"duration_ms"`
 	// Stdout and Stderr carry the captured run output (bounded by the
 	// executor's per-run buffer), so a run's full log is inspectable later.
 	Stdout string `json:"stdout,omitempty"`

@@ -112,7 +112,7 @@ func (a *App) runStdio(ctx context.Context) error {
 					continue
 				}
 				go func(request stdioRequest, body []byte) {
-					result, requestErr := a.runStdioFileAction(action, body)
+					result, requestErr := a.runStdioFileAction(ctx, action, body)
 					results <- stdioActionResult{request: request, err: requestErr, fileResult: result}
 				}(request, body)
 				continue

@@ -43,10 +43,14 @@ type App struct {
 	jobs            *jobRunner
 	terminal        *terminalManager
 	terminalRelay   *terminalRelay
-	server          *http.Server
-	listenerMu      sync.RWMutex
-	listener        net.Listener
-	logger          *slog.Logger
+	// priv runs the root-capable helper for writes inside a privileged file
+	// root. Nil when this host has no way to elevate (no sudo and not root);
+	// a privileged write then reports that instead of failing on permissions.
+	priv       *privRunner
+	server     *http.Server
+	listenerMu sync.RWMutex
+	listener   net.Listener
+	logger     *slog.Logger
 	// configPath is the TOML file the daemon was started with; empty means
 	// environment-only configuration (hot reload and the config API are
 	// disabled then).
@@ -127,6 +131,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		watched:         watchedStore,
 		jobs:            jobs,
 		terminal:        newTerminalManager(logger, audit),
+		priv:            newPrivRunner(),
 		logger:          logger,
 	}
 	app.logAlerts.SetAlerts(cfg.LogAlerts)
