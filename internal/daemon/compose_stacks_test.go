@@ -414,11 +414,11 @@ func TestComposeScanAssignsAProjectAndTheContainerUpdateUsesIt(t *testing.T) {
 		t.Fatalf("stack health = %+v", scanned.Stacks[0])
 	}
 
-	// Now the same update runs, in the directory the scan recorded.
+	// Now the same update runs, in the directory the scan recorded. A container
+	// update pulls and recreates, so it answers with a task; the test waits for
+	// it the way a client does.
 	status, body = signedPost(t, base, "/api/v1/containers/web/update", `{}`)
-	if status != http.StatusOK {
-		t.Fatalf("assigned update status = %d: %s", status, body)
-	}
+	_ = awaitTask(t, base, taskFrom(t, status, body).ID)
 	// The fake runtime records one argv token per line, so the invocation is
 	// read as a whole.
 	recorded := strings.Join(recordedRuntimeCalls(t, calls), " ")
@@ -476,9 +476,8 @@ func TestComposeUpdateActionRunsBothStages(t *testing.T) {
 	if status, body := signedPost(t, base, "/api/v1/compose/stacks/scan", `{"path":"`+projectDir+`"}`); status != http.StatusOK {
 		t.Fatalf("scan status = %d: %s", status, body)
 	}
-	if status, body := signedPost(t, base, "/api/v1/compose/myapp/update", `{}`); status != http.StatusOK {
-		t.Fatalf("stack update status = %d: %s", status, body)
-	}
+	status, body := signedPost(t, base, "/api/v1/compose/myapp/update", `{}`)
+	_ = awaitTask(t, base, taskFrom(t, status, body).ID)
 	recorded := strings.Join(recordedRuntimeCalls(t, calls), " ")
 	composeFile := filepath.Join(projectDir, "compose.yaml")
 	if !strings.Contains(recorded, "compose --ansi never -p myapp -f "+composeFile+" pull") {

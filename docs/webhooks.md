@@ -17,7 +17,10 @@ Beyond configured hooks, the daemon also executes **native operations**
 compose project actions, package operations, firewall rules) directly, with the
 same transport channels — see the "Native host operations" section of the
 README. Their slugs (`container.restart`, `container.update`, `process.kill`,
-…) are reserved and cannot be used for webhook or action names.
+…) are reserved and cannot be used for webhook or action names. The ones that
+pull an image run for minutes, so over direct HTTP they answer `202` with a task
+to follow rather than a result — see "Following a long operation" in the README;
+the relay and stdio paths, which wait for their result, are unaffected.
 
 There are two ways to invoke a hook:
 

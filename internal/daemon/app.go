@@ -21,17 +21,20 @@ import (
 )
 
 type App struct {
-	cfg             config.DaemonConfig
-	audit           *AuditLogger
-	executor        *WebhookExecutor
-	ops             *nativeOpRunner
-	metrics         *MetricsCollector
-	publisher       *atomic.Pointer[CloudPublisher]
-	relay           *WebhookRelay
-	hub             *StreamHub
-	alarms          *alarmEvaluator
-	containers      *ContainersCollector
-	composeStacks   *composeStackStore
+	cfg           config.DaemonConfig
+	audit         *AuditLogger
+	executor      *WebhookExecutor
+	ops           *nativeOpRunner
+	metrics       *MetricsCollector
+	publisher     *atomic.Pointer[CloudPublisher]
+	relay         *WebhookRelay
+	hub           *StreamHub
+	alarms        *alarmEvaluator
+	containers    *ContainersCollector
+	composeStacks *composeStackStore
+	// tasks holds the long native operations currently running as tasks, so a
+	// client can follow one instead of waiting on the request that started it.
+	tasks           *taskStore
 	images          *ImagesCollector
 	processes       *ProcessesCollector
 	systemd         *SystemdCollector
@@ -95,10 +98,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	runtimeProbe := &runtimeProbeState{}
 	processTable := &processTableCache{}
+	tasks := newTaskStore()
 	ops := &nativeOpRunner{
 		executor:  executor,
 		runtimes:  probeContainerRuntimes,
 		publisher: publisherBox,
+		tasks:     tasks,
 	}
 	ops.SetScriptTimeout(cfg.ScriptTimeout)
 	priv := newPrivRunner()
@@ -126,6 +131,7 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 		alarms:        newAlarmEvaluator(),
 		containers:    &ContainersCollector{probe: runtimeProbe},
 		composeStacks: composeStacks,
+		tasks:         tasks,
 		images:        &ImagesCollector{probe: runtimeProbe},
 		processes:     &ProcessesCollector{limit: cfg.ProcessesLimit, table: processTable},
 		systemd:       &SystemdCollector{},
@@ -518,6 +524,12 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	router.GET("/api/v1/compose/stacks", authorizeMetrics, app.handleComposeStacks)
 	router.POST("/api/v1/compose/stacks/scan", authorizeMetrics, app.handleComposeStacksScan)
 	router.DELETE("/api/v1/compose/stacks/:project", authorizeMetrics, app.handleComposeStackRemove)
+	// Tasks: the long native operations — image pulls, compose pulls and
+	// updates — run detached, and a client follows one by id for its stages,
+	// its output and its cancel.
+	router.GET("/api/v1/tasks", authorizeMetrics, app.handleTaskList)
+	router.GET("/api/v1/tasks/:id", authorizeMetrics, app.handleTaskGet)
+	router.POST("/api/v1/tasks/:id/cancel", authorizeMetrics, app.handleTaskCancel)
 	// Config introspection and safe-subset patching: the daemon edits its own
 	// config.toml (preserving everything it does not model) and hot-reloads,
 	// so interval/limit/cloud changes apply without a restart.
@@ -678,6 +690,26 @@ func (a *App) nativeOpHandler(
 			}
 			decorate(values, &params)
 		}
+		// The operations that pull images run for minutes, longer than any
+		// client waits for a response. They are started as tasks: the client
+		// gets the task's id and follows it, and the run no longer depends on
+		// the connection that asked for it. Everything else is quick enough to
+		// answer in the request.
+		if taskNativeOp(slug) {
+			task, requestErr := ops.dispatchTask(
+				c.Request.Context(),
+				slug,
+				params,
+				"http",
+				c.GetHeader("X-MaidCafe-Invoked-By"),
+			)
+			if requestErr != nil {
+				c.JSON(requestErr.status, gin.H{"ok": false, "error": requestErr.message})
+				return
+			}
+			c.JSON(http.StatusAccepted, gin.H{"ok": true, "task": task.snapshot()})
+			return
+		}
 		response, status, requestErr := ops.dispatch(
 			c.Request.Context(),
 			slug,
@@ -799,6 +831,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.terminal != nil {
 		a.terminal.CloseAll()
 	}
+	// A task is work the daemon owns, not the client that asked for it: a pull
+	// left running past the daemon would write to a store nothing is tracking
+	// any more, and whoever started it lost sight of it with the daemon.
+	a.tasks.cancelAll()
 	if a.server == nil {
 		return nil
 	}

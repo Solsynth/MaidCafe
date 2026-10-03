@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -216,6 +217,11 @@ type opAttempt struct {
 // only meaningful once the first has succeeded, which is a different relation
 // from the alternatives within a stage.
 type opStage struct {
+	// label names the step in the terms its operation uses ("pull",
+	// "recreate"). A task reports progress per stage, so the label is what an
+	// operator watching one reads; a one-stage operation takes its label from
+	// its slug's verb.
+	label    string
 	attempts []opAttempt
 }
 
@@ -249,6 +255,9 @@ type nativeOpRunner struct {
 	// one here, and a container whose labels do not point at its project is
 	// updated where that registry says it lives.
 	composeStacks *composeStackStore
+	// tasks is where the long operations run: the transports start one and
+	// hand its id to the client instead of holding the request open.
+	tasks *taskStore
 }
 
 // SetComposeStacks hands the runner the managed stack registry. Called at
@@ -444,17 +453,24 @@ func detectFirewallBackend() (string, bool) {
 	return "", false
 }
 
-// dispatch validates [slug] and [params], builds the command attempts and
-// runs them. Request-level failures return a requestError; execution
-// outcomes return an executionResponse with the usual status codes (502 for
-// non-zero exit, 504 for timeout).
-func (r *nativeOpRunner) dispatch(
+// nativeOpPlan is a validated native operation, ready to run: the stages it
+// executes in order, the label it targets, and the deadline it runs under.
+// Planning is what needs a runtime probe and what can fail with something
+// useful to say — including the container's own configuration — so it stays in
+// the caller's request even when the execution itself is detached into a task.
+type nativeOpPlan struct {
+	stages  []opStage
+	target  string
+	timeout time.Duration
+}
+
+// planNativeOp validates [slug] against [params] and resolves everything the
+// run needs. It executes nothing.
+func (r *nativeOpRunner) planNativeOp(
 	ctx context.Context,
 	slug string,
 	params opParams,
-	source string,
-	invokedBy string,
-) (executionResponse, int, *requestError) {
+) (nativeOpPlan, *requestError) {
 	var attempts []opAttempt
 	// stages carries an operation's steps. Single-stage operations fill
 	// [attempts] and are wrapped below; a multi-stage operation (an update:
@@ -462,11 +478,11 @@ func (r *nativeOpRunner) dispatch(
 	var stages []opStage
 	targetLabel := ""
 	timeout := time.Duration(r.scriptTimeout.Load())
-	bad := func(message string) (executionResponse, int, *requestError) {
-		return executionResponse{}, 0, &requestError{status: http.StatusBadRequest, message: message}
+	bad := func(message string) (nativeOpPlan, *requestError) {
+		return nativeOpPlan{}, &requestError{status: http.StatusBadRequest, message: message}
 	}
-	failed := func(err error) (executionResponse, int, *requestError) {
-		return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: err.Error()}
+	failed := func(err error) (nativeOpPlan, *requestError) {
+		return nativeOpPlan{}, &requestError{status: http.StatusBadGateway, message: err.Error()}
 	}
 	switch {
 	case slug == "container.pull" || slug == "container.update":
@@ -516,8 +532,8 @@ func (r *nativeOpRunner) dispatch(
 				err.Error(), resolved.Runtime))
 		}
 		stages = append(stages,
-			opStage{attempts: r.composeAttempts(resolved.Path, compose, "pull", compose.Service)},
-			opStage{attempts: r.composeAttempts(resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
+			opStage{label: "pull", attempts: r.composeAttempts(resolved.Path, compose, "pull", compose.Service)},
+			opStage{label: "recreate", attempts: r.composeAttempts(resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
 		)
 	case strings.HasPrefix(slug, "container."):
 		verb := strings.TrimPrefix(slug, "container.")
@@ -679,8 +695,8 @@ func (r *nativeOpRunner) dispatch(
 			// every service the project declares: fetch the images, then
 			// recreate on them.
 			stages = append(stages,
-				opStage{attempts: r.composeAttemptsFor(ctx, compose, "pull")},
-				opStage{attempts: r.composeAttemptsFor(ctx, compose, "up", "-d", "--force-recreate")},
+				opStage{label: "pull", attempts: r.composeAttemptsFor(ctx, compose, "pull")},
+				opStage{label: "recreate", attempts: r.composeAttemptsFor(ctx, compose, "up", "-d", "--force-recreate")},
 			)
 			break
 		}
@@ -694,12 +710,100 @@ func (r *nativeOpRunner) dispatch(
 	}
 	if len(stages) == 0 {
 		if len(attempts) == 0 {
-			return executionResponse{}, 0, &requestError{status: http.StatusBadGateway, message: "no container runtime available"}
+			return nativeOpPlan{}, &requestError{status: http.StatusBadGateway, message: "no container runtime available"}
 		}
-		stages = []opStage{{attempts: attempts}}
+		stages = []opStage{{label: nativeOpVerb(slug), attempts: attempts}}
 	}
-	response, status := r.executeNative(ctx, slug, nativeOpDisplayNames[slug], targetLabel, stages, timeout, source, invokedBy)
+	return nativeOpPlan{stages: stages, target: targetLabel, timeout: timeout}, nil
+}
+
+// nativeOpVerb is the verb part of a native slug: "pull" for container.pull.
+// It is the label of a one-stage operation, and nothing else depends on it.
+func nativeOpVerb(slug string) string {
+	if _, verb, ok := strings.Cut(slug, "."); ok {
+		return verb
+	}
+	return slug
+}
+
+// dispatch runs a native operation to completion inside the caller's request.
+// The transports that can hold a request open — stdio over SSH, a scheduled
+// job — use it; the ones whose client will not wait use [dispatchTask].
+// Request-level failures return a requestError; execution outcomes return an
+// executionResponse with the usual status codes (502 for non-zero exit, 504
+// for timeout).
+func (r *nativeOpRunner) dispatch(
+	ctx context.Context,
+	slug string,
+	params opParams,
+	source string,
+	invokedBy string,
+) (executionResponse, int, *requestError) {
+	plan, requestErr := r.planNativeOp(ctx, slug, params)
+	if requestErr != nil {
+		return executionResponse{}, 0, requestErr
+	}
+	if !r.acquireSlot() {
+		return executionResponse{Name: slug}, http.StatusTooManyRequests, nil
+	}
+	defer r.releaseSlot()
+	runCtx, cancel := r.runContext(ctx, plan.timeout)
+	defer cancel()
+	response, status := r.runStages(runCtx, slug, nativeOpDisplayNames[slug], plan.target, plan.stages, source, invokedBy, nil)
 	return response, status, nil
+}
+
+// taskNativeOp reports whether [slug] starts a task instead of holding the
+// request it arrived on. It is exactly the set of operations that pull an image
+// and the compose recreates that follow a pull: those are the ones measured in
+// minutes, and no client's read timeout outlasts them.
+func taskNativeOp(slug string) bool {
+	switch slug {
+	case "container.pull", "container.update", "compose.pull", "compose.update", "compose.recreate":
+		return true
+	}
+	return false
+}
+
+// dispatchTask starts [slug] as a task and returns it before the work is done.
+// The run has its own deadline and is detached from [ctx]: a caller that goes
+// away — a browser tab, an HTTP client's read timeout, a phone that slept — no
+// longer aborts an operation halfway through, which for a stack update is the
+// difference between a pulled image and a half-recreated stack. What stops it
+// instead is the operator (the cancel route) or the daemon shutting down.
+func (r *nativeOpRunner) dispatchTask(
+	ctx context.Context,
+	slug string,
+	params opParams,
+	source string,
+	invokedBy string,
+) (*opTask, *requestError) {
+	plan, requestErr := r.planNativeOp(ctx, slug, params)
+	if requestErr != nil {
+		return nil, requestErr
+	}
+	if !r.acquireSlot() {
+		return nil, &requestError{
+			status:  http.StatusTooManyRequests,
+			message: "another native operation is already running; try again when it finishes",
+		}
+	}
+	runCtx, cancel := r.runContext(context.WithoutCancel(ctx), plan.timeout)
+	task := newOpTask(
+		newTaskID(), slug, nativeOpDisplayNames[slug], plan.target,
+		source, invokedBy, plan.stages, cancel,
+	)
+	r.tasks.add(task)
+	go func() {
+		defer r.releaseSlot()
+		defer cancel()
+		response, _ := r.runStages(
+			runCtx, slug, task.displayName, task.target,
+			plan.stages, source, invokedBy, task,
+		)
+		task.finish(response, runCtx.Err(), plan.timeout)
+	}()
+	return task, nil
 }
 
 // resolveOpContainer finds [target] on one of the probed runtimes (podman
@@ -904,12 +1008,12 @@ func (r *nativeOpRunner) runtimePullAttempts(path, imageRef string) []opAttempt 
 // attempt's output and exit code: the `sudo -n` or alternate-runtime variant is
 // an implementation detail, so the direct attempt's message is the one an
 // operator should see.
-func runStage(ctx context.Context, attempts []opAttempt) (string, string, int, error) {
+func runStage(ctx context.Context, attempts []opAttempt, sink io.Writer) (string, string, int, error) {
 	var stdout, stderr string
 	var exitCode int
 	var primaryErr error
 	for _, attempt := range attempts {
-		attemptStdout, attemptStderr, attemptExit, err := runOpOnce(ctx, attempt)
+		attemptStdout, attemptStderr, attemptExit, err := runOpOnce(ctx, attempt, sink)
 		if err == nil {
 			return attemptStdout, attemptStderr, 0, nil
 		}
@@ -973,48 +1077,42 @@ func validNativeDirectory(value string) bool {
 	return value != "" && !strings.Contains(value, "..") && nativeDirectoryPattern.MatchString(value)
 }
 
-// executeNative runs [stages] in order under one concurrency slot and one
-// timeout budget, recording a single audit entry and updating the execution
-// counters. Within a stage a failed attempt retries with the next (the sudo or
+// runStages runs [stages] in order under the caller's concurrency slot and
+// deadline, recording a single audit entry and updating the execution counters.
+// Within a stage a failed attempt retries with the next (the sudo or
 // alternate-runtime variant), and the first attempt's failure stays the primary
 // signal when every one fails, mirroring the collectors; a stage that fails
 // ends the operation, because a later stage depends on it. A multi-stage
 // operation reports every stage's output, since what was downloaded and what
 // was recreated are both worth showing.
-func (r *nativeOpRunner) executeNative(
+//
+// [task] is the run a client is watching, and the only difference between a
+// task and a request-scoped run: it is told when a stage starts and ends, and
+// the commands' output streams into it as it is written.
+func (r *nativeOpRunner) runStages(
 	ctx context.Context,
 	slug string,
 	displayName string,
 	target string,
 	stages []opStage,
-	timeout time.Duration,
 	source string,
 	invokedBy string,
+	task *opTask,
 ) (executionResponse, int) {
-	select {
-	case r.executor.slots <- struct{}{}:
-		defer func() { <-r.executor.slots }()
-	default:
-		return executionResponse{Name: slug}, http.StatusTooManyRequests
-	}
 	started := time.Now()
-	// A zero timeout disables the deadline; compose and image operations keep
-	// their explicit 5m bound so they never run unbounded.
-	var runCtx context.Context
-	var cancel context.CancelFunc
-	if timeout <= 0 {
-		runCtx, cancel = context.WithCancel(ctx)
-	} else {
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
-	}
-	defer cancel()
 	response := executionResponse{Name: slug}
 	var stdout, stderr strings.Builder
 	var failure error
 	for _, stage := range stages {
-		stageStdout, stageStderr, exitCode, err := runStage(runCtx, stage.attempts)
+		if task != nil {
+			task.stageStarted(stage.label)
+		}
+		stageStdout, stageStderr, exitCode, err := runStage(ctx, stage.attempts, outputSink(task))
 		appendStageOutput(&stdout, stageStdout)
 		appendStageOutput(&stderr, stageStderr)
+		if task != nil {
+			task.stageFinished(stage.label, err == nil)
+		}
 		if err != nil {
 			failure = err
 			response.ExitCode = exitCode
@@ -1047,7 +1145,7 @@ func (r *nativeOpRunner) executeNative(
 	if failure != nil {
 		r.executor.counts.failures.Add(1)
 		status = http.StatusBadGateway
-		if runCtx.Err() == context.DeadlineExceeded {
+		if ctx.Err() == context.DeadlineExceeded {
 			status = http.StatusGatewayTimeout
 		}
 	} else {
@@ -1057,6 +1155,40 @@ func (r *nativeOpRunner) executeNative(
 		r.publishFailure(slug, displayName, target, response, source, invokedBy, duration)
 	}
 	return response, status
+}
+
+// outputSink is the writer a stage's commands stream into, and nil when nobody
+// is watching. A typed nil task must not become a non-nil io.Writer.
+func outputSink(task *opTask) io.Writer {
+	if task == nil {
+		return nil
+	}
+	return task
+}
+
+// acquireSlot takes the executor's concurrency slot without waiting: a daemon
+// already at its limit answers "too many runs" rather than queueing work it
+// cannot start. The slot is held until the run ends, so it bounds tasks and
+// script actions together, exactly as it did when every run lived inside a
+// request.
+func (r *nativeOpRunner) acquireSlot() bool {
+	select {
+	case r.executor.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *nativeOpRunner) releaseSlot() { <-r.executor.slots }
+
+// runContext bounds a run. A zero timeout disables the deadline; the slow
+// operations keep their explicit bound so they never run unbounded.
+func (r *nativeOpRunner) runContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 // publishFailure reports a failed native operation on its own notification
@@ -1102,7 +1234,11 @@ func (r *nativeOpRunner) publishFailure(slug, displayName, target string, respon
 }
 
 // runOpOnce runs one attempt with bounded stdout/stderr capture and no shell.
-func runOpOnce(ctx context.Context, attempt opAttempt) (stdout, stderr string, exitCode int, err error) {
+// When [sink] is given — a task a client is watching — both streams are also
+// written to it as they are produced, in the order the command printed them,
+// because a pull that takes minutes is worth following while it runs; the
+// bounded buffers still hold the attempt's own result.
+func runOpOnce(ctx context.Context, attempt opAttempt, sink io.Writer) (stdout, stderr string, exitCode int, err error) {
 	cmd := exec.CommandContext(ctx, attempt.command, attempt.args...)
 	cmd.Dir = attempt.cwd
 	if len(attempt.env) > 0 {
@@ -1111,6 +1247,10 @@ func runOpOnce(ctx context.Context, attempt opAttempt) (stdout, stderr string, e
 	cmd.WaitDelay = execPipeWaitDelay
 	outBuf, errBuf := &limitedBuffer{limit: 8192}, &limitedBuffer{limit: 8192}
 	cmd.Stdout, cmd.Stderr = outBuf, errBuf
+	if sink != nil {
+		cmd.Stdout = io.MultiWriter(outBuf, sink)
+		cmd.Stderr = io.MultiWriter(errBuf, sink)
+	}
 	err = cmd.Run()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

@@ -771,6 +771,9 @@ POST   /api/v1/firewall/:action         action = enable|disable|allow|deny|delet
 GET    /api/v1/compose/stacks           the managed stack registry, with what each stack runs
 POST   /api/v1/compose/stacks/scan      assign stacks: {"path": "…"} | {"roots": ["…"]} | neither (configured roots)
 DELETE /api/v1/compose/stacks/:project  unassign one stack
+GET    /api/v1/tasks                    the recent operations, newest first
+GET    /api/v1/tasks/:id                one operation, with its output since ?since=<bytes>
+POST   /api/v1/tasks/:id/cancel         stop a running operation
 ```
 
 All are authenticated with the metrics secret and a body signature, like the
@@ -839,6 +842,57 @@ Both run under the executor's concurrency slot and audit trail like every other
 native op, with a 5 minute bound (a pull is slow by nature), so they are also
 available as scheduled jobs and through the cloud relay:
 `name: container.update` with `{"id": "web"}` in the body.
+
+#### Following a long operation
+
+The operations that pull an image — `container.pull`, `container.update`,
+`compose.pull`, `compose.update`, `compose.recreate` — are measured in minutes,
+which no HTTP client waits for: MaidKit's own client gives up after ten seconds
+of silence (its read timeout), and a browser or a proxy in between may give up
+sooner. Those five answer `202` with a **task** instead of holding the request:
+
+```json
+{
+  "ok": true,
+  "task": {
+    "id": "9f2c…", "name": "compose.update", "display_name": "Update compose stack",
+    "target": "myapp", "source": "http", "status": "running",
+    "started_at": "2026-10-03T11:20:31Z",
+    "stages": [
+      {"label": "pull", "status": "running", "started_at": "2026-10-03T11:20:31Z"},
+      {"label": "recreate", "status": "pending"}
+    ],
+    "ok": false, "exit_code": 0, "stdout": "", "stderr": "", "output_bytes": 412
+  },
+  "output": "Pulling web …", "output_from": 0
+}
+```
+
+- The run belongs to the **daemon**, not to the connection that asked for it: a
+  client that disconnects mid-pull no longer aborts the operation halfway
+  through. What stops it is `POST /api/v1/tasks/:id/cancel`, the 5 minute bound
+  it has always had, or the daemon shutting down (which cancels everything still
+  running, since a task is the daemon's work and not the client's).
+- `GET /api/v1/tasks/:id` returns the task with the output written since
+  `?since=<bytes>`: a client tracks the byte count it has shown and asks for
+  what came after it. Output is retained as a 32 KiB tail, so a client that has
+  fallen behind gets the tail with `"output_truncated": true` and replaces what
+  it holds instead of appending. Without `since`, the response carries the tail.
+- `stages` is the plan the run is following, not a log of what has happened:
+  a stage is `pending`, `running`, `succeeded` or `failed`, and the stages a
+  failed or cancelled run never reached stay `pending`. `pull` and `recreate`
+  are the labels used so far; a one-stage operation names its single stage after
+  its verb.
+- On completion `status` is `succeeded`, `failed` or `canceled`, with the same
+  `ok`/`exit_code`/`stdout`/`stderr` a request-scoped run returns, and `error`
+  saying why when it did not succeed.
+- Tasks are in memory: a restart loses them along with the runs themselves, and
+  the store keeps the 32 most recent finished ones (`GET /api/v1/tasks` is how a
+  client that lost an id finds a run again).
+- The transports that *can* hold a request open keep the old behaviour: the
+  same operation over stdio (SSH) or through the cloud relay still returns its
+  result in the response, because nothing on those paths times out. Tasks exist
+  for the HTTP clients that do.
 
 #### Managed compose stacks
 
