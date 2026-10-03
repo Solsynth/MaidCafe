@@ -466,30 +466,54 @@ type composeTool struct {
 	prefix []string
 }
 
-// composeTools is the runtime's compose invocation followed by the standalone
-// tool when this host has one, in the order a step tries them.
+// composeTools is the compose invocations for the runtime at [runtimePath], in
+// the order a step tries them.
+//
+// The order differs per runtime, because their `compose` subcommand is a
+// different kind of thing. Docker *implements* compose — the plugin is the tool
+// — so `docker compose` comes first and the standalone binary is the fallback
+// for a host that has only that. Podman does not implement compose at all: its
+// `podman compose` is a wrapper that execs whichever provider is installed,
+// normally the very `podman-compose` the host also has. There the direct tool
+// goes first and the wrapper second, because the wrapper only adds a layer that
+// evaluates the arguments before forwarding them — and that layer is where a
+// flag one tool accepts and the other rejects kills a stack update before it
+// runs (`--ansi never`, the plugin's spelling, against podman-compose).
 func composeTools(runtimePath string) []composeTool {
-	tools := []composeTool{{command: runtimePath, prefix: []string{"compose"}}}
-	if standalone := standaloneComposePath(runtimePath); standalone != "" {
-		tools = append(tools, composeTool{command: standalone})
+	runtimeTool := composeTool{command: runtimePath, prefix: []string{"compose"}}
+	standalone := standaloneComposePath(runtimePath)
+	if standalone == "" {
+		return []composeTool{runtimeTool}
 	}
-	return tools
+	direct := composeTool{command: standalone}
+	if composeToolName(runtimePath) == "podman-compose" {
+		return []composeTool{direct, runtimeTool}
+	}
+	return []composeTool{runtimeTool, direct}
 }
 
-// standaloneComposePath is the standalone compose tool for the runtime at
-// [path] (podman-compose, docker-compose), or "" when this host has none.
+// composeToolName is the standalone compose tool for the runtime at [path]
+// — `podman-compose`, `docker-compose` — or "" when this daemon does not
+// recognize the runtime.
 //
 // The tool is derived from the runtime's own name so a docker host is never
 // sent to podman-compose: the two write to different image stores, and pulling
 // into the wrong one would leave the container exactly where it was.
-func standaloneComposePath(runtimePath string) string {
+func composeToolName(runtimePath string) string {
 	name := strings.ToLower(filepath.Base(runtimePath))
 	switch {
 	case strings.Contains(name, "podman"):
-		name = "podman-compose"
+		return "podman-compose"
 	case strings.Contains(name, "docker"):
-		name = "docker-compose"
-	default:
+		return "docker-compose"
+	}
+	return ""
+}
+
+// standaloneComposePath resolves that tool on this host, or "" when it has none.
+func standaloneComposePath(runtimePath string) string {
+	name := composeToolName(runtimePath)
+	if name == "" {
 		return ""
 	}
 	path, err := exec.LookPath(name)

@@ -821,19 +821,24 @@ configuration the same way the container's creation did.
   daemon's working directory. When the labels record no file list at all, the
   step runs `compose` in the directory and lets compose read the files it would
   read by itself.
-- The compose command is the runtime's own (`podman compose`, `docker compose`)
-  and, on a host that has only the standalone tool, `podman-compose` or
-  `docker-compose` — the tool is chosen from the runtime's own name, so a
-  docker host is never sent to `podman-compose`. No form is given an ANSI flag.
-  The runtime's `compose` subcommand is a dispatcher rather than an
-  implementation — `podman compose` on a host with only `podman-compose` *is*
-  `podman-compose` — and the providers spell the flag differently (`--ansi
-  never` for the plugin, `--no-ansi` for the standalone), so the flag that one
-  accepts ends the command on the other before it starts: `podman-compose:
-  error: argument command: invalid choice: 'never'`. Nothing needs it, because
-  the daemon never gives compose a terminal and compose's own `ansi: auto`
-  disables colors when it writes to a pipe, which is the only place this
-  output ever goes.
+- The compose command is chosen from the runtime's own name, so a docker host is
+  never sent to `podman-compose`: the two write to different image stores, and
+  pulling into the wrong one would leave the container exactly where it was.
+  **Podman** runs `podman-compose` when the host has it, with `podman compose`
+  only as the fallback — podman does not implement compose, so its subcommand is
+  a wrapper that execs whichever provider is installed, normally that same
+  `podman-compose`. Calling the tool directly is one layer less, and that layer
+  is where an argument it evaluates and forwards can kill the command.
+  **Docker** runs `docker compose` first, because there the plugin *is* the
+  implementation, with `docker-compose` as the fallback for a host that has only
+  it.
+- Neither form is given an ANSI flag. The providers spell it differently
+  (`--ansi never` for the compose plugin, `--no-ansi` for the standalone tools),
+  so the spelling one accepts ends the command on the other before it starts:
+  `podman-compose: error: argument command: invalid choice: 'never'`. Nothing
+  needs it — the daemon never gives compose a terminal, and compose's own
+  `ansi: auto` disables colors when it writes to a pipe, which is the only place
+  this output ever goes.
 - A container that is not compose-managed is refused (`400`) with the reason.
   Neither runtime can recreate a plain `docker run` container from its own
   configuration, and replaying `inspect` into a `run` argv silently drops

@@ -291,11 +291,12 @@ func TestComposeAttemptsCarryNoAnsiFlag(t *testing.T) {
 	}
 }
 
-// TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone asserts the
-// fallback a host with only podman-compose needs: the runtime's own subcommand
-// is tried first, and the standalone tool after it, with the same project, the
-// same files and no `compose` word of its own.
-func TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone(t *testing.T) {
+// TestComposeAttemptsPreferPodmanComposeDirectly pins the order on a podman
+// host: the standalone tool is the one that runs, and `podman compose` — which
+// only forwards to a provider — is the fallback, not the first attempt. Going
+// through the wrapper is what let its argument handling reject a stack update
+// before podman-compose ever saw it.
+func TestComposeAttemptsPreferPodmanComposeDirectly(t *testing.T) {
 	standalone := fakeCommand(t, "podman-compose", "#!/bin/sh\nexit 0\n")
 	runtime := fakeCommand(t, "podman", "#!/bin/sh\nexit 0\n")
 	runner := newTestOpsRunner(t, map[string]string{"podman": runtime})
@@ -305,7 +306,7 @@ func TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone(t *testing.T) 
 
 	attempts := runner.composeAttempts(runtime, target, "up", "-d", "--force-recreate", "web")
 	// The `sudo -n` variants are added when the host has sudo, which a test
-	// machine usually does; the relation under test is plugin-then-standalone.
+	// machine usually does; the relation under test is which tool runs first.
 	direct := make([]opAttempt, 0, 2)
 	for _, attempt := range attempts {
 		if attempt.command == runtime || attempt.command == standalone {
@@ -313,23 +314,57 @@ func TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone(t *testing.T) 
 		}
 	}
 	if len(direct) != 2 {
-		t.Fatalf("direct attempts = %+v, want the runtime and the standalone tool", direct)
+		t.Fatalf("direct attempts = %+v, want the standalone tool and the runtime", direct)
 	}
 	first := direct[0]
-	if first.command != runtime || !equalStrings(first.args, []string{
+	if first.command != standalone || !equalStrings(first.args, []string{
+		"-p", "myapp", "-f", "/srv/myapp/compose.yml", "up", "-d", "--force-recreate", "web",
+	}) {
+		t.Fatalf("standalone attempt = %s %v", first.command, first.args)
+	}
+	second := direct[1]
+	if second.command != runtime || !equalStrings(second.args, []string{
 		"compose", "-p", "myapp", "-f", "/srv/myapp/compose.yml",
 		"up", "-d", "--force-recreate", "web",
 	}) {
-		t.Fatalf("runtime attempt = %s %v", first.command, first.args)
-	}
-	second := direct[1]
-	if second.command != standalone || !equalStrings(second.args, []string{
-		"-p", "myapp", "-f", "/srv/myapp/compose.yml", "up", "-d", "--force-recreate", "web",
-	}) {
-		t.Fatalf("standalone attempt = %s %v", second.command, second.args)
+		t.Fatalf("runtime attempt = %s %v", second.command, second.args)
 	}
 	if second.cwd != "/srv/myapp" {
-		t.Fatalf("standalone cwd = %q, want the project directory", second.cwd)
+		t.Fatalf("runtime cwd = %q, want the project directory", second.cwd)
+	}
+	if first.cwd != "/srv/myapp" {
+		t.Fatalf("standalone cwd = %q, want the project directory", first.cwd)
+	}
+}
+
+// TestComposeAttemptsPreferTheDockerPlugin is the other half of the order rule:
+// docker implements compose, so its own subcommand stays the first attempt and
+// the standalone binary is the fallback for a host that has only that.
+func TestComposeAttemptsPreferTheDockerPlugin(t *testing.T) {
+	standalone := fakeCommand(t, "docker-compose", "#!/bin/sh\nexit 0\n")
+	runtime := fakeCommand(t, "docker", "#!/bin/sh\nexit 0\n")
+	runner := newTestOpsRunner(t, map[string]string{"docker": runtime})
+	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
+
+	attempts := runner.composeAttempts(runtime, target, "pull")
+	direct := make([]opAttempt, 0, 2)
+	for _, attempt := range attempts {
+		if attempt.command == runtime || attempt.command == standalone {
+			direct = append(direct, attempt)
+		}
+	}
+	if len(direct) != 2 {
+		t.Fatalf("direct attempts = %+v, want the plugin and the standalone tool", direct)
+	}
+	if direct[0].command != runtime || !equalStrings(direct[0].args, []string{
+		"compose", "-p", "myapp", "pull",
+	}) {
+		t.Fatalf("plugin attempt = %s %v", direct[0].command, direct[0].args)
+	}
+	if direct[1].command != standalone || !equalStrings(direct[1].args, []string{
+		"-p", "myapp", "pull",
+	}) {
+		t.Fatalf("standalone attempt = %s %v", direct[1].command, direct[1].args)
 	}
 }
 
