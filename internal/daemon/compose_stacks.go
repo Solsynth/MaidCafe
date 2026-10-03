@@ -451,21 +451,25 @@ const composeFileMaxBytes = 256 << 10
 // subcommand, or the standalone tool for that runtime.
 type composeTool struct {
 	command string
-	// prefix is what precedes the compose arguments. The plugin form needs the
-	// `compose` word and is asked for no ANSI; the standalone tools spell that
-	// flag differently (`--no-ansi`), and an unrecognized flag fails the whole
-	// command, so the standalone form carries neither. A colored line in
-	// captured output is the smaller cost.
+	// prefix is what precedes the compose arguments. The runtime's subcommand
+	// needs the `compose` word; the standalone tools are the command itself.
+	//
+	// Neither carries an ANSI flag. The runtime's `compose` subcommand is a
+	// dispatcher, not an implementation: podman execs whichever provider is
+	// installed — often `podman-compose`, whose flag is `--no-ansi` — so a flag
+	// spelled for one provider reaches a tool that rejects it, and an
+	// unrecognized flag fails the command before anything runs
+	// (`podman-compose: error: argument command: invalid choice: 'never'`).
+	// Asking for none costs nothing: compose writes to a pipe here and never to
+	// a terminal, and its own `ansi: auto` turns colors off for exactly that
+	// case. A colored line in captured output is cheaper than a failed pull.
 	prefix []string
 }
 
 // composeTools is the runtime's compose invocation followed by the standalone
 // tool when this host has one, in the order a step tries them.
 func composeTools(runtimePath string) []composeTool {
-	tools := []composeTool{{
-		command: runtimePath,
-		prefix:  []string{"compose", "--ansi", "never"},
-	}}
+	tools := []composeTool{{command: runtimePath, prefix: []string{"compose"}}}
 	if standalone := standaloneComposePath(runtimePath); standalone != "" {
 		tools = append(tools, composeTool{command: standalone})
 	}

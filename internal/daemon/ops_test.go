@@ -188,7 +188,7 @@ func TestNativeComposeOpUsesDirectoryAndArgs(t *testing.T) {
 	if len(lines) != 2 || lines[0] != "cwd="+dir {
 		t.Fatalf("cwd not applied; recorded %q", got)
 	}
-	if lines[1] != "args=compose --ansi never -p myapp up -d" {
+	if lines[1] != "args=compose -p myapp up -d" {
 		t.Fatalf("recorded args %q", lines[1])
 	}
 }
@@ -404,9 +404,9 @@ func TestContainerUpdateOpRecreatesComposeContainer(t *testing.T) {
 	got := strings.Join(recordedRuntimeCalls(t, calls), "|")
 	want := strings.Join([]string{
 		"cwd=" + workingDir,
-		strings.Join([]string{"compose", "--ansi", "never", "-p", "app", "-f", file, "pull", "web"}, "|"),
+		strings.Join([]string{"compose", "-p", "app", "-f", file, "pull", "web"}, "|"),
 		"cwd=" + workingDir,
-		strings.Join([]string{"compose", "--ansi", "never", "-p", "app", "-f", file, "up", "-d", "--force-recreate", "web"}, "|"),
+		strings.Join([]string{"compose", "-p", "app", "-f", file, "up", "-d", "--force-recreate", "web"}, "|"),
 	}, "|")
 	if got != want {
 		t.Fatalf("recorded calls =\n%s\nwant\n%s", got, want)

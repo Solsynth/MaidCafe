@@ -824,9 +824,16 @@ configuration the same way the container's creation did.
 - The compose command is the runtime's own (`podman compose`, `docker compose`)
   and, on a host that has only the standalone tool, `podman-compose` or
   `docker-compose` — the tool is chosen from the runtime's own name, so a
-  docker host is never sent to `podman-compose`. The standalone form carries no
-  `--ansi` flag: the plugin spells it `--ansi never` and the standalone tools
-  spell it `--no-ansi`, and an unrecognized flag would fail the whole command.
+  docker host is never sent to `podman-compose`. No form is given an ANSI flag.
+  The runtime's `compose` subcommand is a dispatcher rather than an
+  implementation — `podman compose` on a host with only `podman-compose` *is*
+  `podman-compose` — and the providers spell the flag differently (`--ansi
+  never` for the plugin, `--no-ansi` for the standalone), so the flag that one
+  accepts ends the command on the other before it starts: `podman-compose:
+  error: argument command: invalid choice: 'never'`. Nothing needs it, because
+  the daemon never gives compose a terminal and compose's own `ansi: auto`
+  disables colors when it writes to a pipe, which is the only place this
+  output ever goes.
 - A container that is not compose-managed is refused (`400`) with the reason.
   Neither runtime can recreate a plain `docker run` container from its own
   configuration, and replaying `inspect` into a `run` argv silently drops

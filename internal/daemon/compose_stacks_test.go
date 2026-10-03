@@ -260,6 +260,37 @@ func TestComposeLabelPathsStayInsideTheProject(t *testing.T) {
 	}
 }
 
+// TestComposeAttemptsCarryNoAnsiFlag is the guard for a pull that never
+// started: the runtime's `compose` subcommand is a dispatcher, so on a podman
+// host it hands the arguments to whichever provider is installed —
+// `podman-compose` here. `--ansi never` is the *plugin's* spelling; the
+// provider only knows `--no-ansi`, and its argument parser ends the command
+// with a usage error before anything runs:
+//
+//	podman-compose: error: argument command: invalid choice: 'never'
+//	Error: executing /usr/local/bin/podman-compose --ansi never -p drasl …
+//
+// Nothing needs the flag: the daemon never gives compose a terminal, and
+// compose's own `ansi: auto` disables colors when it is writing to a pipe.
+func TestComposeAttemptsCarryNoAnsiFlag(t *testing.T) {
+	fakeCommand(t, "podman-compose", "#!/bin/sh\nexit 0\n")
+	runtime := fakeCommand(t, "podman", "#!/bin/sh\nexit 0\n")
+	runner := newTestOpsRunner(t, map[string]string{"podman": runtime})
+	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
+
+	attempts := runner.composeAttempts(runtime, target, "pull")
+	if len(attempts) == 0 {
+		t.Fatal("no compose attempts were built")
+	}
+	for _, attempt := range attempts {
+		for _, arg := range attempt.args {
+			if arg == "--ansi" || arg == "--no-ansi" {
+				t.Fatalf("attempt %s carries %s: %v", attempt.command, arg, attempt.args)
+			}
+		}
+	}
+}
+
 // TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone asserts the
 // fallback a host with only podman-compose needs: the runtime's own subcommand
 // is tried first, and the standalone tool after it, with the same project, the
@@ -286,7 +317,7 @@ func TestComposeAttemptsUseTheStandaloneToolWhenTheRuntimeHasNone(t *testing.T) 
 	}
 	first := direct[0]
 	if first.command != runtime || !equalStrings(first.args, []string{
-		"compose", "--ansi", "never", "-p", "myapp", "-f", "/srv/myapp/compose.yml",
+		"compose", "-p", "myapp", "-f", "/srv/myapp/compose.yml",
 		"up", "-d", "--force-recreate", "web",
 	}) {
 		t.Fatalf("runtime attempt = %s %v", first.command, first.args)
@@ -423,10 +454,10 @@ func TestComposeScanAssignsAProjectAndTheContainerUpdateUsesIt(t *testing.T) {
 	// read as a whole.
 	recorded := strings.Join(recordedRuntimeCalls(t, calls), " ")
 	composeFile := filepath.Join(projectDir, "compose.yaml")
-	if !strings.Contains(recorded, "cwd="+projectDir+" compose --ansi never -p myapp -f "+composeFile+" up -d --force-recreate web") {
+	if !strings.Contains(recorded, "cwd="+projectDir+" compose -p myapp -f "+composeFile+" up -d --force-recreate web") {
 		t.Fatalf("the recreate did not run in the scanned project directory: %s", recorded)
 	}
-	if !strings.Contains(recorded, "compose --ansi never -p myapp -f "+composeFile+" pull web") {
+	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" pull web") {
 		t.Fatalf("the update did not pull first: %s", recorded)
 	}
 
@@ -480,13 +511,13 @@ func TestComposeUpdateActionRunsBothStages(t *testing.T) {
 	_ = awaitTask(t, base, taskFrom(t, status, body).ID)
 	recorded := strings.Join(recordedRuntimeCalls(t, calls), " ")
 	composeFile := filepath.Join(projectDir, "compose.yaml")
-	if !strings.Contains(recorded, "compose --ansi never -p myapp -f "+composeFile+" pull") {
+	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" pull") {
 		t.Fatalf("no pull stage: %s", recorded)
 	}
-	if !strings.Contains(recorded, "compose --ansi never -p myapp -f "+composeFile+" up -d --force-recreate") {
+	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" up -d --force-recreate") {
 		t.Fatalf("no recreate stage: %s", recorded)
 	}
-	if !strings.Contains(recorded, "cwd="+projectDir+" compose --ansi never") {
+	if !strings.Contains(recorded, "cwd="+projectDir+" compose ") {
 		t.Fatalf("the upgrade did not run in the stack's directory: %s", recorded)
 	}
 }
