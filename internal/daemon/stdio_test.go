@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -171,11 +170,7 @@ func TestStdioNativeOpProtocol(t *testing.T) {
 	if !ok || result["ok"] != true {
 		t.Fatalf("unexpected native op result: %#v", response)
 	}
-	got, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(got)) != "restart\nweb" {
+	if got := recordedRuntimeArgs(t, out); got != "restart\nweb" {
 		t.Fatalf("recorded args %q, want %q", got, "restart\nweb")
 	}
 

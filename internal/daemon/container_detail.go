@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -101,22 +100,19 @@ func (a *App) resolveContainer(ctx context.Context, ref string) (containerRef, b
 }
 
 // runRuntimeRead runs one read-only runtime command, retrying through `sudo
-// -n` when the direct invocation fails and the daemon is not root — the same
-// never-interactive elevation the collectors use, and the reason a detail
-// request works against a rootful runtime behind a non-root daemon. The
-// runtime's own stderr becomes the error: "no such container" is actionable,
-// "exit status 125" is not.
+// -n` when the direct invocation fails and elevating that runtime means
+// anything (see elevationAttempt) — the same never-interactive elevation the
+// collectors use, and the reason a detail request works against a rootful
+// runtime behind a non-root daemon. The runtime's own stderr becomes the
+// error: "no such container" is actionable, "exit status 125" is not.
 func runRuntimeRead(ctx context.Context, timeout time.Duration, limit int, command string, args ...string) ([]byte, error) {
 	stdout, stderr, err := runReadOnce(ctx, timeout, limit, command, args...)
 	if err == nil {
 		return stdout, nil
 	}
-	if os.Geteuid() != 0 {
-		if _, lookupErr := exec.LookPath("sudo"); lookupErr == nil {
-			elevated := append([]string{"-n", command}, args...)
-			if elevatedOut, _, elevatedErr := runReadOnce(ctx, timeout, limit, "sudo", elevated...); elevatedErr == nil {
-				return elevatedOut, nil
-			}
+	if elevated, ok := elevationAttempt(ctx, command, args...); ok {
+		if elevatedOut, _, elevatedErr := runReadOnce(ctx, timeout, limit, elevated[0], elevated[1:]...); elevatedErr == nil {
+			return elevatedOut, nil
 		}
 	}
 	if message := strings.TrimSpace(stderr); message != "" {
@@ -502,15 +498,13 @@ func runRuntimeReadBounded(ctx context.Context, path string, args []string) ([]b
 	if err == nil {
 		return out, nil
 	}
-	if os.Geteuid() != 0 {
-		if _, lookupErr := exec.LookPath("sudo"); lookupErr == nil {
-			elevatedOut, elevatedErr := runCommandBounded(ctx, "sudo", append([]string{"-n", path}, args...)...)
-			if elevatedErr == nil {
-				return elevatedOut, nil
-			}
-			if message := strings.TrimSpace(string(elevatedOut)); message != "" {
-				return nil, fmt.Errorf("%s", message)
-			}
+	if elevated, ok := elevationAttempt(ctx, path, args...); ok {
+		elevatedOut, elevatedErr := runCommandBounded(ctx, elevated[0], elevated[1:]...)
+		if elevatedErr == nil {
+			return elevatedOut, nil
+		}
+		if message := strings.TrimSpace(string(elevatedOut)); message != "" {
+			return nil, fmt.Errorf("%s", message)
 		}
 	}
 	if message := strings.TrimSpace(string(out)); message != "" {

@@ -659,9 +659,13 @@ func TestProcessTableCacheCoalescesCollectors(t *testing.T) {
 
 func TestContainerSnapshotCacheCoalescesConcurrentConsumers(t *testing.T) {
 	countPath := filepath.Join(t.TempDir(), "podman-count")
-	podman := fakeCommand(t, "podman", "#!/bin/sh\nprintf x >> "+countPath+"\nprintf '%s\\n' '{\"Id\":\"abc\",\"Names\":[\"web\"],\"Image\":\"nginx\",\"State\":\"running\",\"Status\":\"Up\"}'\n")
+	podman := fakeCommand(t, "podman", "#!/bin/sh\n"+
+		"if [ \"$1\" = info ]; then printf 'true systemd\\n'; exit 0; fi\n"+
+		"printf x >> "+countPath+"\n"+
+		"printf '%s\\n' '{\"Id\":\"abc\",\"Names\":[\"web\"],\"Image\":\"nginx\",\"State\":\"running\",\"Status\":\"Up\"}'\n")
 	probe := &runtimeProbeState{
 		probed:       true,
+		runtimes:     []string{"podman"},
 		runtimePaths: map[string]string{"podman": podman},
 	}
 	collector := &ContainersCollector{probe: probe}
@@ -677,5 +681,150 @@ func TestContainerSnapshotCacheCoalescesConcurrentConsumers(t *testing.T) {
 	}
 	if got := len(count); got != 1 {
 		t.Fatalf("podman ps invocations = %d, want 1", got)
+	}
+}
+
+// TestContainerSnapshotReportsWhatTheRuntimeIs pins the detection an operator
+// reads off the container list, which is the answer to "why does this host
+// repeat podman's cgroup warning on every invocation, and which tool is
+// actually in play". A runtime that does not answer reports neither, rather
+// than being guessed at.
+func TestContainerSnapshotReportsWhatTheRuntimeIs(t *testing.T) {
+	cases := []struct {
+		name            string
+		infoAnswer      string
+		wantRootless    *bool
+		wantCgroups     string
+		wantComposeTool string
+	}{
+		{
+			name: "podman answers rootless", infoAnswer: "printf 'true cgroupfs\\n'\n",
+			wantRootless: new(true), wantCgroups: "cgroupfs", wantComposeTool: "podman-compose",
+		},
+		{
+			name: "podman answers rootful", infoAnswer: "printf 'false systemd\\n'\n",
+			wantRootless: new(false), wantCgroups: "systemd", wantComposeTool: "podman-compose",
+		},
+		{
+			name: "podman stays silent", infoAnswer: "exit 1\n",
+			wantRootless: nil, wantCgroups: "", wantComposeTool: "podman-compose",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeCommand(t, "podman-compose", "#!/bin/sh\nexit 0\n")
+			podman := fakeCommand(t, "podman", "#!/bin/sh\n"+
+				"if [ \"$1\" = info ]; then "+tc.infoAnswer+"exit 0; fi\n"+
+				"exit 0\n")
+			// The probed set is pinned so the test reports on the fake podman
+			// alone, rather than whatever runtime the machine running it has.
+			probe := &runtimeProbeState{
+				probed:       true,
+				runtimes:     []string{"podman"},
+				runtimePaths: map[string]string{"podman": podman},
+			}
+			collector := &ContainersCollector{probe: probe}
+
+			data, err := collector.snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload containersPayload
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload.Runtimes) != 1 {
+				t.Fatalf("runtimes = %+v", payload.Runtimes)
+			}
+			got := payload.Runtimes[0]
+			switch {
+			case tc.wantRootless == nil && got.Rootless != nil:
+				t.Fatalf("a silent runtime was reported as rootless=%v", *got.Rootless)
+			case tc.wantRootless != nil && (got.Rootless == nil || *got.Rootless != *tc.wantRootless):
+				t.Fatalf("rootless = %v, want %v", got.Rootless, *tc.wantRootless)
+			}
+			if got.Cgroups != tc.wantCgroups {
+				t.Fatalf("cgroups = %q, want %q", got.Cgroups, tc.wantCgroups)
+			}
+			if got.ComposeTool != tc.wantComposeTool {
+				t.Fatalf("compose tool = %q, want %q", got.ComposeTool, tc.wantComposeTool)
+			}
+		})
+	}
+}
+
+// TestRuntimeModeReadsTheRuntimeOwnAnswer pins how the daemon learns what a
+// runtime is: from the runtime itself, not from the daemon's uid or its group
+// membership, so a daemon in the docker group on a rootful host and one
+// running its own rootless docker are told apart. A runtime that does not
+// answer stays unknown, which keeps the elevation a host like that has always
+// had.
+func TestRuntimeModeReadsTheRuntimeOwnAnswer(t *testing.T) {
+	cases := []struct {
+		name   string
+		binary string
+		body   string
+		want   runtimeFacts
+	}{
+		{"podman rootless", "podman", "printf 'true systemd\\n'\n", runtimeFacts{Rootless: true, Cgroups: "systemd", Known: true}},
+		{"podman rootless cgroupfs", "podman", "printf 'true cgroupfs\\n'\n", runtimeFacts{Rootless: true, Cgroups: "cgroupfs", Known: true}},
+		{"podman rootful", "podman", "printf 'false systemd\\n'\n", runtimeFacts{Rootless: false, Cgroups: "systemd", Known: true}},
+		{"podman silent", "podman", "exit 1\n", runtimeFacts{}},
+		{"docker rootless", "docker", "printf '[name=seccomp,name=rootless]\\n'\n", runtimeFacts{Rootless: true, Known: true}},
+		{"docker rootful", "docker", "printf '[name=seccomp,profile=builtin]\\n'\n", runtimeFacts{Rootless: false, Known: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := fakeCommand(t, tc.binary, "#!/bin/sh\n"+tc.body)
+			if got := probeRuntimeFacts(context.Background(), path); got != tc.want {
+				t.Fatalf("facts = %+v, want %+v", got, tc.want)
+			}
+			if got, want := probeRuntimeFacts(context.Background(), path).elevatable(), tc.want.elevatable(); got != want {
+				t.Fatalf("elevatable = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestRuntimeListElevationFollowsTheRuntimeMode pins what the collectors ask
+// before elevating a runtime command, which used to be a blind `sudo -n`
+// retry. A rootless runtime owns its containers, so an empty listing is the
+// truth about it and rising to root would answer with root's separate runtime
+// instead; a rootful one keeps the retry it always had, because the daemon
+// user genuinely cannot see root's containers.
+func TestRuntimeListElevationFollowsTheRuntimeMode(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("the daemon does not elevate when it is already root")
+	}
+	for _, tc := range []struct {
+		name         string
+		infoAnswer   string
+		wantElevated bool
+	}{
+		{name: "rootless", infoAnswer: "true", wantElevated: false},
+		{name: "rootful", infoAnswer: "false", wantElevated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sudoLog := filepath.Join(t.TempDir(), "sudo")
+			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n")
+			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
+				"if [ \"$1\" = info ]; then printf '"+tc.infoAnswer+"\\n'; exit 0; fi\n"+
+				"exit 0\n")
+
+			out, err := runRuntimeList(context.Background(), runtimePath, "ps", "-a")
+			if err != nil {
+				t.Fatalf("empty listing reported as an error: %v", err)
+			}
+			if len(bytes.TrimSpace(out)) != 0 {
+				t.Fatalf("out = %q, want an empty listing", out)
+			}
+			elevated := recordedElevations(t, sudoLog)
+			if tc.wantElevated && !strings.Contains(elevated, "ps -a") {
+				t.Fatalf("a rootful listing was not elevated: %q", elevated)
+			}
+			if !tc.wantElevated && elevated != "" {
+				t.Fatalf("a rootless listing was elevated: %q", elevated)
+			}
+		})
 	}
 }

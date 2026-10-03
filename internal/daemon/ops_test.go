@@ -36,6 +36,64 @@ func stubRuntimes(paths map[string]string) func(context.Context) map[string]stri
 	return func(context.Context) map[string]string { return paths }
 }
 
+// fakeRuntimeInvocations reads what a fake runtime recorded and drops the
+// `info` probe the daemon runs before it elevates a runtime command, because
+// the tests that use this assert what an *operation* ran, not what the daemon
+// asked the runtime about itself on the way there. The probe is covered by
+// TestRuntimeElevationSkipsRootlessRuntime.
+//
+// Both recording styles are handled: one argument per line (the usual fake),
+// and `cwd=`/`args=` pairs (the compose fake, which also records its working
+// directory).
+func fakeRuntimeInvocations(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+	lines := strings.Split(trimmed, "\n")
+	paired := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "args=") {
+			paired = true
+			break
+		}
+	}
+	out := make([]string, 0, len(lines))
+	if !paired {
+		// `info --format <template>` is three lines of the probe.
+		for i := 0; i < len(lines); i++ {
+			if lines[i] == "info" && i+2 < len(lines) && lines[i+1] == "--format" {
+				i += 2
+				continue
+			}
+			out = append(out, lines[i])
+		}
+		return out
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "args=info --format ") {
+			if len(out) > 0 && strings.HasPrefix(out[len(out)-1], "cwd=") {
+				out = out[:len(out)-1]
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// recordedRuntimeArgs joins fakeRuntimeInvocations back into the single string
+// the one-argument-per-line tests compare against.
+func recordedRuntimeArgs(t *testing.T, path string) string {
+	t.Helper()
+	return strings.Join(fakeRuntimeInvocations(t, path), "\n")
+}
+
 func newTestOpsRunner(t *testing.T, runtimes map[string]string) *nativeOpRunner {
 	t.Helper()
 	executor := NewWebhookExecutor(config.DaemonConfig{
@@ -100,8 +158,7 @@ func TestNativeContainerOpExecutes(t *testing.T) {
 	if status != http.StatusOK || !resp.OK || resp.ExitCode != 0 {
 		t.Fatalf("status=%d resp=%+v", status, resp)
 	}
-	got, _ := os.ReadFile(out)
-	if strings.TrimSpace(string(got)) != "restart\nweb" {
+	if got := recordedRuntimeArgs(t, out); got != "restart\nweb" {
 		t.Fatalf("recorded args %q, want %q", got, "restart\nweb")
 	}
 }
@@ -116,8 +173,7 @@ func TestNativeContainerOpForcedRemove(t *testing.T) {
 	if requestErr != nil || status != http.StatusOK {
 		t.Fatalf("status=%d err=%+v", status, requestErr)
 	}
-	got, _ := os.ReadFile(out)
-	if strings.TrimSpace(string(got)) != "rm\n-f\nweb" {
+	if got := recordedRuntimeArgs(t, out); got != "rm\n-f\nweb" {
 		t.Fatalf("recorded args %q, want %q", got, "rm\n-f\nweb")
 	}
 }
@@ -172,6 +228,66 @@ func TestNativeSystemdOpNormalizesAndExecutes(t *testing.T) {
 	}
 }
 
+// recordedElevations returns what a fake sudo recorded. An absent log means
+// nothing was elevated: the fake only creates its file when it runs.
+func recordedElevations(t *testing.T, path string) string {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	recorded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(recorded))
+}
+
+// TestRuntimeElevationSkipsRootlessRuntime is the operation-ladder half of the
+// detection: a runtime that reports itself rootless never gets the `sudo -n`
+// variant, because elevating it would address root's separate container store
+// rather than the daemon user's own — which is also the attempt that put "sudo:
+// a password is required" into a task log on a host without passwordless sudo.
+func TestRuntimeElevationSkipsRootlessRuntime(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("the daemon does not elevate when it is already root")
+	}
+	for _, tc := range []struct {
+		name          string
+		infoAnswer    string
+		wantElevation bool
+	}{
+		{name: "rootless", infoAnswer: "true", wantElevation: false},
+		{name: "rootful", infoAnswer: "false", wantElevation: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sudoLog := filepath.Join(t.TempDir(), "sudo")
+			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n")
+			// The action fails, so the ladder reaches its elevation.
+			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
+				"if [ \"$1\" = info ]; then printf '"+tc.infoAnswer+"\\n'; exit 0; fi\n"+
+				"exit 1\n")
+			runner := newTestOpsRunner(t, map[string]string{"podman": runtimePath})
+
+			_, _, requestErr := runner.dispatch(
+				context.Background(), "container.restart", opParams{target: "web"}, "test", "tester",
+			)
+			if requestErr != nil {
+				t.Fatalf("dispatch: %+v", requestErr)
+			}
+			elevated := recordedElevations(t, sudoLog)
+			if tc.wantElevation {
+				if !strings.Contains(elevated, "restart web") {
+					t.Fatalf("a rootful runtime was not elevated: %q", elevated)
+				}
+				return
+			}
+			if elevated != "" {
+				t.Fatalf("a rootless runtime was elevated: %q", elevated)
+			}
+		})
+	}
+}
+
 func TestNativeComposeOpUsesDirectoryAndArgs(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	dir := t.TempDir()
@@ -183,13 +299,12 @@ func TestNativeComposeOpUsesDirectoryAndArgs(t *testing.T) {
 	if requestErr != nil || status != http.StatusOK || !resp.OK {
 		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, resp)
 	}
-	got, _ := os.ReadFile(out)
-	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
-	if len(lines) != 2 || lines[0] != "cwd="+dir {
-		t.Fatalf("cwd not applied; recorded %q", got)
+	steps := fakeRuntimeInvocations(t, out)
+	if len(steps) != 2 || steps[0] != "cwd="+dir {
+		t.Fatalf("cwd not applied; recorded %#v", steps)
 	}
-	if lines[1] != "args=compose -p myapp up -d" {
-		t.Fatalf("recorded args %q", lines[1])
+	if steps[1] != "args=compose -p myapp up -d" {
+		t.Fatalf("recorded args %q", steps[1])
 	}
 }
 
@@ -277,8 +392,7 @@ func TestRelayDispatchesNativeOp(t *testing.T) {
 		InvokedBy: "@alice",
 	})
 
-	got, _ := os.ReadFile(out)
-	if strings.TrimSpace(string(got)) != "restart\nweb" {
+	if got := recordedRuntimeArgs(t, out); got != "restart\nweb" {
 		t.Fatalf("native op did not run; recorded %q", got)
 	}
 	if resultBody == nil {

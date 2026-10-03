@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -953,11 +952,7 @@ func TestHTTPNativeContainerEndpoint(t *testing.T) {
 			t.Fatalf("restart failed: %+v", payload)
 		}
 	}
-	got, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(got)) != "restart\nweb" {
+	if got := recordedRuntimeArgs(t, out); got != "restart\nweb" {
 		t.Fatalf("recorded args %q, want %q", got, "restart\nweb")
 	}
 	if resp := post(`{}`, signedHeader("metrics-secret", []byte(`{}`)), true); resp.StatusCode == http.StatusOK {

@@ -278,7 +278,7 @@ func TestComposeAttemptsCarryNoAnsiFlag(t *testing.T) {
 	runner := newTestOpsRunner(t, map[string]string{"podman": runtime})
 	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
 
-	attempts := runner.composeAttempts(runtime, target, "pull")
+	attempts := runner.composeAttempts(t.Context(), runtime, target, "pull")
 	if len(attempts) == 0 {
 		t.Fatal("no compose attempts were built")
 	}
@@ -304,7 +304,7 @@ func TestComposeAttemptsPreferPodmanComposeDirectly(t *testing.T) {
 		Project: "myapp", Directory: "/srv/myapp", Files: []string{"compose.yml"},
 	}
 
-	attempts := runner.composeAttempts(runtime, target, "up", "-d", "--force-recreate", "web")
+	attempts := runner.composeAttempts(t.Context(), runtime, target, "up", "-d", "--force-recreate", "web")
 	// The `sudo -n` variants are added when the host has sudo, which a test
 	// machine usually does; the relation under test is which tool runs first.
 	direct := make([]opAttempt, 0, 2)
@@ -346,7 +346,7 @@ func TestComposeAttemptsPreferTheDockerPlugin(t *testing.T) {
 	runner := newTestOpsRunner(t, map[string]string{"docker": runtime})
 	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
 
-	attempts := runner.composeAttempts(runtime, target, "pull")
+	attempts := runner.composeAttempts(t.Context(), runtime, target, "pull")
 	direct := make([]opAttempt, 0, 2)
 	for _, attempt := range attempts {
 		if attempt.command == runtime || attempt.command == standalone {

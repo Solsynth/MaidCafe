@@ -59,10 +59,23 @@ type containerEntry struct {
 }
 
 type containersRuntimePayload struct {
-	Runtime    string           `json:"runtime"`
-	Available  bool             `json:"available"`
-	Error      *string          `json:"error"`
-	Containers []containerEntry `json:"containers"`
+	Runtime   string  `json:"runtime"`
+	Available bool    `json:"available"`
+	Error     *string `json:"error"`
+	// Rootless is what the runtime says about itself: true when its containers
+	// belong to the invoking user (no elevation reaches them), false when a
+	// root daemon owns them, and absent when the runtime did not answer.
+	Rootless *bool `json:"rootless,omitempty"`
+	// Cgroups is the cgroup manager the runtime will use ("systemd",
+	// "cgroupfs"), absent when it did not say. A podman that reports cgroupfs
+	// on a host whose user has no systemd session repeats that fallback, with
+	// the remedy it suggests, on every invocation it makes.
+	Cgroups string `json:"cgroups,omitempty"`
+	// ComposeTool names the tool a compose step for this runtime runs first —
+	// "podman-compose", "podman compose", "docker-compose" — so an operator can
+	// see which tool is in play rather than inferring it from a task log.
+	ComposeTool string           `json:"compose_tool,omitempty"`
+	Containers  []containerEntry `json:"containers"`
 }
 
 type containersPayload struct {
@@ -79,6 +92,38 @@ type runtimeProbeState struct {
 	runtimePaths map[string]string
 	probed       bool
 	lastProbe    time.Time
+	facts        map[string]runtimeFacts
+	factsAt      time.Time
+}
+
+// runtimeFactsTTL bounds how long the probe's answer about one runtime is
+// reused. It costs a runtime subprocess, and what it reports — the runtime's
+// mode and cgroup manager — is host configuration, not something that changes
+// minute to minute.
+const runtimeFactsTTL = 1 * time.Minute
+
+// factsFor reports what the runtime at [path] is, caching the answer for
+// runtimeFactsTTL so a collector that reports it every tick does not spawn a
+// runtime subprocess every tick. An empty path, or a collector wired without a
+// probe, reports an unknown runtime; elevation asks probeRuntimeFacts directly
+// instead, because it is about to spend a subprocess on the command itself and
+// a stale answer there would change which store a mutation lands in.
+func (p *runtimeProbeState) factsFor(ctx context.Context, path string) runtimeFacts {
+	if p == nil || path == "" {
+		return runtimeFacts{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.facts == nil || time.Since(p.factsAt) >= runtimeFactsTTL {
+		p.facts = make(map[string]runtimeFacts, 2)
+		p.factsAt = time.Now()
+	}
+	if facts, ok := p.facts[path]; ok {
+		return facts
+	}
+	facts := probeRuntimeFacts(ctx, path)
+	p.facts[path] = facts
+	return facts
 }
 
 // probePathSnapshot ensures the probe has run and returns the current
@@ -119,28 +164,145 @@ func runtimeStateKey(paths map[string]string) string {
 	return strings.Join(names, ",")
 }
 
-// runRuntimeList runs a runtime CLI listing command, retrying through
-// `sudo -n` (never interactive) when the direct invocation fails or returns
-// nothing and the daemon is not root. Rootful runtimes are invisible to a
-// non-root daemon — e.g. the shipped systemd unit runs as the maidcafe user
-// while operators run containers as root — and the elevated retry sees them
-// whenever the daemon user has passwordless sudo. The retry is never
-// interactive; the systemd unit's NoNewPrivileges keeps it inert there. An
-// empty direct listing whose elevated retry also fails is reported as an
-// error rather than a misleading empty list, so invisible root-owned
-// containers never masquerade as "no containers".
+// runtimeFacts is what a runtime says about itself: whether it runs in the
+// invoking user's own user namespace, which cgroup manager it will actually
+// use, and whether it answered at all.
+type runtimeFacts struct {
+	// Rootless is true when the runtime runs in the invoking user's own user
+	// namespace, so the containers are that user's and no elevation reaches
+	// them.
+	Rootless bool
+	// Cgroups is the manager the runtime reports it will use — "systemd" or
+	// "cgroupfs" — and is empty for a runtime that does not say. Podman on a
+	// host where the user has no systemd session reports cgroupfs, and repeats
+	// that fallback, with the remedy it suggests, on every invocation.
+	Cgroups string
+	// Known is false when the runtime did not answer. Callers then keep the
+	// elevation they would have attempted before this detection existed,
+	// because a runtime that stays silent may still be a root-owned one.
+	Known bool
+}
+
+// elevatable reports whether a `sudo -n` retry is meaningful for this runtime.
+//
+// For a rootless runtime it is not: `sudo podman` is a different, rootful
+// runtime with its own container store and its own network, so the retry would
+// act on containers the operator never asked about — or, without passwordless
+// sudo, print "a password is required" into the task log and do nothing else.
+// A root-owned runtime is the case the retry exists for, and an unanswered
+// runtime keeps it.
+func (f runtimeFacts) elevatable() bool {
+	return !(f.Known && f.Rootless)
+}
+
+// runtimeName is the runtime a binary path is: "podman", "docker", or "" for
+// anything this daemon does not recognize. A distro's podman-docker shim is
+// podman wearing docker's name, and is classified as the podman it is.
+func runtimeName(path string) string {
+	name := strings.ToLower(filepath.Base(path))
+	switch {
+	case strings.Contains(name, "podman"):
+		return "podman"
+	case strings.Contains(name, "docker"):
+		return "docker"
+	}
+	return ""
+}
+
+// probeRuntimeFacts asks the runtime at [path] what it is. Both runtimes answer
+// about themselves rather than being inferred from the daemon's uid or group
+// membership: podman reports the security mode and cgroup manager it runs with,
+// and rootless docker names itself among its security options, so a daemon in
+// the docker group on a rootful host is told apart from one running its own
+// rootless docker.
+//
+// Callers ask where they are about to elevate a runtime command, because the
+// answer costs a subprocess and only a failed or empty direct call needs it.
+func probeRuntimeFacts(ctx context.Context, path string) runtimeFacts {
+	switch runtimeName(path) {
+	case "podman":
+		out, err := runCommand(ctx, path, "info", "--format", "{{.Host.Security.Rootless}} {{.Host.CgroupManager}}")
+		if err != nil {
+			return runtimeFacts{}
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) == 0 {
+			return runtimeFacts{}
+		}
+		facts := runtimeFacts{Known: true, Rootless: fields[0] == "true"}
+		if len(fields) > 1 {
+			facts.Cgroups = fields[1]
+		}
+		return facts
+	case "docker":
+		out, err := runCommand(ctx, path, "info", "--format", "{{.SecurityOptions}}")
+		if err != nil {
+			return runtimeFacts{}
+		}
+		return runtimeFacts{Rootless: strings.Contains(string(out), "name=rootless"), Known: true}
+	}
+	return runtimeFacts{}
+}
+
+// elevationPrefix returns the `sudo -n` prefix to elevate a command against the
+// runtime at [path], or nil when elevating it means nothing: when this process
+// is root already, when the host has no sudo, and when the runtime is rootless
+// (see elevatable). Callers that wrap a command other than the runtime binary
+// itself — the standalone compose tools — take the prefix alone.
+func elevationPrefix(ctx context.Context, path string) []string {
+	if os.Geteuid() == 0 {
+		return nil
+	}
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return nil
+	}
+	if !probeRuntimeFacts(ctx, path).elevatable() {
+		return nil
+	}
+	return []string{"sudo", "-n"}
+}
+
+// elevationAttempt builds the `sudo -n <runtime> …` form of a runtime command,
+// or reports that there is none to build. It is the single place that decides
+// whether elevating a runtime invocation means anything, so the collectors,
+// the detail reads, the log tails and the operation ladder all agree: never
+// interactive, never as root when this process is root already, and never
+// against a rootless runtime.
+func elevationAttempt(ctx context.Context, path string, args ...string) ([]string, bool) {
+	prefix := elevationPrefix(ctx, path)
+	if prefix == nil {
+		return nil, false
+	}
+	argv := append([]string{}, prefix...)
+	argv = append(argv, path)
+	argv = append(argv, args...)
+	return argv, true
+}
+
+// runRuntimeList runs a runtime CLI listing command, retrying through `sudo -n`
+// (never interactive) when the direct invocation fails or returns nothing and
+// the daemon is not root. Rootful runtimes are invisible to a non-root daemon —
+// e.g. the shipped systemd unit runs as the maidcafe user while operators run
+// containers as root — and the elevated retry sees them whenever the daemon
+// user has passwordless sudo. The retry is never interactive; the systemd
+// unit's NoNewPrivileges keeps it inert there.
+//
+// A rootless runtime is a different case and is not elevated at all: its
+// containers belong to the daemon user, so an empty listing is the truth about
+// it rather than a blind spot, and a failure stays a failure instead of being
+// answered with root's containers. An empty direct listing whose elevated
+// retry fails is reported as an error rather than a misleading empty list, so
+// invisible root-owned containers never masquerade as "no containers".
 func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, error) {
 	out, err := runCommand(ctx, path, args...)
 	if err == nil && len(bytes.TrimSpace(out)) > 0 {
 		return out, nil
 	}
-	if os.Geteuid() == 0 {
+	elevated, ok := elevationAttempt(ctx, path, args...)
+	if !ok {
 		return out, err
 	}
-	if _, lookupErr := exec.LookPath("sudo"); lookupErr != nil {
-		return out, err
-	}
-	sudoOut, sudoErr := runCommand(ctx, "sudo", append([]string{"-n", path}, args...)...)
+	sudoOut, sudoErr := runCommand(ctx, elevated[0], elevated[1:]...)
 	if sudoErr != nil {
 		if err != nil {
 			// The direct failure stays the primary signal.
@@ -243,25 +405,37 @@ func (c *ContainersCollector) collectRuntimes(ctx context.Context, paths map[str
 		if path == "" {
 			continue
 		}
+		// What the runtime says about itself travels with its containers: it
+		// is what tells an operator why a rootless host repeats podman's
+		// cgroup fallback on every invocation, and which compose tool a stack
+		// action will run.
+		facts := c.probe.factsFor(ctx, path)
+		// The mode is absent, rather than "rootful", when the runtime did not
+		// answer: a reader is never told a runtime is rootful when it said
+		// nothing at all.
+		var rootless *bool
+		if facts.Known {
+			rootless = new(facts.Rootless)
+		}
+		entry := containersRuntimePayload{
+			Runtime: runtime, Available: true, Containers: []containerEntry{},
+			Rootless: rootless, Cgroups: facts.Cgroups,
+			ComposeTool: composeToolResolution(path),
+		}
 		out, err := runRuntimeList(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
 		if err != nil {
-			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
-				Runtime: runtime, Available: true, Error: strPtr("list containers: " + err.Error()),
-				Containers: []containerEntry{},
-			})
+			entry.Error = strPtr("list containers: " + err.Error())
+			payload.Runtimes = append(payload.Runtimes, entry)
 			continue
 		}
 		entries, err := parseContainerLines(out)
 		if err != nil {
-			payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
-				Runtime: runtime, Available: true, Error: strPtr("parse container list: " + err.Error()),
-				Containers: []containerEntry{},
-			})
+			entry.Error = strPtr("parse container list: " + err.Error())
+			payload.Runtimes = append(payload.Runtimes, entry)
 			continue
 		}
-		payload.Runtimes = append(payload.Runtimes, containersRuntimePayload{
-			Runtime: runtime, Available: true, Containers: entries,
-		})
+		entry.Containers = entries
+		payload.Runtimes = append(payload.Runtimes, entry)
 	}
 	return json.Marshal(payload)
 }

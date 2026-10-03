@@ -493,24 +493,24 @@ func composeTools(runtimePath string) []composeTool {
 }
 
 // composeToolName is the standalone compose tool for the runtime at [path]
-// — `podman-compose`, `docker-compose` — or "" when this daemon does not
+// - `podman-compose`, `docker-compose` - or "" when this daemon does not
 // recognize the runtime.
 //
-// The tool is derived from the runtime's own name so a docker host is never
-// sent to podman-compose: the two write to different image stores, and pulling
-// into the wrong one would leave the container exactly where it was.
+// The tool is derived from the runtime's own name (see runtimeName) so a
+// docker host is never sent to podman-compose: the two write to different
+// image stores, and pulling into the wrong one would leave the container
+// exactly where it was.
 func composeToolName(runtimePath string) string {
-	name := strings.ToLower(filepath.Base(runtimePath))
-	switch {
-	case strings.Contains(name, "podman"):
+	switch runtimeName(runtimePath) {
+	case "podman":
 		return "podman-compose"
-	case strings.Contains(name, "docker"):
+	case "docker":
 		return "docker-compose"
 	}
 	return ""
 }
 
-// standaloneComposePath resolves that tool on this host, or "" when it has none.
+// standaloneComposePath resolves that tool on this host.
 func standaloneComposePath(runtimePath string) string {
 	name := composeToolName(runtimePath)
 	if name == "" {
@@ -521,6 +521,19 @@ func standaloneComposePath(runtimePath string) string {
 		return ""
 	}
 	return path
+}
+
+// composeToolResolution names the tool a compose step for [runtimePath] runs
+// first: the standalone binary when this host has it, else the runtime's own
+// `compose` subcommand. It is reported with the container list so an operator
+// can see which tool is in play instead of inferring it from a task log.
+func composeToolResolution(runtimePath string) string {
+	tools := composeTools(runtimePath)
+	if len(tools) == 0 {
+		return ""
+	}
+	argv := append([]string{filepath.Base(tools[0].command)}, tools[0].prefix...)
+	return strings.Join(argv, " ")
 }
 
 // validateComposeScanPath checks a starting point or root a request names: an

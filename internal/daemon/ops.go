@@ -335,7 +335,7 @@ func (r *nativeOpRunner) composeAttemptsFor(
 		if !ok {
 			continue
 		}
-		attempts = append(attempts, r.composeAttempts(path, target, args...)...)
+		attempts = append(attempts, r.composeAttempts(ctx, path, target, args...)...)
 	}
 	return attempts
 }
@@ -512,7 +512,7 @@ func (r *nativeOpRunner) planNativeOp(
 		if slug == "container.pull" {
 			// A pull is about the image, not the container it was read from.
 			targetLabel = resolved.ImageRef
-			attempts = r.runtimePullAttempts(resolved.Path, resolved.ImageRef)
+			attempts = r.runtimePullAttempts(ctx, resolved.Path, resolved.ImageRef)
 			break
 		}
 		compose, err := composeUpdateTargetFromLabels(resolved.Labels)
@@ -532,8 +532,8 @@ func (r *nativeOpRunner) planNativeOp(
 				err.Error(), resolved.Runtime))
 		}
 		stages = append(stages,
-			opStage{label: "pull", attempts: r.composeAttempts(resolved.Path, compose, "pull", compose.Service)},
-			opStage{label: "recreate", attempts: r.composeAttempts(resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
+			opStage{label: "pull", attempts: r.composeAttempts(ctx, resolved.Path, compose, "pull", compose.Service)},
+			opStage{label: "recreate", attempts: r.composeAttempts(ctx, resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
 		)
 	case strings.HasPrefix(slug, "container."):
 		verb := strings.TrimPrefix(slug, "container.")
@@ -556,8 +556,8 @@ func (r *nativeOpRunner) planNativeOp(
 				continue
 			}
 			attempts = append(attempts, opAttempt{command: path, args: args})
-			if sudo := r.sudoAttempt(); sudo != nil {
-				attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, args...)...)})
+			if elevated, elevatedOK := elevationAttempt(ctx, path, args...); elevatedOK {
+				attempts = append(attempts, opAttempt{command: elevated[0], args: elevated[1:]})
 			}
 		}
 	case slug == "process.kill":
@@ -951,21 +951,23 @@ func composeLabel(labels map[string]string, key string) string {
 }
 
 // composeAttempts builds one compose step for [target] against the runtime that
-// holds the container, with the same `sudo -n` variant every native operation
-// carries, and the standalone compose tool as the last alternative.
+// holds the container, with the standalone compose tool as the last
+// alternative and the runtime's elevation as the option that runs beside it —
+// where elevation means anything at all for that runtime (see
+// elevationPrefix: it never does for a rootless one).
 //
 // The compose file list comes from the container's own labels when they record
 // it, so the step reads the same file the container was created from even when
 // the project directory holds several. A project whose files the labels do not
 // name is run from its own directory, where compose reads the default file.
-func (r *nativeOpRunner) composeAttempts(path string, target composeUpdateTarget, args ...string) []opAttempt {
+func (r *nativeOpRunner) composeAttempts(ctx context.Context, path string, target composeUpdateTarget, args ...string) []opAttempt {
 	files := make([]string, 0, len(target.Files))
 	for _, file := range target.Files {
 		if resolved, ok := resolveComposeFile(target.Directory, file); ok {
 			files = append(files, resolved)
 		}
 	}
-	sudo := r.sudoAttempt()
+	sudo := elevationPrefix(ctx, path)
 	tools := composeTools(path)
 	attempts := make([]opAttempt, 0, 2*len(tools))
 	for _, tool := range tools {
@@ -994,11 +996,11 @@ func (r *nativeOpRunner) composeAttempts(path string, target composeUpdateTarget
 // the container. Only that runtime is asked: the image has to land in the store
 // the container runs from, so the alternate runtime would be the wrong answer,
 // not a fallback.
-func (r *nativeOpRunner) runtimePullAttempts(path, imageRef string) []opAttempt {
+func (r *nativeOpRunner) runtimePullAttempts(ctx context.Context, path, imageRef string) []opAttempt {
 	args := []string{"pull", imageRef}
 	attempts := []opAttempt{{command: path, args: args}}
-	if sudo := r.sudoAttempt(); sudo != nil {
-		attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, args...)...)})
+	if elevated, ok := elevationAttempt(ctx, path, args...); ok {
+		attempts = append(attempts, opAttempt{command: elevated[0], args: elevated[1:]})
 	}
 	return attempts
 }
@@ -1040,8 +1042,12 @@ func appendStageOutput(builder *strings.Builder, next string) {
 }
 
 // sudoAttempt returns the sudo -n prefix when the daemon is not root and
-// sudo is available, else nil. Mirrors the collectors' never-interactive
-// elevation.
+// sudo is available, else nil. It serves the operations that are not runtime
+// invocations — systemd units, packages, the firewall, processes — where root
+// is simply the only authority that can do the work. Runtime commands go
+// through elevationPrefix instead, which also asks what the runtime is: a
+// rootless runtime is the daemon user's own and sudo would address root's
+// separate container store rather than elevate it.
 func (r *nativeOpRunner) sudoAttempt() []string {
 	if os.Geteuid() == 0 {
 		return nil

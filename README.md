@@ -372,6 +372,16 @@ Authorization: Bearer <metrics-secret>
   elevated retry also fails is reported as an error rather than a misleading
   empty list, so invisible root-owned containers never look like "no
   containers".
+- That retry — and every other elevation of a runtime command, including the
+  container and compose actions — asks the runtime first what it is: podman
+  reports `Host.Security.Rootless` and rootless docker names itself in its
+  security options. A **rootless** runtime is never elevated, because `sudo
+  podman` is a different, rootful runtime with its own container store and its
+  own network: the retry would act on containers the operator never asked
+  about, and on a host without passwordless sudo it would only add "a password
+  is required" to the task log. A rootful runtime keeps the retry, and a
+  runtime that does not answer keeps it too, since a silent runtime may still
+  be a root-owned one.
 - Setting a collector interval to `0` disables that collector. Collection is
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.
@@ -658,7 +668,14 @@ reuse the stream collectors' probe cache and rate limits:
 
 - `GET /api/v1/containers` — same payload as the `containers` event: a
   `runtimes` list covering every runtime found on the host (podman first),
-  each with `runtime`, `available`, `error` and `containers`.
+  each with `runtime`, `available`, `error`, `containers`, and what the
+  runtime says about itself: `rootless` (absent when it did not answer),
+  `cgroups` (the manager it will use — `systemd` or `cgroupfs`) and
+  `compose_tool` (the tool a stack action for that runtime runs first, e.g.
+  `podman-compose` or `podman compose`). A podman that reports `cgroupfs`
+  because the user has no systemd session repeats that fallback, with the
+  remedy it suggests, on every invocation it makes — the daemon's own task
+  logs no longer add anything to it beyond the runtime's output.
 - `GET /api/v1/images` — same payload as the `images` event: a `runtimes`
   list, each with `runtime`, `available`, `error` and `images`.
 - `GET /api/v1/processes` — same payload as the `processes` event. `?limit=N`
