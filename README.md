@@ -172,11 +172,21 @@ Cloud publishing is disabled when either setting is empty. Log upload is
 separately opt-in even when cloud publishing is configured. HTTPS is required,
 except for HTTP development URLs using `localhost` or `127.0.0.1`.
 - Container status upload: when `statusUploadEnabled = true`, the daemon
-  publishes the managed container set's status (state, image, compose project)
-  to the cloud on the metrics tick, so managed hosts can be inspected centrally
-  from one place. An optional managed allowlist (`managedContainers`,
+  publishes the managed container set's status (state, image, compose project,
+  runtime) to the cloud on the metrics tick, so managed hosts can be inspected
+  centrally from one place. An optional managed allowlist (`managedContainers`,
   `managedComposes`) scopes both log upload and status upload to a curated set;
   an empty allowlist uploads every container. Status carries no secrets.
+- Each publish is a **snapshot**, not an append: the daemon names the runtimes
+  it managed to enumerate in that tick, and the cloud drops the containers of
+  those runtimes that the snapshot leaves out. A container that has left the
+  host therefore stops being listed on the next tick instead of answering
+  queries in its final state — which is what an update needs, because a
+  recreate mints a new container id for the same name and the old row would
+  otherwise read as a stopped container long after its replacement is up. A
+  runtime whose listing failed is not named, so a hiccup holds its containers
+  at their last known state rather than deleting them, and the cloud's
+  retention window remains the backstop for a host that stops reporting.
 
 ## Cloud API
 

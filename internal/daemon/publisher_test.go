@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -247,5 +248,103 @@ func TestCloudPublisherUploadsHealthScore(t *testing.T) {
 	}
 	if history[0].HealthScore != 63 || history[0].HealthStatus != HealthDegraded {
 		t.Fatalf("metric lost health fields: %+v", history[0])
+	}
+}
+
+// TestContainerStatusBatchCoversEnumeratedRuntimes pins what the daemon tells
+// the cloud a snapshot is: every managed container carries its runtime, and
+// only the runtimes that answered are covered, so a runtime whose listing
+// failed keeps its containers' last known state instead of losing them to a
+// hiccup.
+func TestContainerStatusBatchCoversEnumeratedRuntimes(t *testing.T) {
+	failure := "list containers: exit status 125"
+	rt := &reloadableConfig{managedComposes: []string{"drasl"}}
+	payload := containersPayload{Runtimes: []containersRuntimePayload{
+		{Runtime: "podman", Available: true, Containers: []containerEntry{
+			{ID: "abc", Name: "drasl_drasl_1", State: "running", ComposeProject: "drasl"},
+			{ID: "def", Name: "other_thing_1", State: "running", ComposeProject: "other"},
+		}},
+		{Runtime: "docker", Available: true, Error: &failure},
+	}}
+
+	entries, covered := containerStatusBatch(payload, rt)
+	if len(covered) != 1 || covered[0] != "podman" {
+		t.Fatalf("covered = %#v, want only the runtime that answered", covered)
+	}
+	if len(entries) != 1 || entries[0].ContainerID != "abc" || entries[0].Runtime != "podman" {
+		t.Fatalf("entries = %#v, want just the managed podman container", entries)
+	}
+
+	// A runtime that answered with nothing is still covered: that empty set is
+	// how the cloud learns the containers it holds for that runtime are gone.
+	empty := containersPayload{Runtimes: []containersRuntimePayload{{Runtime: "podman", Available: true}}}
+	entries, covered = containerStatusBatch(empty, rt)
+	if len(entries) != 0 || len(covered) != 1 || covered[0] != "podman" {
+		t.Fatalf("empty snapshot = %#v covered by %#v", entries, covered)
+	}
+}
+
+// TestPublishContainerStatusPostsCoverage is the smoke for the publish path
+// itself: a snapshot that covers a runtime is posted to the cloud in the shape
+// the cloud decodes, and a snapshot that covers none is not posted at all — it
+// would tell the cloud nothing about what is absent.
+func TestPublishContainerStatusPostsCoverage(t *testing.T) {
+	var mu sync.Mutex
+	bodies := []cloud.ContainerStatusBatchInput{}
+	paths := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var batch cloud.ContainerStatusBatchInput
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, batch)
+		mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/quota") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"workspace_id":"ws-a","quotas":{"max_daemons":10}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cfg := config.DaemonConfig{ID: "host-1", CloudURL: server.URL, CloudSecret: "secret", RequestTimeout: time.Second}
+	publisher, err := NewCloudPublisher(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+
+	// Nothing enumerated: no publish, so the cloud keeps what it has.
+	publisher.PublishContainerStatus(ctx, containerStatusPayload{
+		SentAt: time.Now().UTC(), Runtimes: nil,
+		Containers: []containerStatusEntry{{ContainerID: "abc", Runtime: "podman"}},
+	})
+
+	publisher.PublishContainerStatus(ctx, containerStatusPayload{
+		SentAt:   time.Now().UTC(),
+		Runtimes: []string{"podman"},
+		Containers: []containerStatusEntry{{
+			ContainerID: "abc", Runtime: "podman", Name: "drasl_drasl_1", State: "running", ComposeProject: "drasl",
+		}},
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	posted := 0
+	for i, path := range paths {
+		if !strings.HasSuffix(path, "/containers") {
+			continue
+		}
+		posted++
+		if len(bodies[i].Runtimes) != 1 || bodies[i].Runtimes[0] != "podman" {
+			t.Fatalf("posted batch lost its coverage: %+v", bodies[i])
+		}
+		if len(bodies[i].Containers) != 1 || bodies[i].Containers[0].Runtime != "podman" || bodies[i].Containers[0].ContainerID != "abc" {
+			t.Fatalf("posted batch lost a container: %+v", bodies[i])
+		}
+	}
+	if posted != 1 {
+		t.Fatalf("container publishes = %d in %#v, want exactly the covering snapshot", posted, paths)
 	}
 }

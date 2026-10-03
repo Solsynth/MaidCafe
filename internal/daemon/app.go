@@ -1104,6 +1104,12 @@ func (a *App) isContainerManaged(id string, entry containerEntry) bool {
 // managed allowlist, and pushes one bounded status batch to the cloud on the
 // metrics tick. Non-managed containers are skipped so logs/status for
 // unmanaged workloads never leave the host.
+//
+// The batch also names the runtimes it covers — the ones this snapshot
+// enumerated successfully — because that is what lets the cloud retire a
+// container that is gone rather than keep serving it in its last state. A
+// runtime whose listing failed is left out of the coverage, so its containers
+// are held at their last known state instead of being deleted on a hiccup.
 func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, rt *reloadableConfig) {
 	data, err := a.containers.snapshot(ctx)
 	if err != nil {
@@ -1114,14 +1120,36 @@ func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, r
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
 	}
+	entries, covered := containerStatusBatch(payload, rt)
+	if len(covered) == 0 {
+		return
+	}
+	pub.PublishContainerStatus(ctx, containerStatusPayload{
+		Containers: entries, Runtimes: covered, SentAt: time.Now().UTC(),
+	})
+}
+
+// containerStatusBatch reduces a container snapshot to the status batch the
+// cloud stores: the managed containers, each tagged with its runtime, plus the
+// runtimes this snapshot covered. A runtime is covered when it was enumerated
+// successfully — an empty container list from a runtime that answered is a
+// covered, empty set, which is how the cloud learns that its containers are
+// gone.
+func containerStatusBatch(payload containersPayload, rt *reloadableConfig) ([]containerStatusEntry, []string) {
 	entries := make([]containerStatusEntry, 0, 8)
+	covered := make([]string, 0, len(payload.Runtimes))
 	for _, runtime := range payload.Runtimes {
+		if !runtime.Available || runtime.Error != nil {
+			continue
+		}
+		covered = append(covered, runtime.Runtime)
 		for _, c := range runtime.Containers {
 			if !matchManagedContainer(c.ID, c.Name, c.ComposeProject, rt.managedContainers, rt.managedComposes) {
 				continue
 			}
 			entries = append(entries, containerStatusEntry{
 				ContainerID:    c.ID,
+				Runtime:        runtime.Runtime,
 				Name:           c.Name,
 				Image:          c.Image,
 				State:          c.State,
@@ -1130,10 +1158,7 @@ func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, r
 			})
 		}
 	}
-	if len(entries) == 0 {
-		return
-	}
-	pub.PublishContainerStatus(ctx, containerStatusPayload{Containers: entries, SentAt: time.Now().UTC()})
+	return entries, covered
 }
 
 // matchManagedContainer reports whether a container belongs to the managed

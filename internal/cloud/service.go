@@ -458,6 +458,7 @@ type LogView struct {
 // ContainerStatusInput is one container's status uploaded by a daemon.
 type ContainerStatusInput struct {
 	ContainerID    string `json:"container_id"`
+	Runtime        string `json:"runtime"`
 	Name           string `json:"name"`
 	Image          string `json:"image"`
 	State          string `json:"state"`
@@ -465,9 +466,15 @@ type ContainerStatusInput struct {
 	ComposeProject string `json:"compose_project"`
 }
 
-// ContainerStatusBatchInput is one status snapshot for a daemon.
+// ContainerStatusBatchInput is one status snapshot for a daemon. Runtimes
+// names the runtimes this batch is a complete answer for: the daemon lists a
+// runtime here only when it managed to enumerate it, and the ingest then drops
+// that runtime's rows which the batch does not mention. A batch without
+// runtimes is upsert-only, which is what a daemon that predates the field
+// sends.
 type ContainerStatusBatchInput struct {
 	Containers []ContainerStatusInput `json:"containers"`
+	Runtimes   []string               `json:"runtimes"`
 	SentAt     time.Time              `json:"sent_at"`
 }
 
@@ -475,6 +482,7 @@ type ContainerStatusBatchInput struct {
 type ContainerStatusView struct {
 	DaemonID       string    `json:"daemon_id"`
 	ContainerID    string    `json:"container_id"`
+	Runtime        string    `json:"runtime"`
 	Name           string    `json:"name"`
 	Image          string    `json:"image"`
 	State          string    `json:"state"`
@@ -1037,20 +1045,37 @@ func (s *Service) ListLogs(ctx context.Context, accountID, daemonID, containerID
 	return out, nil
 }
 
-// IngestContainerStatus upserts the managed container status snapshot for a
-// daemon, authenticated by its registered secret. Rows are keyed by
-// (DaemonID, ContainerID) so each publish refreshes LastSeenAt without
-// duplicating; FirstSeenAt is preserved from the initial insert.
+// IngestContainerStatus stores the managed container status snapshot for a
+// daemon, authenticated by its registered secret.
+//
+// The batch is a snapshot, not an append. Its Runtimes name the runtimes the
+// daemon managed to enumerate, and a container of a covered runtime that the
+// batch does not mention is gone from the host, so its row is dropped in the
+// same transaction. That is what keeps a recreate honest: the runtime mints a
+// new container id for the same name, and without the reconcile the old row
+// would answer queries in the state it had when the update stopped it — for
+// the whole retention window, or forever where retention is disabled.
+// Runtimes the batch does not cover keep their rows, so a runtime whose
+// listing failed retains the last state it was known in, and an empty
+// Runtimes list (a daemon older than the field) upserts without deleting.
 func (s *Service) IngestContainerStatus(ctx context.Context, id, secret string, input ContainerStatusBatchInput) error {
 	d, err := s.authenticateDaemon(ctx, id, secret)
 	if err != nil {
 		return ErrUnauthorized
 	}
-	if len(input.Containers) == 0 || len(input.Containers) > 500 {
-		return fmt.Errorf("containers must contain between 1 and 500 entries")
+	if len(input.Containers) > 500 {
+		return fmt.Errorf("containers must not exceed 500 entries")
+	}
+	covered, err := normalizeCoveredRuntimes(input.Runtimes)
+	if err != nil {
+		return err
+	}
+	if len(input.Containers) == 0 && len(covered) == 0 {
+		return fmt.Errorf("a batch needs at least one container or one covered runtime")
 	}
 	now := time.Now().UTC()
 	rows := make([]database.DaemonContainer, 0, len(input.Containers))
+	ids := make([]string, 0, len(input.Containers))
 	for _, c := range input.Containers {
 		cid := strings.TrimSpace(c.ContainerID)
 		if cid == "" || len(cid) > 128 || !utf8.ValidString(cid) {
@@ -1060,9 +1085,11 @@ func (s *Service) IngestContainerStatus(ctx context.Context, id, secret string, 
 		if len(name) > 255 {
 			name = name[:255]
 		}
+		ids = append(ids, cid)
 		rows = append(rows, database.DaemonContainer{
 			DaemonID:       d.ID,
 			ContainerID:    cid,
+			Runtime:        strings.TrimSpace(c.Runtime),
 			WorkspaceID:    d.WorkspaceID,
 			Name:           name,
 			Image:          c.Image,
@@ -1074,12 +1101,53 @@ func (s *Service) IngestContainerStatus(ctx context.Context, id, secret string, 
 			ReceivedAt:     now,
 		})
 	}
-	return s.db.WithContext(ctx).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "daemon_id"}, {Name: "container_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"name", "image", "state", "status", "compose_project", "last_seen_at", "received_at", "updated_at"}),
-		}).
-		Create(&rows).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if len(rows) > 0 {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "daemon_id"}, {Name: "container_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"runtime", "name", "image", "state", "status", "compose_project", "last_seen_at", "received_at", "updated_at"}),
+			}).Create(&rows).Error; err != nil {
+				return err
+			}
+		}
+		if len(covered) == 0 {
+			return nil
+		}
+		// A row written before the runtime column existed carries no runtime,
+		// so absence alone decides it: the daemon that declares coverage tags
+		// everything it can still see, and an untagged row it did not mention
+		// is one the pre-upgrade daemon reported and this one cannot find.
+		gone := tx.Where("daemon_id = ?", d.ID).
+			Where(tx.Where("runtime IN ?", covered).Or("runtime = ?", ""))
+		if len(ids) > 0 {
+			gone = gone.Where("container_id NOT IN ?", ids)
+		}
+		return gone.Delete(&database.DaemonContainer{}).Error
+	})
+}
+
+// normalizeCoveredRuntimes validates and dedupes the runtimes a batch speaks
+// for. Each name is bounded, because it is matched against the Runtime column
+// the reconcile deletes by; an empty list is allowed and means "this batch
+// makes no claim about what is absent".
+func normalizeCoveredRuntimes(runtimes []string) ([]string, error) {
+	if len(runtimes) > 8 {
+		return nil, fmt.Errorf("runtimes must not exceed 8 entries")
+	}
+	out := make([]string, 0, len(runtimes))
+	seen := make(map[string]bool, len(runtimes))
+	for _, r := range runtimes {
+		name := strings.TrimSpace(r)
+		if name == "" || len(name) > 64 || !utf8.ValidString(name) {
+			return nil, fmt.Errorf("runtime name exceeds bounds or is empty")
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out, nil
 }
 
 // ListContainerStatus returns the latest status of managed containers to
@@ -1108,7 +1176,7 @@ func (s *Service) ListContainerStatus(ctx context.Context, accountID, daemonID, 
 	out := make([]ContainerStatusView, len(rows))
 	for i, row := range rows {
 		out[i] = ContainerStatusView{
-			DaemonID: row.DaemonID, ContainerID: row.ContainerID, Name: row.Name,
+			DaemonID: row.DaemonID, ContainerID: row.ContainerID, Runtime: row.Runtime, Name: row.Name,
 			Image: row.Image, State: row.State, Status: row.Status,
 			ComposeProject: row.ComposeProject, FirstSeenAt: row.FirstSeenAt, LastSeenAt: row.LastSeenAt,
 		}

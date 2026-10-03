@@ -1038,6 +1038,110 @@ func TestIngestAndListContainerStatus(t *testing.T) {
 	}
 }
 
+// TestIngestContainerStatusRetiresGoneContainers pins the snapshot rule a
+// recreate depends on: a batch answers for the runtimes it covers, so a
+// container of a covered runtime that the batch leaves out is dropped instead
+// of lingering in the state it held while the update had it stopped. Runtimes
+// the batch does not cover keep their rows, and a batch without coverage (what
+// a daemon older than the field sends) only upserts.
+func TestIngestContainerStatusRetiresGoneContainers(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	defer db.Close()
+	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, "metrics_retention_days": 7}}
+	ctx := context.Background()
+	created, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "status-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingest := func(batch ContainerStatusBatchInput) {
+		t.Helper()
+		if err := svc.IngestContainerStatus(ctx, created.ID, created.Secret, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	states := func() map[string]string {
+		t.Helper()
+		rows, err := svc.ListContainerStatus(ctx, "account-a", created.ID, "", "", 50, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make(map[string]string, len(rows))
+		for _, row := range rows {
+			out[row.ContainerID] = row.State
+		}
+		return out
+	}
+
+	// A compose-managed container and an unrelated docker one.
+	ingest(ContainerStatusBatchInput{
+		Runtimes: []string{"podman", "docker"},
+		Containers: []ContainerStatusInput{
+			{ContainerID: "old-id", Runtime: "podman", Name: "drasl_drasl_1", State: "running", ComposeProject: "drasl"},
+			{ContainerID: "docker-id", Runtime: "docker", Name: "web", State: "running"},
+		},
+	})
+	if got := states(); len(got) != 2 || got["old-id"] != "running" {
+		t.Fatalf("after the first batch = %#v", got)
+	}
+
+	// The update recreated the container, so the name now has a new id. Docker
+	// failed to list this tick, so it is not covered.
+	ingest(ContainerStatusBatchInput{
+		Runtimes: []string{"podman"},
+		Containers: []ContainerStatusInput{
+			{ContainerID: "new-id", Runtime: "podman", Name: "drasl_drasl_1", State: "running", ComposeProject: "drasl"},
+		},
+	})
+	got := states()
+	if _, stale := got["old-id"]; stale {
+		t.Fatalf("the recreated container's old row survived: %#v", got)
+	}
+	if got["new-id"] != "running" {
+		t.Fatalf("the new container is missing: %#v", got)
+	}
+	if got["docker-id"] != "running" {
+		t.Fatalf("an uncovered runtime's rows must keep their last state: %#v", got)
+	}
+
+	// The last managed podman container is gone, and the daemon says so.
+	ingest(ContainerStatusBatchInput{Runtimes: []string{"podman"}})
+	got = states()
+	if _, stale := got["new-id"]; stale {
+		t.Fatalf("an empty snapshot of a covered runtime kept its rows: %#v", got)
+	}
+	if len(got) != 1 || got["docker-id"] != "running" {
+		t.Fatalf("only the uncovered runtime's row should remain: %#v", got)
+	}
+
+	// An older daemon's batch makes no claim about what is absent.
+	ingest(ContainerStatusBatchInput{Containers: []ContainerStatusInput{
+		{ContainerID: "legacy-id", Name: "legacy", State: "exited"},
+	}})
+	if got = states(); len(got) != 2 {
+		t.Fatalf("an upsert-only batch deleted rows: %#v", got)
+	}
+
+	// The daemon upgrades: rows written before the runtime column existed are
+	// matched by absence, so an untagged row the daemon no longer reports goes
+	// away instead of surviving the upgrade forever. An uncovered runtime's
+	// row still stays.
+	ingest(ContainerStatusBatchInput{Runtimes: []string{"podman"}})
+	got = states()
+	if _, stale := got["legacy-id"]; stale {
+		t.Fatalf("an untagged row the daemon no longer reports survived: %#v", got)
+	}
+	if len(got) != 1 || got["docker-id"] != "running" {
+		t.Fatalf("uncovered runtime row should remain: %#v", got)
+	}
+
+	if err := svc.IngestContainerStatus(ctx, created.ID, created.Secret, ContainerStatusBatchInput{}); err == nil {
+		t.Fatal("a batch with neither containers nor runtimes was accepted")
+	}
+	if err := svc.IngestContainerStatus(ctx, created.ID, created.Secret, ContainerStatusBatchInput{Runtimes: []string{" "}}); err == nil {
+		t.Fatal("a blank runtime name was accepted")
+	}
+}
+
 // TestDaemonHealthReflectsNewestMetric covers the health view: it reads the
 // newest metric's embedded score, reports unknown for metrics that predate
 // health reporting, fails closed on ownership, and rejects out-of-range scores.

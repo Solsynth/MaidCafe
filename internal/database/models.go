@@ -82,12 +82,17 @@ type DaemonLog struct {
 
 // DaemonContainer is the cloud-side, centrally inspectable status of one
 // managed container reported by a daemon. Rows are upserted by
-// (DaemonID, ContainerID); LastSeenAt drives retention pruning so a container
-// that leaves the host lingers until the workspace's metrics_retention_days
-// window elapses, then is removed.
+// (DaemonID, ContainerID) and carry the runtime they came from, because each
+// status batch is a snapshot of the runtimes it covers: a container missing
+// from it is gone from the host, and its row is dropped by the ingest. That
+// matters because a recreate mints a new container id for the same name — the
+// old row would otherwise keep answering queries in the state it had when the
+// update stopped it. Retention pruning (LastSeenAt) stays as the backstop for
+// a daemon that stops reporting altogether.
 type DaemonContainer struct {
 	DaemonID       string    `gorm:"size:191;primaryKey;not null"`
 	ContainerID    string    `gorm:"size:128;primaryKey;not null"`
+	Runtime        string    `gorm:"size:64"`
 	WorkspaceID    string    `gorm:"size:191;index;not null"`
 	Name           string    `gorm:"size:255;not null"`
 	Image          string    `gorm:"size:512"`

@@ -348,6 +348,7 @@ func (p *CloudPublisher) PublishLogs(ctx context.Context, entries []LogUploadEnt
 // carries no secrets, unlike logs.
 type containerStatusEntry struct {
 	ContainerID    string `json:"container_id"`
+	Runtime        string `json:"runtime"`
 	Name           string `json:"name"`
 	Image          string `json:"image"`
 	State          string `json:"state"`
@@ -355,17 +356,24 @@ type containerStatusEntry struct {
 	ComposeProject string `json:"compose_project"`
 }
 
-// containerStatusPayload is the wire shape of one status snapshot.
+// containerStatusPayload is the wire shape of one status snapshot. Runtimes
+// names the runtimes this snapshot is a complete answer for; the cloud drops
+// the rows of a covered runtime that the batch leaves out, which is how a
+// container that has been recreated (new id, same name) stops being reported
+// in the state it held while the update had it stopped.
 type containerStatusPayload struct {
 	Containers []containerStatusEntry `json:"containers"`
+	Runtimes   []string               `json:"runtimes"`
 	SentAt     time.Time              `json:"sent_at"`
 }
 
 // PublishContainerStatus uploads the managed container status snapshot. It is
 // opt-in (StatusUploadEnabled) and fire-and-forget on the metrics tick, like
 // PublishActions; a failed request is best-effort and does not block the tick.
+// A snapshot that covers no runtime is not sent: it would make no claim about
+// what is absent, and the cloud would keep the rows it has.
 func (p *CloudPublisher) PublishContainerStatus(ctx context.Context, payload containerStatusPayload) {
-	if p == nil || len(payload.Containers) == 0 {
+	if p == nil || len(payload.Runtimes) == 0 {
 		return
 	}
 	p.post(ctx, "/containers", payload)

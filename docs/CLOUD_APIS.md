@@ -118,6 +118,37 @@ The daemon reports the full sample (including the load, swap, disk and
 network extras) every `metricsInterval`; the cloud stores it, stamps
 `last_seen_at` on the daemon, and clears a prior `disconnected_at` state.
 
+### Container
+
+One managed container's latest reported status, kept per daemon and container
+id.
+
+```json
+{
+  "daemon_id": "d0f2f0c2-...",
+  "container_id": "9d2b4f...",
+  "runtime": "podman",
+  "name": "drasl_drasl_1",
+  "image": "docker.io/unmojang/drasl:latest",
+  "state": "running",
+  "status": "Up 4 hours",
+  "compose_project": "drasl",
+  "first_seen_at": "2026-08-15T11:00:00Z",
+  "last_seen_at": "2026-08-15T12:00:00Z"
+}
+```
+
+`state` is the runtime's own state string, unmodified (`running`, `exited`,
+`created`, `paused`, ...); the cloud never rewrites it, so a client decides how
+to render it. A row exists for as long as the daemon keeps reporting the
+container: the next status batch that covers the container's runtime and does
+not mention it deletes the row. That matters for a recreate, which gives the
+same name a new container id — the old row would otherwise answer queries in
+the state it held while the update had the container stopped, long after its
+replacement is up. `first_seen_at` survives updates of a row, `last_seen_at`
+is refreshed by every batch, and retention pruning by `last_seen_at` stays as
+the backstop for a daemon that stops reporting altogether.
+
 ### Alarm
 Alarms are evaluated **daemon-side** for metric and container conditions. The
 daemon declares `cpu_percent`, `memory_used_percent`, or `disk_used_percent`
@@ -336,6 +367,25 @@ curl 'http://localhost:8080/api/daemons/d0f2f0c2-.../metrics?limit=50&before=202
 | --- | --- | --- | --- |
 | `limit` | int | `100` | `1..100` |
 | `before` | RFC 3339 | — | exclusive cursor on `sent_at` |
+
+#### `GET /api/daemons/:id/containers`
+
+The daemon's managed containers, as it last reported them: `200` returns
+`{"containers": [...]}` of [Container](#container) resources, newest
+`last_seen_at` first. A refresh reads the stored rows, so it reflects the last
+status batch the daemon published rather than a live query of the host.
+
+| Query | Type | Default | Bounds |
+| --- | --- | --- | --- |
+| `compose` | string | — | exact compose project |
+| `state` | string | — | exact runtime state (`running`, `exited`, ...) |
+| `limit` | int | `100` | `1..500` |
+| `before` | RFC 3339 | — | exclusive cursor on `last_seen_at` |
+
+```sh
+curl "http://localhost:8080/api/daemons/d0f2f0c2-.../containers?compose=drasl" \
+  -H 'Authorization: Bearer <solar-token>'
+```
 
 #### `GET /api/daemons/:id/health`
 
@@ -768,6 +818,49 @@ daemon reports the resulting notifications through
 `POST /api/daemons/:id/notifications`. The cloud scheduler independently marks
 enabled daemons disconnected after the configured heartbeat threshold and emits
 `daemon.disconnected` once per outage, subject to the notification cooldown.
+
+#### `POST /api/daemons/:id/containers`
+
+Replace the daemon's managed container status snapshot. `204` on success; `401`
+on a bad or disabled daemon secret; `400` on a malformed batch.
+
+```sh
+curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../containers \
+  -H 'Authorization: Bearer <daemon-secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runtimes": ["podman"],
+    "containers": [
+      {
+        "container_id": "9d2b4f...",
+        "runtime": "podman",
+        "name": "drasl_drasl_1",
+        "image": "docker.io/unmojang/drasl:latest",
+        "state": "running",
+        "status": "Up 4 hours",
+        "compose_project": "drasl"
+      }
+    ],
+    "sent_at": "2026-08-15T12:00:00Z"
+  }'
+```
+
+| Field | Constraints |
+| --- | --- |
+| `containers` | at most 500 entries; may be empty when `runtimes` is not |
+| `containers[].container_id` | required, at most 128 bytes |
+| `containers[].runtime` | the runtime the container was listed from |
+| `runtimes` | at most 8 names, each at most 64 bytes; the runtimes this batch is a complete answer for |
+| `sent_at` | required, non-zero |
+
+The batch is a snapshot, not an append, and `runtimes` is what makes that
+precise: rows of a listed runtime that the batch does not mention are deleted,
+because the daemon only lists a runtime it managed to enumerate. Runtimes it
+does not list keep their rows, so a runtime whose listing failed holds its
+containers at their last known state instead of losing them to a hiccup. A
+batch with no `runtimes` (a daemon older than the field) only upserts. Rows
+written before the `runtime` column existed are matched by absence alone, so a
+daemon that upgrades still retires what it can no longer see.
 
 #### `POST /api/daemons/:id/notifications`
 
