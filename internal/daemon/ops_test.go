@@ -335,57 +335,94 @@ func readCallLog(t *testing.T, path string) []string {
 // lives in root's — the shape of a host whose stacks an operator started with
 // sudo — used to be recreated by the unprivileged attempt first: that attempt
 // created the whole project again in the daemon user's store, under the same
-// container names, where it could not bind the ports the real one holds, and
+// container names, where it could not bind the ports the real one holds, and it
 // left a container behind for every update. The step must run in the store that
-// holds the project, and the tool it runs must be one that can reach it: here
-// the standalone `podman-compose` is present but not granted, so the runtime's
-// own `podman compose` is the tool that runs.
+// holds the project, and it must run the tool the operator's stacks are made
+// with — the standalone `podman-compose` where the host has it — rather than
+// substituting the runtime's own compose wrapper for it.
 func TestContainerUpdateRecreatesInTheStoreThatOwnsTheProject(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("a daemon running as root has one store")
 	}
-	calls := filepath.Join(t.TempDir(), "calls")
-	t.Setenv("FAKE_STORE_CALLS", calls)
-	dir := t.TempDir()
-	// A standalone tool that records its own argv (ungated by the store=fake)
-	// so a test can see it run.
-	fakeCommand(t, "podman-compose", "#!/bin/sh\nprintf 'standalone argv=%s\\n' \"$*\" >> "+calls+"\n")
-	fakeCommand(t, "sudo", fakeSudoScript(false))
-	path := fakeCommand(t, "podman", fakeStoreRuntimeScript("", "drasl", dir))
-	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+	// A standalone tool that records its own argv with the store it ran in.
+	const standaloneBody = "#!/bin/sh\nprintf 'store=%s standalone argv=%s\\n' \"${FAKE_STORE:-own}\" \"$*\" >> \"$FAKE_STORE_CALLS\"\n"
+	for _, tc := range []struct {
+		name       string
+		standalone bool
+		grantsTool bool
+		wantErr    []string
+		wantSteps  []string
+	}{
+		{
+			// The operator's own tool, through sudo, in root's store.
+			name: "the granted standalone tool runs", standalone: true, grantsTool: true,
+			wantSteps: []string{
+				"store=root standalone argv=-p drasl -f FILE pull drasl",
+				"store=root standalone argv=-p drasl -f FILE up -d --force-recreate drasl",
+			},
+		},
+		{
+			// The shipped sudoers rule grants the runtime and not the tool. The
+			// step is refused with the line that would allow it: falling through
+			// to the wrapper would hand the project to a different compose
+			// implementation than the one that owns it.
+			name: "a granted runtime does not stand in for the tool", standalone: true, grantsTool: false,
+			wantErr: []string{"STANDALONE", "NOPASSWD", "root's store"},
+		},
+		{
+			// No standalone tool on the host: the runtime's own subcommand is
+			// the only compose tool there is, so using it mixes nothing.
+			name: "the wrapper is the only tool", standalone: false, grantsTool: true,
+			wantSteps: []string{
+				"store=root argv=compose -p drasl -f FILE pull drasl",
+				"store=root argv=compose -p drasl -f FILE up -d --force-recreate drasl",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := filepath.Join(t.TempDir(), "calls")
+			t.Setenv("FAKE_STORE_CALLS", calls)
+			dir := t.TempDir()
+			standalonePath := ""
+			if tc.standalone {
+				standalonePath = fakeCommand(t, "podman-compose", standaloneBody)
+			}
+			fakeCommand(t, "sudo", fakeSudoScript(tc.grantsTool))
+			path := fakeCommand(t, "podman", fakeStoreRuntimeScript("", "drasl", dir))
+			runner := newTestOpsRunner(t, map[string]string{"podman": path})
 
-	response, status, requestErr := runner.dispatch(
-		context.Background(), "container.update", opParams{target: "drasl_drasl_1"}, "test", "tester",
-	)
-	if requestErr != nil || status != http.StatusOK || !response.OK {
-		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
-	}
-	file := filepath.Join(dir, "compose.yml")
-	wantSteps := []string{
-		"compose -p drasl -f " + file + " pull drasl",
-		"compose -p drasl -f " + file + " up -d --force-recreate drasl",
-	}
-	var steps []string
-	probedOwnStore := false
-	for _, call := range readCallLog(t, calls) {
-		if strings.HasPrefix(call, "standalone ") {
-			t.Fatalf("the standalone compose tool ran, though only the runtime is granted: %q", call)
-		}
-		if strings.Contains(call, "argv=compose") && strings.HasPrefix(call, "store=own") {
-			t.Fatalf("the step ran in the daemon user's own store, creating a second stack: %q", call)
-		}
-		if strings.Contains(call, "argv=ps -a") && strings.HasPrefix(call, "store=own") {
-			probedOwnStore = true
-		}
-		if strings.Contains(call, "argv=compose") && strings.HasPrefix(call, "store=root") {
-			steps = append(steps, strings.SplitN(call, "argv=", 2)[1])
-		}
-	}
-	if !probedOwnStore {
-		t.Fatal("the daemon did not look in the daemon user's own store before choosing root's")
-	}
-	if got := strings.Join(steps, "|"); got != strings.Join(wantSteps, "|") {
-		t.Fatalf("compose steps =\n%s\nwant\n%s", got, strings.Join(wantSteps, "|"))
+			response, status, requestErr := runner.dispatch(
+				context.Background(), "container.update", opParams{target: "drasl_drasl_1"}, "test", "tester",
+			)
+			file := filepath.Join(dir, "compose.yml")
+			if len(tc.wantErr) > 0 {
+				if requestErr == nil || requestErr.status != http.StatusBadRequest {
+					t.Fatalf("status=%d err=%+v, want 400", status, requestErr)
+				}
+				for _, want := range tc.wantErr {
+					if want == "STANDALONE" {
+						want = standalonePath
+					}
+					if !strings.Contains(requestErr.message, want) {
+						t.Fatalf("message = %q, want it to mention %q", requestErr.message, want)
+					}
+				}
+			} else if requestErr != nil || status != http.StatusOK || !response.OK {
+				t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+			}
+			// The steps, exactly: which store they ran in, which tool ran them
+			// and with which argv. Anything else recorded is a store probe.
+			var got []string
+			for _, call := range readCallLog(t, calls) {
+				if !strings.Contains(call, "standalone argv=") && !strings.Contains(call, "argv=compose") {
+					continue
+				}
+				got = append(got, strings.ReplaceAll(call, file, "FILE"))
+			}
+			if strings.Join(got, "|") != strings.Join(tc.wantSteps, "|") {
+				t.Fatalf("steps =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.wantSteps, "\n"))
+			}
+		})
 	}
 }
 

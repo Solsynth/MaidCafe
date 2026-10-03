@@ -869,14 +869,18 @@ configuration the same way the container's creation did.
   other as a fallback, and a project that exists in *two* stores is refused
   (`400`) with both named: choosing silently is how the second copy appeared in
   the first place.
-- Which tool runs depends on the store. In the daemon user's own store the
-  tools are tried in the order above, unprivileged. In root's store every
-  attempt is `sudo -n`-wrapped and only tools that grant permits are kept, so a
-  host whose `/etc/sudoers.d` grants the runtime but not the standalone tool
-  runs `sudo podman compose …` — the wrapper *is* the granted binary — and
-  never falls back to running the standalone tool unprivileged. When no tool can
-  reach the store at all, the operation is refused with the sudoers line that
-  would allow it, rather than run somewhere else.
+- Which tool runs depends on the store, and it stays the tool the project is
+  made with. In the daemon user's own store the tools are tried in the order
+  above, unprivileged. In root's store every attempt is `sudo -n`-wrapped and
+  the order is a *requirement* rather than a fallback: the tool that would run
+  first must be one `sudo -n` may run, and when it is not, the operation is
+  refused (`400`) with that tool's sudoers line instead of being handed to the
+  next tool. Substituting the runtime's own `compose` subcommand for a stack the
+  operator's `podman-compose` created would give one project two compose
+  implementations — a different version, a different argument parser, a
+  different idea of the project's name — and that is how a stack comes apart. A
+  host that has no standalone tool has only the runtime's subcommand to run, and
+  then there is nothing to mix.
 - The compose command is chosen from the runtime's own name, so a docker host is
   never sent to `podman-compose`: the two write to different image stores, and
   pulling into the wrong one would leave the container exactly where it was.
@@ -884,7 +888,10 @@ configuration the same way the container's creation did.
   only as the fallback — podman does not implement compose, so its subcommand is
   a wrapper that execs whichever provider is installed, normally that same
   `podman-compose`. Calling the tool directly is one layer less, and that layer
-  is where an argument it evaluates and forwards can kill the command.
+  is where an argument it evaluates and forwards can kill the command. That
+  order is what runs in root's store as well, where a tool the daemon may not
+  run through `sudo -n` is a refusal rather than a reason to reorder — see the
+  store rule above.
   **Docker** runs `docker compose` first, because there the plugin *is* the
   implementation, with `docker-compose` as the fallback for a host that has only
   it.
@@ -1271,13 +1278,25 @@ EOF
 ```
 
 Root's store is where the daemon *reads* when its own store has nothing to
-show, and it is the only store a project that lives there may be written to:
-the step runs `sudo podman compose …` there — the runtime's own subcommand is
-covered by this rule — and never runs the standalone `podman-compose`
-unprivileged, which would create the project a second time under the same
-names. A standalone tool needs its own line (`/usr/local/bin/podman-compose`)
-to be used for such a project; without any granted compose command the update
-is refused and says so.
+show, and it is the only store a project that lives there may be written to.
+Two grants are in play and they do different things: the runtime is what lets
+the daemon see root's containers at all, and the **compose tool the stacks were
+deployed with** is what lets it update them — in that store, through that tool,
+never by substituting another one:
+
+```sh
+sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidcafe-containers <<'EOF'
+maidcafe ALL=(root) NOPASSWD: /usr/bin/podman, /usr/bin/docker
+maidcafe ALL=(root) NOPASSWD: /usr/local/bin/podman-compose
+EOF
+```
+
+The second line is the one that matters for a stack built with the standalone
+tool. Without it the daemon does *not* fall back to `podman compose`: it refuses
+the step and prints the line to add, because a project that one tool created
+must not be recreated by another. Adjust the path to where the host keeps its
+tool (`command -v podman-compose`); a host that has no standalone tool needs no
+such line — the runtime's subcommand is then the only compose tool there is.
 
 The tradeoff is worth stating plainly: `sudo podman` is root-equivalent for
 that binary — a container can mount the host filesystem and run as root inside

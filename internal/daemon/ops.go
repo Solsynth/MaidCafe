@@ -1164,16 +1164,20 @@ func (r *nativeOpRunner) composeProjectStore(ctx context.Context, project string
 	return composeStore{}, fmt.Errorf("no container runtime available")
 }
 
-// composeAttempts builds the compose step for [target] in [store]: every tool
+// composeAttempts builds the compose step for [target] in [store]: the tools
 // that can run it, in the order that runtime prefers (see composeTools), each in
 // the form that reaches that store.
 //
-// It returns an error instead of a shorter ladder when no tool can reach the
-// store. A step that belongs in root's store has no unprivileged form worth
-// running — the unprivileged form is the daemon user's own store, which is a
-// different project on the same host — so the answer is a refusal that names
-// the grant which would let the daemon run it, not a step that quietly creates
-// the project a second time.
+// Two things it will not do. It will not run the step in another store: the
+// unprivileged form of a step that belongs in root's store is the daemon user's
+// own store, which is a different project on the same host. And it will not
+// substitute one compose implementation for another: the tools are a *preference
+// order*, so when the tool that would run first cannot reach the store — the
+// sudoers grant names the runtime binary and not the standalone tool, say — the
+// step is refused with the line that would allow it, rather than handed to the
+// next tool in the list. One project owned by two compose implementations is
+// how a stack comes apart, which is also why the order puts the operator's own
+// tool first (see composeTools).
 //
 // The compose file list comes from the container's own labels when they record
 // it, so the step reads the same file the container was created from even when
@@ -1191,7 +1195,6 @@ func (r *nativeOpRunner) composeAttempts(ctx context.Context, store composeStore
 		return nil, fmt.Errorf("no compose tool is installed for %s", store.Runtime)
 	}
 	attempts := make([]opAttempt, 0, len(tools))
-	denied := make([]string, 0, len(tools))
 	for _, tool := range tools {
 		inner := append([]string{}, tool.prefix...)
 		inner = append(inner, "-p", target.Project)
@@ -1206,18 +1209,18 @@ func (r *nativeOpRunner) composeAttempts(ctx context.Context, store composeStore
 			continue
 		}
 		if !sudoRuns(ctx, tool.command) {
-			denied = append(denied, tool.command)
-			continue
+			if len(attempts) > 0 {
+				// A tool later in the order cannot reach this store. The step
+				// keeps the tool it has and stops here.
+				break
+			}
+			return nil, fmt.Errorf(
+				"project %q lives in %s, and the compose tool that runs there — %s — may not be run through `sudo -n` on this host; grant it (for example `maidcafe ALL=(root) NOPASSWD: %s` in a file under /etc/sudoers.d/) or run the step yourself as root",
+				target.Project, store.describe(), tool.command, tool.command)
 		}
 		attempts = append(attempts, opAttempt{
 			command: "sudo", args: append([]string{"-n", tool.command}, inner...), cwd: target.Directory,
 		})
-	}
-	if len(attempts) == 0 {
-		return nil, fmt.Errorf(
-			"project %q lives in %s, and `sudo -n` may not run %s on this host; grant one of them (for example `%s ALL=(root) NOPASSWD: %s` in a file under /etc/sudoers.d/) or run the step yourself as root",
-			target.Project, store.describe(), strings.Join(denied, " or "),
-			"maidcafe", strings.Join(denied, ", "))
 	}
 	return attempts, nil
 }
