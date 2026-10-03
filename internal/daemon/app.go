@@ -31,6 +31,7 @@ type App struct {
 	hub             *StreamHub
 	alarms          *alarmEvaluator
 	containers      *ContainersCollector
+	composeStacks   *composeStackStore
 	images          *ImagesCollector
 	processes       *ProcessesCollector
 	systemd         *SystemdCollector
@@ -111,20 +112,23 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	}
 	historyStore := newProcessHistoryStore(historyDir, cfg.MetricsRetentionDays)
 	logStore := newContainerLogStore(cfg.LogsDir, cfg.MetricsRetentionDays)
+	composeStacks := newComposeStackStore(cfg.Compose.StacksPath, logger)
+	ops.SetComposeStacks(composeStacks)
 	jobs := newJobRunner(executor, ops, publisherBox, logger)
 	app := &App{
-		cfg:        cfg,
-		audit:      audit,
-		executor:   executor,
-		ops:        ops,
-		metrics:    metrics,
-		publisher:  publisherBox,
-		hub:        NewStreamHub(),
-		alarms:     newAlarmEvaluator(),
-		containers: &ContainersCollector{probe: runtimeProbe},
-		images:     &ImagesCollector{probe: runtimeProbe},
-		processes:  &ProcessesCollector{limit: cfg.ProcessesLimit, table: processTable},
-		systemd:    &SystemdCollector{},
+		cfg:           cfg,
+		audit:         audit,
+		executor:      executor,
+		ops:           ops,
+		metrics:       metrics,
+		publisher:     publisherBox,
+		hub:           NewStreamHub(),
+		alarms:        newAlarmEvaluator(),
+		containers:    &ContainersCollector{probe: runtimeProbe},
+		composeStacks: composeStacks,
+		images:        &ImagesCollector{probe: runtimeProbe},
+		processes:     &ProcessesCollector{limit: cfg.ProcessesLimit, table: processTable},
+		systemd:       &SystemdCollector{},
 		runtimes: &RuntimesCollector{
 			limit: cfg.ProcessesLimit, runtimes: cfg.Runtimes,
 			watched: watchedStore, history: historyStore, table: processTable,
@@ -507,6 +511,13 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			p.directory = directory
 		}
 	}))
+	// Managed compose stacks: what a scan assigned to this daemon. The native
+	// compose operations above resolve their directory here when the caller
+	// does not send one, and `container.update` does the same for a container
+	// whose own labels do not point at its project.
+	router.GET("/api/v1/compose/stacks", authorizeMetrics, app.handleComposeStacks)
+	router.POST("/api/v1/compose/stacks/scan", authorizeMetrics, app.handleComposeStacksScan)
+	router.DELETE("/api/v1/compose/stacks/:project", authorizeMetrics, app.handleComposeStackRemove)
 	// Config introspection and safe-subset patching: the daemon edits its own
 	// config.toml (preserving everything it does not model) and hot-reloads,
 	// so interval/limit/cloud changes apply without a restart.

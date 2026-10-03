@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -113,6 +114,7 @@ var nativeOpDisplayNames = map[string]string{
 	"compose.restart":   "Compose restart",
 	"compose.pull":      "Compose pull",
 	"compose.recreate":  "Compose recreate",
+	"compose.update":    "Update compose stack",
 }
 
 // isNativeOpSlug reports whether [name] is a built-in native operation. Used
@@ -242,6 +244,91 @@ type nativeOpRunner struct {
 	// priv is how an operation reaches root, when it may. Nil means the
 	// pre-helper behavior (a direct call, then a blanket `sudo -n`).
 	priv atomic.Pointer[opPrivPolicy]
+	// composeStacks is the registry of stacks the operator assigned to this
+	// daemon with a scan. A compose action that names no directory resolves
+	// one here, and a container whose labels do not point at its project is
+	// updated where that registry says it lives.
+	composeStacks *composeStackStore
+}
+
+// SetComposeStacks hands the runner the managed stack registry. Called at
+// construction; the registry itself is long-lived and rewritten in place, so a
+// reload does not replace it.
+func (r *nativeOpRunner) SetComposeStacks(store *composeStackStore) {
+	r.composeStacks = store
+}
+
+// composeStack returns the managed stack for [project], matched without regard
+// to case.
+func (r *nativeOpRunner) composeStack(project string) (composeStack, bool) {
+	if r.composeStacks == nil {
+		return composeStack{}, false
+	}
+	return r.composeStacks.Get(project)
+}
+
+// composeTargetDirectory fills in the project directory a container's labels
+// did not record, from the stacks the operator assigned to this daemon.
+//
+// A container only reaches this when its labels name a project and a service
+// but no usable directory. It is not guessed at: the daemon runs `compose up`
+// where a scan found the project, or it refuses.
+func (r *nativeOpRunner) composeTargetDirectory(target composeUpdateTarget) (composeUpdateTarget, error) {
+	if target.Directory != "" {
+		return target, nil
+	}
+	stack, ok := r.composeStack(target.Project)
+	if !ok {
+		return composeUpdateTarget{}, fmt.Errorf(
+			"the container's compose labels record no usable working directory, and project %q is not a stack this daemon manages — run a compose scan to assign it",
+			target.Project)
+	}
+	target.Directory = stack.Directory
+	if len(target.Files) == 0 {
+		target.Files = stack.Files
+	}
+	return target, nil
+}
+
+// composeDirectory is the directory a compose action runs in: the one the
+// caller sent, or — when it sent none — the managed stack's own.
+//
+// A caller's directory keeps the stricter rule it always had, because that path
+// comes from outside this host. A managed stack's directory was validated when
+// the scan recorded it.
+func (r *nativeOpRunner) composeDirectory(project, directory string) (string, []string, error) {
+	if directory != "" {
+		if !validNativeDirectory(directory) {
+			return "", nil, fmt.Errorf("invalid compose directory")
+		}
+		return directory, nil, nil
+	}
+	stack, ok := r.composeStack(project)
+	if !ok {
+		return "", nil, fmt.Errorf(
+			"project %q is not a stack this daemon manages; run a compose scan to assign it, or send the directory", project)
+	}
+	return stack.Directory, stack.Files, nil
+}
+
+// composeAttemptsFor builds one compose step against every runtime that can run
+// it, in probe order (podman first): the alternate runtime is the same relation
+// the other native operations carry, and a project that lives in one runtime's
+// store is not found in the other's.
+func (r *nativeOpRunner) composeAttemptsFor(
+	ctx context.Context,
+	target composeUpdateTarget,
+	args ...string,
+) []opAttempt {
+	var attempts []opAttempt
+	for _, runtime := range []string{"podman", "docker"} {
+		path, ok := r.runtimes(ctx)[runtime]
+		if !ok {
+			continue
+		}
+		attempts = append(attempts, r.composeAttempts(path, target, args...)...)
+	}
+	return attempts
 }
 
 // SetScriptTimeout updates the daemon-wide op timeout (hot reload).
@@ -413,6 +500,9 @@ func (r *nativeOpRunner) dispatch(
 			break
 		}
 		compose, err := composeUpdateTargetFromLabels(resolved.Labels)
+		if err == nil {
+			compose, err = r.composeTargetDirectory(compose)
+		}
 		if err != nil {
 			// Docker cannot recreate a plain `docker run` container from its own
 			// configuration, and replaying inspect into a `run` argv would
@@ -422,7 +512,7 @@ func (r *nativeOpRunner) dispatch(
 			// is declared in compose is recreated by compose, which is the
 			// runtime's own answer to this and needs no reconstruction.
 			return bad(fmt.Sprintf(
-				"%s (runtime %s); the daemon recreates only compose-managed containers — pull the image with container.pull and recreate this one on the host",
+				"%s (runtime %s); the daemon recreates only compose-managed containers whose project it can find — pull the image with container.pull and recreate this one on the host",
 				err.Error(), resolved.Runtime))
 		}
 		stages = append(stages,
@@ -570,28 +660,35 @@ func (r *nativeOpRunner) dispatch(
 		}
 	case strings.HasPrefix(slug, "compose."):
 		verb := strings.TrimPrefix(slug, "compose.")
-		cliArgs, known := nativeComposeVerbs[verb]
-		if !known {
-			return bad("unknown compose action")
-		}
-		if !nativeProjectPattern.MatchString(params.target) || !validNativeDirectory(params.directory) {
-			return bad("invalid compose project or directory")
+		if !nativeProjectPattern.MatchString(params.target) {
+			return bad("invalid compose project")
 		}
 		targetLabel = params.target
 		if timeout < slowOpTimeout {
 			timeout = slowOpTimeout
 		}
-		for _, runtime := range []string{"podman", "docker"} {
-			path, ok := r.runtimes(ctx)[runtime]
-			if !ok {
-				continue
-			}
-			args := append([]string{"compose", "--ansi", "never", "-p", params.target}, strings.Fields(cliArgs)...)
-			attempts = append(attempts, opAttempt{command: path, args: args, cwd: params.directory})
-			if sudo := r.sudoAttempt(); sudo != nil {
-				attempts = append(attempts, opAttempt{command: sudo[0], args: append(sudo[1:], append([]string{path}, args...)...), cwd: params.directory})
-			}
+		directory, files, err := r.composeDirectory(params.target, params.directory)
+		if err != nil {
+			return bad(err.Error())
 		}
+		compose := composeUpdateTarget{
+			Project: params.target, Directory: directory, Files: files,
+		}
+		if verb == "update" {
+			// An upgrade is the same two steps a container update runs, for
+			// every service the project declares: fetch the images, then
+			// recreate on them.
+			stages = append(stages,
+				opStage{attempts: r.composeAttemptsFor(ctx, compose, "pull")},
+				opStage{attempts: r.composeAttemptsFor(ctx, compose, "up", "-d", "--force-recreate")},
+			)
+			break
+		}
+		cliArgs, known := nativeComposeVerbs[verb]
+		if !known {
+			return bad("unknown compose action")
+		}
+		attempts = append(attempts, r.composeAttemptsFor(ctx, compose, strings.Fields(cliArgs)...)...)
 	default:
 		return bad("unknown operation")
 	}
@@ -647,29 +744,31 @@ type opContainerResolution struct {
 
 // composeUpdateTarget is the compose identity a container's labels declare.
 type composeUpdateTarget struct {
-	Project   string
-	Service   string
+	Project string
+	Service string
+	// Directory is the project directory the labels record, when they record a
+	// usable one. Empty means discovery has to find the project.
 	Directory string
-	Files     []string
+	// Files are the compose files the labels record, exactly as recorded:
+	// absolute, or relative to [Directory]. They are resolved when the argv is
+	// built, because a project found by discovery supplies the base a relative
+	// entry needs.
+	Files []string
 }
 
 // composeUpdateTargetFromLabels reads the compose identity out of a
 // container's labels. docker compose records the project, service, working
-// directory and config files; podman compose records the same facts under its
-// own label prefix. Everything is validated before it reaches an argv: these
-// values come from the host's own container configuration, and a `compose up`
-// in a directory of the labels' choosing is exactly the interpolation this
-// package refuses to do.
+// directory and config files; podman compose and the standalone podman-compose
+// record the same facts, and record the config files as the paths the operator
+// typed (`-f docker-compose.yml` stays `docker-compose.yml`).
+//
+// Everything is validated before it reaches an argv: these values come from the
+// host's own container configuration, and a `compose up` in a directory of the
+// labels' choosing is exactly the interpolation this package refuses to do.
 func composeUpdateTargetFromLabels(labels map[string]string) (composeUpdateTarget, error) {
 	target := composeUpdateTarget{
-		Project:   composeLabel(labels, "project"),
-		Service:   composeLabel(labels, "service"),
-		Directory: composeLabel(labels, "project.working_dir"),
-	}
-	for _, file := range strings.Split(composeLabel(labels, "project.config_files"), ",") {
-		if file = strings.TrimSpace(file); file != "" {
-			target.Files = append(target.Files, file)
-		}
+		Project: composeLabel(labels, "project"),
+		Service: composeLabel(labels, "service"),
 	}
 	if target.Project == "" || target.Service == "" {
 		return composeUpdateTarget{}, fmt.Errorf("the container is not compose-managed")
@@ -677,15 +776,64 @@ func composeUpdateTargetFromLabels(labels map[string]string) (composeUpdateTarge
 	if !nativeProjectPattern.MatchString(target.Project) || !nativeProjectPattern.MatchString(target.Service) {
 		return composeUpdateTarget{}, fmt.Errorf("the container's compose labels name an invalid project or service")
 	}
-	if !validNativeDirectory(target.Directory) {
-		return composeUpdateTarget{}, fmt.Errorf("the container's compose labels record no usable working directory")
+	if directory := composeLabel(labels, "project.working_dir"); validComposeLabelDirectory(directory) {
+		target.Directory = directory
 	}
-	for _, file := range target.Files {
-		if !validNativeDirectory(file) {
-			return composeUpdateTarget{}, fmt.Errorf("the container's compose labels record an invalid compose file path")
+	for _, file := range strings.Split(composeLabel(labels, "project.config_files"), ",") {
+		if file = strings.TrimSpace(file); file != "" && validComposeLabelFile(file) {
+			target.Files = append(target.Files, file)
 		}
 	}
 	return target, nil
+}
+
+// validComposeLabelDirectory reports whether a working directory recorded in a
+// container's labels is one this package will run a compose command in: an
+// absolute path with no parent segment.
+//
+// It is deliberately looser than [validNativeDirectory], which also restricts
+// the character set. That guard exists for a directory a *caller* names, where
+// refusing anything unusual costs nothing; these paths are the host's own
+// recorded configuration, they reach an argv and never a shell, and refusing
+// the update of every project that lives under `/home/First Last/stack` would
+// gain nothing.
+func validComposeLabelDirectory(value string) bool {
+	return value != "" && filepath.IsAbs(value) && validComposeLabelPath(value)
+}
+
+// validComposeLabelFile reports whether one recorded compose file is usable: an
+// absolute path, or a path relative to the project directory.
+func validComposeLabelFile(value string) bool {
+	return value != "" && validComposeLabelPath(value)
+}
+
+// validComposeLabelPath rejects what must not reach an argv: a NUL, a newline,
+// or a parent segment that would let the recorded path leave the directory the
+// labels named.
+func validComposeLabelPath(value string) bool {
+	if strings.ContainsAny(value, "\x00\n\r") {
+		return false
+	}
+	for _, segment := range strings.Split(filepath.ToSlash(value), "/") {
+		if segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveComposeFile turns one recorded compose file into the absolute path
+// compose is invoked with. A relative entry resolves against the project
+// directory — it is still the file the container was created from, only named
+// the way the operator named it on the command line.
+func resolveComposeFile(directory, file string) (string, bool) {
+	if filepath.IsAbs(file) {
+		return file, true
+	}
+	if directory == "" {
+		return "", false
+	}
+	return filepath.Join(directory, file), true
 }
 
 // composeLabel reads one compose fact, accepting either runtime's prefix.
@@ -700,20 +848,40 @@ func composeLabel(labels map[string]string, key string) string {
 
 // composeAttempts builds one compose step for [target] against the runtime that
 // holds the container, with the same `sudo -n` variant every native operation
-// carries. The compose file list comes from the container's own labels when
-// they record it, so the step reads the same file the container was created
-// from even when the project directory holds several.
+// carries, and the standalone compose tool as the last alternative.
+//
+// The compose file list comes from the container's own labels when they record
+// it, so the step reads the same file the container was created from even when
+// the project directory holds several. A project whose files the labels do not
+// name is run from its own directory, where compose reads the default file.
 func (r *nativeOpRunner) composeAttempts(path string, target composeUpdateTarget, args ...string) []opAttempt {
-	base := []string{"compose", "--ansi", "never", "-p", target.Project}
+	files := make([]string, 0, len(target.Files))
 	for _, file := range target.Files {
-		base = append(base, "-f", file)
+		if resolved, ok := resolveComposeFile(target.Directory, file); ok {
+			files = append(files, resolved)
+		}
 	}
-	base = append(base, args...)
-	attempts := []opAttempt{{command: path, args: base, cwd: target.Directory}}
-	if sudo := r.sudoAttempt(); sudo != nil {
+	sudo := r.sudoAttempt()
+	tools := composeTools(path)
+	attempts := make([]opAttempt, 0, 2*len(tools))
+	for _, tool := range tools {
+		inner := append([]string{}, tool.prefix...)
+		inner = append(inner, "-p", target.Project)
+		for _, file := range files {
+			inner = append(inner, "-f", file)
+		}
+		inner = append(inner, args...)
 		attempts = append(attempts, opAttempt{
-			command: sudo[0], args: append(sudo[1:], append([]string{path}, base...)...), cwd: target.Directory,
+			command: tool.command, args: inner, cwd: target.Directory,
 		})
+		if sudo != nil {
+			wrapped := append([]string{}, sudo[1:]...)
+			wrapped = append(wrapped, tool.command)
+			wrapped = append(wrapped, inner...)
+			attempts = append(attempts, opAttempt{
+				command: sudo[0], args: wrapped, cwd: target.Directory,
+			})
+		}
 	}
 	return attempts
 }

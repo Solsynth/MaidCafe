@@ -125,6 +125,9 @@ type DaemonConfig struct {
 	// channel, so the daemon serves the operations the file manager and the
 	// editor need. Disabled by default.
 	Files FilesConfig `mapstructure:"files"`
+	// Compose governs the managed compose stacks: the registry of projects a
+	// scan assigned to this daemon, and where a scan looks for them.
+	Compose ComposeConfig `mapstructure:"compose"`
 	// Priv names the privileged-operation helper, the one component that runs
 	// as root. A privileged file root and a privileged systemd action both go
 	// through it, and the helper's own root-owned configuration is the
@@ -257,6 +260,29 @@ type TerminalRelayConfig struct {
 	// which bounds session start latency and idle cloud traffic. 0 uses
 	// TerminalRelayDefaultPollWait.
 	PollWait time.Duration `mapstructure:"pollWait"`
+}
+
+// ComposeConfig governs the managed compose stacks.
+//
+// A stack becomes managed when a scan finds it — either the operator's
+// configured roots or a starting point a request names — and the registry
+// outlives a restart. Managing a stack is what lets the daemon upgrade it
+// (pull, then recreate) and report what it is running; an unmanaged project is
+// still reachable through the compose action API when the caller sends its
+// directory.
+type ComposeConfig struct {
+	// StacksPath is the registry of assigned stacks, rewritten as a whole on
+	// every change. Empty keeps the registry in memory only, so a restart
+	// forgets which stacks were assigned until the next scan.
+	StacksPath string `mapstructure:"stacksPath"`
+	// ScanRoots is where a scan looks when a request names no starting point.
+	// Empty uses the built-in defaults (`/opt`, `/srv`, `/root`, `/home`,
+	// `/etc/compose`, `/var/lib/compose`).
+	ScanRoots []string `mapstructure:"scanRoots"`
+	// ScanDepth is how far below a root a compose file is looked for. Zero uses
+	// the built-in default (3): a project sits at the root itself or a
+	// directory or two down.
+	ScanDepth int `mapstructure:"scanDepth"`
 }
 
 // FilesConfig is the opt-in file-management API policy. The API serves the
@@ -710,6 +736,41 @@ func validateFiles(cfg FilesConfig) error {
 	return nil
 }
 
+// validateCompose checks the managed-stack configuration: a registry path the
+// daemon can write, and scan roots that are directories the daemon may read.
+// A scan root that does not exist is refused rather than ignored, because a
+// silent omission reads as "the scan found nothing".
+func validateCompose(cfg ComposeConfig) error {
+	if cfg.StacksPath != "" && !filepath.IsAbs(cfg.StacksPath) {
+		return fmt.Errorf("daemon.compose.stacksPath must be an absolute path")
+	}
+	if cfg.ScanDepth < 0 || cfg.ScanDepth > 12 {
+		return fmt.Errorf("daemon.compose.scanDepth must be between 0 and 12")
+	}
+	seen := make(map[string]struct{}, len(cfg.ScanRoots))
+	for i, root := range cfg.ScanRoots {
+		if strings.TrimSpace(root) != root || root == "" {
+			return fmt.Errorf("daemon.compose.scanRoots[%d] must be a non-empty path", i)
+		}
+		if !filepath.IsAbs(root) {
+			return fmt.Errorf("daemon.compose.scanRoots[%d] %q must be an absolute path", i, root)
+		}
+		clean := filepath.Clean(root)
+		if _, ok := seen[clean]; ok {
+			return fmt.Errorf("daemon.compose.scanRoots[%d] %q is duplicated", i, root)
+		}
+		seen[clean] = struct{}{}
+		info, err := os.Stat(clean)
+		if err != nil {
+			return fmt.Errorf("daemon.compose.scanRoots[%d] %q is not usable: %w", i, root, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("daemon.compose.scanRoots[%d] %q is not a directory", i, root)
+		}
+	}
+	return nil
+}
+
 // validatePriv checks the privileged-helper configuration, and with it the
 // helper's presence whenever something is routed to it. An operation routed to
 // a helper that is not installed fails on the request instead of at load, which
@@ -816,6 +877,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.maxBodyBytes", int64(65536))
 	viper.SetDefault("daemon.maxConcurrentRuns", 4)
 	viper.SetDefault("daemon.files.enabled", false)
+	viper.SetDefault("daemon.compose.stacksPath", "/var/lib/maidcafe/compose-stacks.json")
+	viper.SetDefault("daemon.compose.scanRoots", []string{})
+	viper.SetDefault("daemon.compose.scanDepth", 0)
 	viper.SetDefault("daemon.files.secret", "")
 	viper.SetDefault("daemon.files.roots", []map[string]any{})
 	viper.SetDefault("daemon.priv.helper", "")
@@ -1159,6 +1223,7 @@ func applyEnvAliases() {
 		"DAEMON_JOBS_DIR":                "daemon.jobsDir",
 		"DAEMON_LOG_ALERTS_DIR":          "daemon.logAlertsDir",
 		"DAEMON_LOGS_DIR":                "daemon.logsDir",
+		"DAEMON_COMPOSE_STACKS_PATH":     "daemon.compose.stacksPath",
 		"DAEMON_LOGS_INTERVAL":           "daemon.logsInterval",
 		"DAEMON_LOGS_UPLOAD_ENABLED":     "daemon.logsUploadEnabled",
 		"DAEMON_LOGS_UPLOAD_INTERVAL":    "daemon.logsUploadInterval",
@@ -1469,6 +1534,9 @@ func (c *Config) ValidateDaemon() error {
 		return err
 	}
 	if err := validateFiles(c.Daemon.Files); err != nil {
+		return err
+	}
+	if err := validateCompose(c.Daemon.Compose); err != nil {
 		return err
 	}
 	if err := validatePriv(c.Daemon.Priv, c.Daemon.Files); err != nil {

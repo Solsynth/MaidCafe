@@ -762,19 +762,24 @@ a family through it instead — see
 [Privileged operations](docs/PRIVILEGED.md).
 
 ```text
-POST /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove|pull|update
-POST /api/v1/processes/:pid/kill
-POST /api/v1/systemd/:unit/:action    action = start|stop|restart|reload|enable|disable
-POST /api/v1/compose/:project/:action action = up|stop|restart|pull|recreate
-POST /api/v1/packages/:action         action = refresh|upgrade|install|remove
-POST /api/v1/firewall/:action         action = enable|disable|allow|deny|delete
+POST   /api/v1/containers/:id/:action   action = start|stop|restart|pause|unpause|kill|remove|pull|update
+POST   /api/v1/processes/:pid/kill
+POST   /api/v1/systemd/:unit/:action    action = start|stop|restart|reload|enable|disable
+POST   /api/v1/compose/:project/:action action = up|stop|restart|pull|recreate|update
+POST   /api/v1/packages/:action         action = refresh|upgrade|install|remove
+POST   /api/v1/firewall/:action         action = enable|disable|allow|deny|delete
+GET    /api/v1/compose/stacks           the managed stack registry, with what each stack runs
+POST   /api/v1/compose/stacks/scan      assign stacks: {"path": "…"} | {"roots": ["…"]} | neither (configured roots)
+DELETE /api/v1/compose/stacks/:project  unassign one stack
 ```
 
 All are authenticated with the metrics secret and a body signature, like the
 actions route. `POST /api/v1/containers/:id/remove` accepts `{"force":
-true}` (mapped to `rm -f`); `POST /api/v1/compose/:project/:action` requires
-`{"directory": "<absolute path>"}` — compose resolves its file from the
-working directory, so the path must hold the compose file. Container ops
+true}` (mapped to `rm -f`); `POST /api/v1/compose/:project/:action` takes an
+optional `{"directory": "<absolute path>"}` — compose resolves its file from the
+working directory, so a caller that sends one makes the path the daemon's
+working directory, and a caller that sends none runs the project where the
+managed stack registry says it lives. Container ops
 resolve the runtime with the shared probe (podman first) and fall back to the
 other runtime when the container is not found there. Every run is appended to
 the audit log under its slug (`container.restart`, `process.kill`, …).
@@ -797,11 +802,28 @@ configuration the same way the container's creation did.
   their labels (`com.docker.compose.*`, or podman compose's
   `io.podman.compose.*`): the step is
   `compose -p <project> [-f <file>…] pull <service>` followed by
-  `compose … up -d --force-recreate <service>`, run in the project directory the
-  labels record, with every label value validated before it reaches an argv.
+  `compose … up -d --force-recreate <service>`, run in the project directory,
+  with every label value validated before it reaches an argv.
   `--force-recreate` is deliberate: the caller asked for the update, so the
   container must end up on the pulled image even when compose cannot tell the
   image changed.
+- The project directory comes from the container's own labels when they record
+  one, and from the [managed stack registry](#managed-compose-stacks)
+  otherwise. The config files may be recorded either way: the standalone
+  `podman-compose` (and docker compose before 2.x) records them exactly as the
+  operator typed them (`-f docker-compose.yml` stays `docker-compose.yml`), so
+  a relative entry is resolved against the recorded directory instead of
+  failing the update. A recorded path may not contain `..`: it is the
+  operator's own file list, but the directory it is resolved in is the
+  daemon's working directory. When the labels record no file list at all, the
+  step runs `compose` in the directory and lets compose read the files it would
+  read by itself.
+- The compose command is the runtime's own (`podman compose`, `docker compose`)
+  and, on a host that has only the standalone tool, `podman-compose` or
+  `docker-compose` — the tool is chosen from the runtime's own name, so a
+  docker host is never sent to `podman-compose`. The standalone form carries no
+  `--ansi` flag: the plugin spells it `--ansi never` and the standalone tools
+  spell it `--no-ansi`, and an unrecognized flag would fail the whole command.
 - A container that is not compose-managed is refused (`400`) with the reason.
   Neither runtime can recreate a plain `docker run` container from its own
   configuration, and replaying `inspect` into a `run` argv silently drops
@@ -809,11 +831,57 @@ configuration the same way the container's creation did.
   device, a sysctl or a network alias is worse than one that was not touched.
   `container.pull` still works for those: pull, then recreate it where its
   lifecycle is declared.
+- `compose.update` is the same two steps for a whole project — every service,
+  no container named. It is the one call behind "upgrade this stack", and it
+  takes its directory from the registry unless the caller sends one.
 
 Both run under the executor's concurrency slot and audit trail like every other
 native op, with a 5 minute bound (a pull is slow by nature), so they are also
 available as scheduled jobs and through the cloud relay:
 `name: container.update` with `{"id": "web"}` in the body.
+
+#### Managed compose stacks
+
+A daemon can be told which compose projects it manages. That assignment is what
+makes a container whose own labels do not point at its project updatable at all,
+and it is the directory `compose.update` runs in.
+
+```text
+POST   /api/v1/compose/stacks/scan   {"path": "/opt/stacks/web"} | {"roots": ["/opt", "/srv"]} | {}
+GET    /api/v1/compose/stacks
+DELETE /api/v1/compose/stacks/:project
+```
+
+- A scan walks the starting points it was given — one `path`, a list of `roots`,
+  or `daemon.compose.scanRoots` when the request names neither — and reads every
+  `*.yml`/`*.yaml` below them that declares a `services:` section. A project is
+  one directory: its files are recorded in the order compose merges them (base
+  files first, overrides last), its services are the union of what those files
+  declare, and its name is the one a file declares or, failing that, the
+  directory's name — the same fallback compose itself applies. A declared name
+  outranks the directory, because compose refuses `-p <directory>` against a
+  file that declares another name.
+- The walk is bounded and says so: `daemon.compose.scanDepth` (default 3) below
+  each root, at most 400 candidate files read per scan, and a 30 second budget.
+  A depth sent by a request is clamped to 12, so a client cannot ask for an
+  unbounded walk by accident.
+- What a scan finds is assigned and persisted:
+  `daemon.compose.stacksPath` (default
+  `/var/lib/maidcafe/compose-stacks.json`) is rewritten atomically on every
+  change and read at start. A managed stack whose directory has since
+  disappeared is dropped by the next scan; a stack outside that scan's roots is
+  left alone, because scanning one starting point says nothing about the others.
+  `DELETE` unassigns one stack and touches nothing on the host.
+- `GET /api/v1/compose/stacks` is the registry joined to the daemon's own
+  container snapshot: per stack, the containers carrying its project label, how
+  many of them are running, and the files and services the scan recorded. That
+  is the health view a client paints without a second request, and it is served
+  even when a runtime cannot be listed.
+- Nothing is guessed at request time. A container whose project no scan assigned
+  is refused with that reason rather than updated in a directory the daemon
+  picked for it, and an ambiguous scan is not a thing this daemon has: one
+  project is one directory, and the registry holds what the operator's own scan
+  found.
 
 The package and firewall routes carry their operands in the body:
 

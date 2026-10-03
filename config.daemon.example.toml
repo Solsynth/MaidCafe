@@ -199,6 +199,24 @@ path = "/srv"
 # privileged = true
 # profile = "nginx"
 
+# [daemon.compose] governs the managed compose stacks: the projects a scan
+# assigned to this daemon, and where a scan looks for them.
+[daemon.compose]
+# The registry of assigned stacks, rewritten as a whole on every change and
+# read at start. Empty keeps the registry in memory only, so a restart forgets
+# which stacks were assigned until the next scan. Changing this path takes a
+# restart.
+stacksPath = "/var/lib/maidcafe/compose-stacks.json"
+# Where POST /api/v1/compose/stacks/scan looks when a request names no starting
+# point. Empty uses the built-in list (/opt, /srv, /root, /home, /etc/compose,
+# /var/lib/compose). Every configured root must exist: one that cannot be read
+# is refused at load instead of being skipped quietly.
+scanRoots = []
+# How far below a root a compose file is looked for. Zero uses the built-in
+# default (3). A scan reads at most 400 candidate files, and a depth sent by a
+# request is clamped to 12.
+scanDepth = 0
+
 # [daemon.priv] names the privileged helper and says which operations may be
 # routed through it. Where the helper is installed: empty uses the compiled
 # default. Setting it grants nothing on its own — an operation has to be routed

@@ -40,6 +40,7 @@ type reloadableConfig struct {
 	version              string
 	terminal             config.TerminalConfig
 	files                config.FilesConfig
+	compose              config.ComposeConfig
 	priv                 config.PrivConfig
 	intervals            reloadableIntervals
 }
@@ -84,6 +85,7 @@ func newReloadableConfig(cfg config.DaemonConfig) *reloadableConfig {
 		version:              cfg.Version,
 		terminal:             cfg.Terminal,
 		files:                cfg.Files,
+		compose:              cfg.Compose,
 		priv:                 cfg.Priv,
 		intervals: reloadableIntervals{
 			metrics:     cfg.MetricsInterval,
