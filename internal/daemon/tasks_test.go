@@ -68,12 +68,14 @@ func awaitTask(t *testing.T, base, id string) opTaskView {
 }
 
 // watchedComposeRuntime is a runtime whose compose steps take long enough to be
-// watched: each one prints what it is doing, holds still, and exits cleanly.
-// FAKE_COMPOSE_SLEEP sets how long each step holds still.
+// watched: each one prints what it is doing, holds still, and exits cleanly —
+// with a warning on stderr, the way podman and compose announce a host detail
+// while they work. FAKE_COMPOSE_SLEEP sets how long each step holds still.
 func watchedComposeRuntime() string {
 	return `#!/bin/sh
 case "$1" in
 compose)
+	echo "The cgroupv2 manager is set to systemd but there is no systemd user session available" >&2
 	case "$*" in
 	*pull*)
 		echo "Pulling web"
@@ -157,6 +159,13 @@ func TestComposeUpdateRunsAsATask(t *testing.T) {
 	full := readTask(t, base, task.ID, 0)
 	if !strings.Contains(full.Stdout, "Pulling web") || !strings.Contains(full.Stdout, "Recreating web") {
 		t.Fatalf("stdout = %q", full.Stdout)
+	}
+	// Both streams reach the task, and in the retained output they arrive
+	// together: what a runtime warns about while it works — podman's cgroup
+	// notes, compose's per-service remarks — is part of watching a pull.
+	raw := readTaskBody(t, base, "/api/v1/tasks/"+task.ID+"?since=0")
+	if !strings.Contains(string(raw), "no systemd user session") {
+		t.Fatalf("the command's stderr did not reach the task output: %s", raw)
 	}
 
 	// The list is how a client that lost the id finds the run again, and an id
