@@ -757,8 +757,8 @@ func TestContainerSnapshotReportsWhatTheRuntimeIs(t *testing.T) {
 // runtime is: from the runtime itself, not from the daemon's uid or its group
 // membership, so a daemon in the docker group on a rootful host and one
 // running its own rootless docker are told apart. A runtime that does not
-// answer stays unknown, which keeps the elevation a host like that has always
-// had.
+// answer reports neither a mode nor a cgroup manager, rather than being
+// described with a guess.
 func TestRuntimeModeReadsTheRuntimeOwnAnswer(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -779,51 +779,72 @@ func TestRuntimeModeReadsTheRuntimeOwnAnswer(t *testing.T) {
 			if got := probeRuntimeFacts(context.Background(), path); got != tc.want {
 				t.Fatalf("facts = %+v, want %+v", got, tc.want)
 			}
-			if got, want := probeRuntimeFacts(context.Background(), path).elevatable(), tc.want.elevatable(); got != want {
-				t.Fatalf("elevatable = %v, want %v", got, want)
-			}
 		})
 	}
 }
 
-// TestRuntimeListElevationFollowsTheRuntimeMode pins what the collectors ask
-// before elevating a runtime command, which used to be a blind `sudo -n`
-// retry. A rootless runtime owns its containers, so an empty listing is the
-// truth about it and rising to root would answer with root's separate runtime
-// instead; a rootful one keeps the retry it always had, because the daemon
-// user genuinely cannot see root's containers.
-func TestRuntimeListElevationFollowsTheRuntimeMode(t *testing.T) {
+// TestRuntimeListReadsOwnStoreFirstThenRoots pins the rule the container list
+// follows: the daemon user's own store answers whenever it has containers, and
+// root's store fills in only when it has none. The runtime's own mode does not
+// enter into it — this is a read, and reaching root's containers is what the
+// shipped sudoers grant is for. A non-empty direct answer is never
+// second-guessed: asking twice on every poll costs a process, and replacing a
+// real answer with root's would hide the containers the daemon user runs.
+func TestRuntimeListReadsOwnStoreFirstThenRoots(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("the daemon does not elevate when it is already root")
 	}
-	for _, tc := range []struct {
-		name         string
-		infoAnswer   string
-		wantElevated bool
+	cases := []struct {
+		name       string
+		direct     string
+		sudoBody   string
+		sudoStatus string
+		wantOut    string
+		wantErr    bool
+		wantElev   bool
 	}{
-		{name: "rootless", infoAnswer: "true", wantElevated: false},
-		{name: "rootful", infoAnswer: "false", wantElevated: true},
-	} {
+		{
+			name: "own store answers", direct: "printf 'abc\\n'\n",
+			sudoBody: "exit 0\n", wantOut: "abc", wantElev: false,
+		},
+		{
+			name: "own store is empty", direct: "exit 0\n",
+			sudoBody: "printf 'root\\n'\n", wantOut: "root", wantElev: true,
+		},
+		{
+			name: "own store fails", direct: "exit 1\n",
+			sudoBody: "printf 'root\\n'\n", wantOut: "root", wantElev: true,
+		},
+		{
+			name: "neither store answers", direct: "exit 0\n",
+			sudoBody: "exit 1\n", wantErr: true, wantElev: true,
+		},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sudoLog := filepath.Join(t.TempDir(), "sudo")
-			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n")
-			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
-				"if [ \"$1\" = info ]; then printf '"+tc.infoAnswer+"\\n'; exit 0; fi\n"+
-				"exit 0\n")
+			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n"+tc.sudoBody)
+			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+tc.direct)
 
 			out, err := runRuntimeList(context.Background(), runtimePath, "ps", "-a")
-			if err != nil {
-				t.Fatalf("empty listing reported as an error: %v", err)
-			}
-			if len(bytes.TrimSpace(out)) != 0 {
-				t.Fatalf("out = %q, want an empty listing", out)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("an empty own store with a failed elevated retry must not read as an empty list")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("listing: %v", err)
+				}
+				if got := strings.TrimSpace(string(out)); got != tc.wantOut {
+					t.Fatalf("out = %q, want %q", got, tc.wantOut)
+				}
 			}
 			elevated := recordedElevations(t, sudoLog)
-			if tc.wantElevated && !strings.Contains(elevated, "ps -a") {
-				t.Fatalf("a rootful listing was not elevated: %q", elevated)
+			if tc.wantElev && !strings.Contains(elevated, "ps -a") {
+				t.Fatalf("the listing did not reach root's store: %q", elevated)
 			}
-			if !tc.wantElevated && elevated != "" {
-				t.Fatalf("a rootless listing was elevated: %q", elevated)
+			if !tc.wantElev && elevated != "" {
+				t.Fatalf("a listing that answered was elevated anyway: %q", elevated)
 			}
 		})
 	}

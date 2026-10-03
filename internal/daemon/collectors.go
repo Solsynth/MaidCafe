@@ -169,30 +169,19 @@ func runtimeStateKey(paths map[string]string) string {
 // use, and whether it answered at all.
 type runtimeFacts struct {
 	// Rootless is true when the runtime runs in the invoking user's own user
-	// namespace, so the containers are that user's and no elevation reaches
-	// them.
+	// namespace, so the containers it lists are that user's own. It is what the
+	// container list reports; it does not decide whether a command may be
+	// elevated, because elevation reaches root's store rather than this
+	// runtime's.
 	Rootless bool
 	// Cgroups is the manager the runtime reports it will use — "systemd" or
 	// "cgroupfs" — and is empty for a runtime that does not say. Podman on a
 	// host where the user has no systemd session reports cgroupfs, and repeats
 	// that fallback, with the remedy it suggests, on every invocation.
 	Cgroups string
-	// Known is false when the runtime did not answer. Callers then keep the
-	// elevation they would have attempted before this detection existed,
-	// because a runtime that stays silent may still be a root-owned one.
+	// Known is false when the runtime did not answer, which leaves the mode and
+	// the cgroup manager absent from the container list rather than guessed.
 	Known bool
-}
-
-// elevatable reports whether a `sudo -n` retry is meaningful for this runtime.
-//
-// For a rootless runtime it is not: `sudo podman` is a different, rootful
-// runtime with its own container store and its own network, so the retry would
-// act on containers the operator never asked about — or, without passwordless
-// sudo, print "a password is required" into the task log and do nothing else.
-// A root-owned runtime is the case the retry exists for, and an unanswered
-// runtime keeps it.
-func (f runtimeFacts) elevatable() bool {
-	return !(f.Known && f.Rootless)
 }
 
 // runtimeName is the runtime a binary path is: "podman", "docker", or "" for
@@ -244,19 +233,24 @@ func probeRuntimeFacts(ctx context.Context, path string) runtimeFacts {
 	return runtimeFacts{}
 }
 
-// elevationPrefix returns the `sudo -n` prefix to elevate a command against the
-// runtime at [path], or nil when elevating it means nothing: when this process
-// is root already, when the host has no sudo, and when the runtime is rootless
-// (see elevatable). Callers that wrap a command other than the runtime binary
-// itself — the standalone compose tools — take the prefix alone.
-func elevationPrefix(ctx context.Context, path string) []string {
+// elevationPrefix returns the prefix that runs a runtime command as root, or
+// nil when there is nothing to elevate with: this process is root already, or
+// the host has no `sudo`.
+//
+// It does not consult what the runtime says about itself. Elevation reaches
+// *root's* store, which is a different store from the daemon user's own — and
+// that is the point of it: reading root's containers is how a non-root daemon
+// shows the host's real workload, which is why the shipped sudoers rule grants
+// podman and docker. Whether an operation may use it is a separate question,
+// answered per operation: a read falls back to it when the daemon user's own
+// store has nothing to show, and a compose step uses it only when the project
+// already lives in root's store (see composeStore) — never as a second place to
+// create the same project.
+func elevationPrefix() []string {
 	if os.Geteuid() == 0 {
 		return nil
 	}
 	if _, err := exec.LookPath("sudo"); err != nil {
-		return nil
-	}
-	if !probeRuntimeFacts(ctx, path).elevatable() {
 		return nil
 	}
 	return []string{"sudo", "-n"}
@@ -264,12 +258,14 @@ func elevationPrefix(ctx context.Context, path string) []string {
 
 // elevationAttempt builds the `sudo -n <runtime> …` form of a runtime command,
 // or reports that there is none to build. It is the single place that decides
-// whether elevating a runtime invocation means anything, so the collectors,
-// the detail reads, the log tails and the operation ladder all agree: never
-// interactive, never as root when this process is root already, and never
-// against a rootless runtime.
-func elevationAttempt(ctx context.Context, path string, args ...string) ([]string, bool) {
-	prefix := elevationPrefix(ctx, path)
+// whether elevating a runtime invocation is possible at all — never
+// interactive, and never as root when this process is root already — so the
+// collectors, the detail reads, the log tails and the operation ladder agree on
+// the form. Whether an operation *should* elevate is the caller's question:
+// reads fall back to it for root's store, and compose steps use it only for a
+// project that already lives there.
+func elevationAttempt(path string, args ...string) ([]string, bool) {
+	prefix := elevationPrefix()
 	if prefix == nil {
 		return nil, false
 	}
@@ -284,21 +280,25 @@ func elevationAttempt(ctx context.Context, path string, args ...string) ([]strin
 // the daemon is not root. Rootful runtimes are invisible to a non-root daemon —
 // e.g. the shipped systemd unit runs as the maidcafe user while operators run
 // containers as root — and the elevated retry sees them whenever the daemon
-// user has passwordless sudo. The retry is never interactive; the systemd
-// unit's NoNewPrivileges keeps it inert there.
+// user has passwordless sudo. The retry is never interactive.
 //
-// A rootless runtime is a different case and is not elevated at all: its
-// containers belong to the daemon user, so an empty listing is the truth about
-// it rather than a blind spot, and a failure stays a failure instead of being
-// answered with root's containers. An empty direct listing whose elevated
-// retry fails is reported as an error rather than a misleading empty list, so
-// invisible root-owned containers never masquerade as "no containers".
+// The direct answer wins whenever it has something to say, so the daemon's list
+// is its own store's containers first and root's only to fill a blind spot. An
+// empty direct listing whose elevated retry fails is reported as an error
+// rather than a misleading empty list, so invisible root-owned containers never
+// masquerade as "no containers".
+//
+// This is a *read* rule, and only reads may treat the two stores as one view:
+// the direct answer and the elevated one are the daemon user's containers and
+// root's, in that order of preference. A step that creates containers must
+// never fall back that way, because the fallback would create the project a
+// second time in the other store — see composeStore.
 func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, error) {
 	out, err := runCommand(ctx, path, args...)
 	if err == nil && len(bytes.TrimSpace(out)) > 0 {
 		return out, nil
 	}
-	elevated, ok := elevationAttempt(ctx, path, args...)
+	elevated, ok := elevationAttempt(path, args...)
 	if !ok {
 		return out, err
 	}

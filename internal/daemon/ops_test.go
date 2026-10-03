@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -242,56 +243,260 @@ func recordedElevations(t *testing.T, path string) string {
 	return strings.TrimSpace(string(recorded))
 }
 
-// TestRuntimeElevationSkipsRootlessRuntime is the operation-ladder half of the
-// detection: a runtime that reports itself rootless never gets the `sudo -n`
-// variant, because elevating it would address root's separate container store
-// rather than the daemon user's own — which is also the attempt that put "sudo:
-// a password is required" into a task log on a host without passwordless sudo.
-func TestRuntimeElevationSkipsRootlessRuntime(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("the daemon does not elevate when it is already root")
+// fakeSudoScript is a sudo that records nothing of its own and hands the
+// command to the fake runtime with FAKE_STORE=root set, which is how the fake
+// runtime knows it is root's store answering. `sudo -n -l <command>` answers
+// about the standalone compose tools only: the shipped sudoers rule grants the
+// runtime binary and not the tool, and [grantsComposeTool] says which shape
+// this test is pinning.
+func fakeSudoScript(grantsComposeTool bool) string {
+	verdict := "exit 1"
+	if grantsComposeTool {
+		verdict = "exit 0"
 	}
-	for _, tc := range []struct {
-		name          string
-		infoAnswer    string
-		wantElevation bool
-	}{
-		{name: "rootless", infoAnswer: "true", wantElevation: false},
-		{name: "rootful", infoAnswer: "false", wantElevation: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			sudoLog := filepath.Join(t.TempDir(), "sudo")
-			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n")
-			// The action fails, so the ladder reaches its elevation.
-			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
-				"if [ \"$1\" = info ]; then printf '"+tc.infoAnswer+"\\n'; exit 0; fi\n"+
-				"exit 1\n")
-			runner := newTestOpsRunner(t, map[string]string{"podman": runtimePath})
+	return "#!/bin/sh\n" +
+		"if [ \"$2\" = \"-l\" ]; then\n" +
+		"  case \"$3\" in\n" +
+		"    *podman-compose|*docker-compose) " + verdict + " ;;\n" +
+		"  esac\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"shift\n" +
+		"exec env FAKE_STORE=root \"$@\"\n"
+}
 
-			_, _, requestErr := runner.dispatch(
-				context.Background(), "container.restart", opParams{target: "web"}, "test", "tester",
-			)
-			if requestErr != nil {
-				t.Fatalf("dispatch: %+v", requestErr)
+// fakeStoreRuntimeScript is a podman with two stores: what it lists, inspects
+// and creates depends on which user runs it — its own, or root's when the fake
+// sudo set FAKE_STORE=root. Every call is recorded with the store it ran in and
+// its argv, which is what the store-pinning tests assert on. A store whose
+// project is empty holds nothing, so a container or project lookup there fails
+// the way a real one does.
+func fakeStoreRuntimeScript(own, root, dir string) string {
+	quote := func(value string) string {
+		return "\"" + strings.ReplaceAll(value, "\"", "\\\"") + "\""
+	}
+	listing := func(project string) string {
+		if project == "" {
+			return ":\n"
+		}
+		name := project + "_drasl_1"
+		labels := "com.docker.compose.project=" + project
+		return "printf '%s\\n' " + quote(fmt.Sprintf(
+			`{"ID":"%s0123456789","Names":["%s"],"State":"running","Labels":"%s"}`,
+			project, name, labels)) + "\n"
+	}
+	inspect := func(project, id string) string {
+		if project == "" {
+			return "printf 'Error: no such container\\n' >&2\nexit 125\n"
+		}
+		return "printf '%s\\n' " + quote(fmt.Sprintf(
+			`{"Id":"%s","ImageName":"docker.io/unmojang/drasl","Config":{"Labels":{"com.docker.compose.project":"%s","com.docker.compose.service":"drasl","com.docker.compose.project.working_dir":"%s","com.docker.compose.project.config_files":"%s"}}}`,
+			id, project, dir, filepath.Join(dir, "compose.yml"))) + "\n"
+	}
+	return "#!/bin/sh\n" +
+		"store=\"${FAKE_STORE:-own}\"\n" +
+		"if [ -n \"$FAKE_STORE_CALLS\" ]; then printf 'store=%s argv=%s\\n' \"$store\" \"$*\" >> \"$FAKE_STORE_CALLS\"; fi\n" +
+		"case \"$1\" in\n" +
+		"ps)\n" +
+		"  if [ \"$store\" = root ]; then " + strings.TrimSpace(listing(root)) + "; else " + strings.TrimSpace(listing(own)) + "; fi\n" +
+		"  ;;\n" +
+		"inspect)\n" +
+		"  if [ \"$store\" = root ]; then\n" + inspect(root, "root0123456789") +
+		"  else\n" + inspect(own, "own0123456789") + "  fi\n" +
+		"  ;;\n" +
+		"info) printf 'true cgroupfs\\n' ;;\n" +
+		"*) printf 'ran\\n' ;;\n" +
+		"esac\n"
+}
+
+// readCallLog returns the calls a fake runtime recorded.
+func readCallLog(t *testing.T, path string) []string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	lines := make([]string, 0, 4)
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// TestContainerUpdateRecreatesInTheStoreThatOwnsTheProject is the regression
+// test for a second stack appearing next to a running one.
+//
+// The daemon user's podman and root's podman are two stores, and a project that
+// lives in root's — the shape of a host whose stacks an operator started with
+// sudo — used to be recreated by the unprivileged attempt first: that attempt
+// created the whole project again in the daemon user's store, under the same
+// container names, where it could not bind the ports the real one holds, and
+// left a container behind for every update. The step must run in the store that
+// holds the project, and the tool it runs must be one that can reach it: here
+// the standalone `podman-compose` is present but not granted, so the runtime's
+// own `podman compose` is the tool that runs.
+func TestContainerUpdateRecreatesInTheStoreThatOwnsTheProject(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a daemon running as root has one store")
+	}
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_STORE_CALLS", calls)
+	dir := t.TempDir()
+	// A standalone tool that records its own argv (ungated by the store=fake)
+	// so a test can see it run.
+	fakeCommand(t, "podman-compose", "#!/bin/sh\nprintf 'standalone argv=%s\\n' \"$*\" >> "+calls+"\n")
+	fakeCommand(t, "sudo", fakeSudoScript(false))
+	path := fakeCommand(t, "podman", fakeStoreRuntimeScript("", "drasl", dir))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "container.update", opParams{target: "drasl_drasl_1"}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusOK || !response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	file := filepath.Join(dir, "compose.yml")
+	wantSteps := []string{
+		"compose -p drasl -f " + file + " pull drasl",
+		"compose -p drasl -f " + file + " up -d --force-recreate drasl",
+	}
+	var steps []string
+	probedOwnStore := false
+	for _, call := range readCallLog(t, calls) {
+		if strings.HasPrefix(call, "standalone ") {
+			t.Fatalf("the standalone compose tool ran, though only the runtime is granted: %q", call)
+		}
+		if strings.Contains(call, "argv=compose") && strings.HasPrefix(call, "store=own") {
+			t.Fatalf("the step ran in the daemon user's own store, creating a second stack: %q", call)
+		}
+		if strings.Contains(call, "argv=ps -a") && strings.HasPrefix(call, "store=own") {
+			probedOwnStore = true
+		}
+		if strings.Contains(call, "argv=compose") && strings.HasPrefix(call, "store=root") {
+			steps = append(steps, strings.SplitN(call, "argv=", 2)[1])
+		}
+	}
+	if !probedOwnStore {
+		t.Fatal("the daemon did not look in the daemon user's own store before choosing root's")
+	}
+	if got := strings.Join(steps, "|"); got != strings.Join(wantSteps, "|") {
+		t.Fatalf("compose steps =\n%s\nwant\n%s", got, strings.Join(wantSteps, "|"))
+	}
+}
+
+// TestContainerUpdateRefusesAProjectInTwoStores pins the answer to a project
+// that exists twice — the state a phantom copy leaves behind. Choosing one
+// silently is how the confusion started, so the daemon names both and stops.
+func TestContainerUpdateRefusesAProjectInTwoStores(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a daemon running as root has one store")
+	}
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_STORE_CALLS", calls)
+	fakeCommand(t, "sudo", fakeSudoScript(false))
+	path := fakeCommand(t, "podman", fakeStoreRuntimeScript("drasl", "drasl", t.TempDir()))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	_, _, requestErr := runner.dispatch(
+		context.Background(), "container.update", opParams{target: "drasl_drasl_1"}, "test", "tester",
+	)
+	if requestErr == nil || requestErr.status != http.StatusBadRequest {
+		t.Fatalf("ambiguous project update = %+v, want 400", requestErr)
+	}
+	for _, want := range []string{"more than one store", "daemon user's own store", "root's store", "drasl_drasl_1"} {
+		if !strings.Contains(requestErr.message, want) {
+			t.Fatalf("message = %q, want it to mention %q", requestErr.message, want)
+		}
+	}
+	for _, call := range readCallLog(t, calls) {
+		if strings.Contains(call, "argv=compose") {
+			t.Fatalf("an ambiguous project was written to anyway: %q", call)
+		}
+	}
+}
+
+// TestComposeStepStaysInTheOwnStoreWhenTheProjectIsThere pins the other half:
+// a project the daemon user runs is not touched through sudo, which would be
+// the same mistake in the other direction — recreating it in root's store.
+func TestComposeStepStaysInTheOwnStoreWhenTheProjectIsThere(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a daemon running as root has one store")
+	}
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_STORE_CALLS", calls)
+	dir := t.TempDir()
+	fakeCommand(t, "sudo", fakeSudoScript(true))
+	path := fakeCommand(t, "podman", fakeStoreRuntimeScript("myapp", "", dir))
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "compose.up", opParams{target: "myapp", directory: dir}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusOK || !response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	var steps []string
+	for _, call := range readCallLog(t, calls) {
+		if strings.Contains(call, "argv=compose") {
+			if !strings.HasPrefix(call, "store=own") {
+				t.Fatalf("an own-store project was written through sudo: %q", call)
 			}
-			elevated := recordedElevations(t, sudoLog)
-			if tc.wantElevation {
-				if !strings.Contains(elevated, "restart web") {
-					t.Fatalf("a rootful runtime was not elevated: %q", elevated)
-				}
-				return
-			}
-			if elevated != "" {
-				t.Fatalf("a rootless runtime was elevated: %q", elevated)
-			}
-		})
+			steps = append(steps, strings.SplitN(call, "argv=", 2)[1])
+		}
+	}
+	// The directory was given rather than a stack the daemon scanned, so no
+	// file is named: compose reads the default one in the project directory.
+	want := "compose -p myapp up -d"
+	if got := strings.Join(steps, "|"); got != want {
+		t.Fatalf("compose steps = %q, want %q", got, want)
+	}
+}
+
+// TestComposeAttemptsRefusesWhenNoToolReachesTheStore pins the guard on the
+// filtered tool list: when every compose tool is one `sudo -n` may not run, the
+// step is refused with the grant that would allow it instead of being built in
+// the wrong store, or built empty and reported as a success.
+func TestComposeAttemptsRefusesWhenNoToolReachesTheStore(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a daemon running as root has one store")
+	}
+	fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
+	path := fakeCommand(t, "podman", "#!/bin/sh\nexit 0\n")
+	runner := newTestOpsRunner(t, map[string]string{"podman": path})
+
+	_, err := runner.composeAttempts(
+		context.Background(),
+		composeStore{Runtime: "podman", Path: path, Elevated: true},
+		composeUpdateTarget{Project: "drasl", Directory: t.TempDir()},
+		"up", "-d",
+	)
+	if err == nil {
+		t.Fatal("a step with no way to reach its store was built anyway")
+	}
+	for _, want := range []string{"root's store", "sudo -n", "NOPASSWD"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to mention %q", err.Error(), want)
+		}
 	}
 }
 
 func TestNativeComposeOpUsesDirectoryAndArgs(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	dir := t.TempDir()
-	podman := fakeCommand(t, "podman", "#!/bin/sh\nprintf 'cwd=%s\\n' \"$PWD\" >> "+out+"\nprintf 'args=%s\\n' \"$*\" >> "+out+"\n")
+	// A sudo that refuses everything: this test is about the argv the daemon
+	// builds in the store the project lives in, and the machine's own sudo has
+	// no business being asked. The store probe is answered empty and unrecorded,
+	// so only the compose step itself is in the log.
+	fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
+	podman := fakeCommand(t, "podman", "#!/bin/sh\n"+
+		"[ \"$1\" = ps ] && exit 0\n"+
+		"printf 'cwd=%s\\n' \"$PWD\" >> "+out+"\n"+
+		"printf 'args=%s\\n' \"$*\" >> "+out+"\n")
 	runner := newTestOpsRunner(t, map[string]string{"podman": podman})
 	resp, status, requestErr := runner.dispatch(
 		context.Background(), "compose.up", opParams{target: "myapp", directory: dir}, "test", "tester",

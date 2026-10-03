@@ -106,19 +106,30 @@ func (a *App) resolveContainer(ctx context.Context, ref string) (containerRef, b
 // runtime behind a non-root daemon. The runtime's own stderr becomes the
 // error: "no such container" is actionable, "exit status 125" is not.
 func runRuntimeRead(ctx context.Context, timeout time.Duration, limit int, command string, args ...string) ([]byte, error) {
+	out, _, err := runRuntimeReadStore(ctx, timeout, limit, command, args...)
+	return out, err
+}
+
+// runRuntimeReadStore is [runRuntimeRead] with the store it answered from: the
+// retry through `sudo -n` reads root's containers, and a caller that is about to
+// write to the store it just read has to know which one that was. For a read
+// the fallback is right — an unreadable container is worse than one read from
+// root's store — but a write must go to the store that owns the target instead
+// of to whichever answered first (see composeStore).
+func runRuntimeReadStore(ctx context.Context, timeout time.Duration, limit int, command string, args ...string) ([]byte, bool, error) {
 	stdout, stderr, err := runReadOnce(ctx, timeout, limit, command, args...)
 	if err == nil {
-		return stdout, nil
+		return stdout, false, nil
 	}
-	if elevated, ok := elevationAttempt(ctx, command, args...); ok {
+	if elevated, ok := elevationAttempt(command, args...); ok {
 		if elevatedOut, _, elevatedErr := runReadOnce(ctx, timeout, limit, elevated[0], elevated[1:]...); elevatedErr == nil {
-			return elevatedOut, nil
+			return elevatedOut, true, nil
 		}
 	}
 	if message := strings.TrimSpace(stderr); message != "" {
-		return nil, fmt.Errorf("%s", message)
+		return nil, false, fmt.Errorf("%s", message)
 	}
-	return nil, fmt.Errorf("%s failed: %w", command, err)
+	return nil, false, fmt.Errorf("%s failed: %w", command, err)
 }
 
 // runReadOnce runs one command, capturing stdout up to [limit] bytes and
@@ -142,15 +153,23 @@ type containerInspect struct {
 	ImageRef string
 	ImageID  string
 	Labels   map[string]string
+	// Elevated records that only root's store answered for this container, so a
+	// caller about to write to it knows which store holds it.
+	Elevated bool
 }
 
 // inspectContainer reads one container's inspect payload.
 func inspectContainer(ctx context.Context, path, id string) (containerInspect, error) {
-	out, err := runRuntimeRead(ctx, collectorExecTimeout, containerInspectBytes, path, "inspect", "--format", "{{json .}}", id)
+	out, elevated, err := runRuntimeReadStore(ctx, collectorExecTimeout, containerInspectBytes, path, "inspect", "--format", "{{json .}}", id)
 	if err != nil {
 		return containerInspect{}, err
 	}
-	return parseContainerInspect(out)
+	info, err := parseContainerInspect(out)
+	if err != nil {
+		return containerInspect{}, err
+	}
+	info.Elevated = elevated
+	return info, nil
 }
 
 // parseContainerInspect reads the inspect object out of a runtime's answer.
@@ -498,7 +517,7 @@ func runRuntimeReadBounded(ctx context.Context, path string, args []string) ([]b
 	if err == nil {
 		return out, nil
 	}
-	if elevated, ok := elevationAttempt(ctx, path, args...); ok {
+	if elevated, ok := elevationAttempt(path, args...); ok {
 		elevatedOut, elevatedErr := runCommandBounded(ctx, elevated[0], elevated[1:]...)
 		if elevatedErr == nil {
 			return elevatedOut, nil

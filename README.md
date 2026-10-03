@@ -372,16 +372,27 @@ Authorization: Bearer <metrics-secret>
   elevated retry also fails is reported as an error rather than a misleading
   empty list, so invisible root-owned containers never look like "no
   containers".
-- That retry — and every other elevation of a runtime command, including the
-  container and compose actions — asks the runtime first what it is: podman
-  reports `Host.Security.Rootless` and rootless docker names itself in its
-  security options. A **rootless** runtime is never elevated, because `sudo
-  podman` is a different, rootful runtime with its own container store and its
-  own network: the retry would act on containers the operator never asked
-  about, and on a host without passwordless sudo it would only add "a password
-  is required" to the task log. A rootful runtime keeps the retry, and a
-  runtime that does not answer keeps it too, since a silent runtime may still
-  be a root-owned one.
+- That retry is the *read* rule, and it is a fallback in one direction only:
+  the daemon user's own store answers whenever it has containers, and root's
+  fills in when it has none. A store that does not answer is skipped, unless
+  `sudo -n` may run that runtime — the grant the shipped sudoers rule sets up —
+  in which case a store that is reachable by policy but does not answer is an
+  error rather than an absence, because a project that might be there must not
+  be written a second time.
+- Container and compose **actions** follow the same distinction, because one
+  runtime binary reaches two stores: `podman` run by the daemon user keeps its
+  containers in that user's own store, and the same binary through `sudo -n`
+  keeps root's. A step runs in the store that already holds its target and
+  never in the other one as a fallback — `sudo podman` is not "the same
+  container with more privilege", it is a different container store, so
+  recreating into it (or from it, unprivileged) would leave two copies of the
+  same project fighting for its published ports. The steps that need a store
+  this daemon cannot reach say so and name the sudoers grant that would let it,
+  instead of building the step somewhere else.
+- The [container list](#snapshot-endpoints) reports what each runtime says
+  about itself — `rootless`, `cgroups`, `compose_tool` — which is what tells an
+  operator whose store the daemon is addressing, and why a podman without a
+  systemd session repeats its cgroup fallback on every invocation.
 - Setting a collector interval to `0` disables that collector. Collection is
   gated on active subscribers and never persists or writes to disk; metrics
   persistence and cloud publishing stay on `metricsInterval`.
@@ -848,6 +859,24 @@ configuration the same way the container's creation did.
   daemon's working directory. When the labels record no file list at all, the
   step runs `compose` in the directory and lets compose read the files it would
   read by itself.
+- The step runs in the **store that owns the project**, which is not always the
+  store the named container was read from. The daemon user's podman and root's
+  podman are two stores with their own containers, and a project belongs to
+  exactly one: running `up -d --force-recreate` in the other one does not
+  retry it with less privilege, it creates the whole project a second time —
+  same project name, same container names — where it cannot bind the ports the
+  original holds. So the ladder is built for one store and never offers the
+  other as a fallback, and a project that exists in *two* stores is refused
+  (`400`) with both named: choosing silently is how the second copy appeared in
+  the first place.
+- Which tool runs depends on the store. In the daemon user's own store the
+  tools are tried in the order above, unprivileged. In root's store every
+  attempt is `sudo -n`-wrapped and only tools that grant permits are kept, so a
+  host whose `/etc/sudoers.d` grants the runtime but not the standalone tool
+  runs `sudo podman compose …` — the wrapper *is* the granted binary — and
+  never falls back to running the standalone tool unprivileged. When no tool can
+  reach the store at all, the operation is refused with the sudoers line that
+  would allow it, rather than run somewhere else.
 - The compose command is chosen from the runtime's own name, so a docker host is
   never sent to `podman-compose`: the two write to different image stores, and
   pulling into the wrong one would leave the container exactly where it was.
@@ -1230,6 +1259,38 @@ under `/etc/maidcafe/actions/run/`, and sudoers wildcards do not cross `/`.
 The same rule must exist for the SSH user that runs the daemon in `stdio`
 transport mode. MaidKit deploys all of this automatically when an action
 selects a run-as user.
+
+Container and image reads, and every container or compose step, can also reach
+**root's** container store through sudo. That is how a daemon running as
+`maidcafe` lists and manages stacks an operator started as root:
+
+```sh
+sudo install -o root -g root -m 0440 /dev/stdin /etc/sudoers.d/maidcafe-containers <<'EOF'
+maidcafe ALL=(root) NOPASSWD: /usr/bin/podman, /usr/bin/docker
+EOF
+```
+
+Root's store is where the daemon *reads* when its own store has nothing to
+show, and it is the only store a project that lives there may be written to:
+the step runs `sudo podman compose …` there — the runtime's own subcommand is
+covered by this rule — and never runs the standalone `podman-compose`
+unprivileged, which would create the project a second time under the same
+names. A standalone tool needs its own line (`/usr/local/bin/podman-compose`)
+to be used for such a project; without any granted compose command the update
+is refused and says so.
+
+The tradeoff is worth stating plainly: `sudo podman` is root-equivalent for
+that binary — a container can mount the host filesystem and run as root inside
+it — so this rule gives the daemon the same reach as running it as root. A
+host that should not extend that reach has two coherent options: run the
+daemon as root itself (one store, and the rule is unnecessary), or keep its
+stacks in the daemon user's own rootless store and grant nothing, in which
+case the daemon can only ever see the containers that account runs.
+
+With the rule in place, a podman that reports `rootless` is still the daemon
+user's own store for everything the daemon *writes*; the elevated form is the
+other store, and the daemon picks between them per operation rather than
+trying both.
 
 The file API runs as the daemon account under the unit's sandbox, so a
 `daemon.files.roots` entry must be somewhere that account can actually read and

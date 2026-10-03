@@ -77,11 +77,19 @@ esac
 // narrowed to it plus the system directories: a detail test must resolve
 // exactly the runtime it installed, never a real runtime on the machine
 // running the tests.
+//
+// A `sudo` that refuses everything is installed beside it, so no test reaches
+// the machine's real sudo by accident: a store that needs elevation is then
+// simply out of reach, which is the deterministic answer. A test that wants
+// elevation installs its own fake after this one, and PATH puts it first.
 func fakeRuntimeBinary(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "podman")
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sudo"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+":/usr/bin:/bin")

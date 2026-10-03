@@ -320,26 +320,6 @@ func (r *nativeOpRunner) composeDirectory(project, directory string) (string, []
 	return stack.Directory, stack.Files, nil
 }
 
-// composeAttemptsFor builds one compose step against every runtime that can run
-// it, in probe order (podman first): the alternate runtime is the same relation
-// the other native operations carry, and a project that lives in one runtime's
-// store is not found in the other's.
-func (r *nativeOpRunner) composeAttemptsFor(
-	ctx context.Context,
-	target composeUpdateTarget,
-	args ...string,
-) []opAttempt {
-	var attempts []opAttempt
-	for _, runtime := range []string{"podman", "docker"} {
-		path, ok := r.runtimes(ctx)[runtime]
-		if !ok {
-			continue
-		}
-		attempts = append(attempts, r.composeAttempts(ctx, path, target, args...)...)
-	}
-	return attempts
-}
-
 // SetScriptTimeout updates the daemon-wide op timeout (hot reload).
 func (r *nativeOpRunner) SetScriptTimeout(timeout time.Duration) {
 	r.scriptTimeout.Store(int64(timeout))
@@ -512,7 +492,12 @@ func (r *nativeOpRunner) planNativeOp(
 		if slug == "container.pull" {
 			// A pull is about the image, not the container it was read from.
 			targetLabel = resolved.ImageRef
-			attempts = r.runtimePullAttempts(ctx, resolved.Path, resolved.ImageRef)
+			store := composeStore{Runtime: resolved.Runtime, Path: resolved.Path, Elevated: resolved.Elevated}
+			pullAttempts, err := r.runtimePullAttempts(ctx, store, resolved.ImageRef)
+			if err != nil {
+				return bad(err.Error())
+			}
+			attempts = pullAttempts
 			break
 		}
 		compose, err := composeUpdateTargetFromLabels(resolved.Labels)
@@ -531,9 +516,27 @@ func (r *nativeOpRunner) planNativeOp(
 				"%s (runtime %s); the daemon recreates only compose-managed containers whose project it can find — pull the image with container.pull and recreate this one on the host",
 				err.Error(), resolved.Runtime))
 		}
+		// The step runs in the store that holds the project, which is not
+		// always the store the named container was read from: a container can
+		// carry compose labels with its project's run elsewhere, and the
+		// project is what `up -d --force-recreate` recreates.
+		store, err := r.composeProjectStore(ctx, compose.Project, &composeStore{
+			Runtime: resolved.Runtime, Path: resolved.Path, Elevated: resolved.Elevated,
+		})
+		if err != nil {
+			return bad(err.Error())
+		}
+		pullAttempts, err := r.composeAttempts(ctx, store, compose, "pull", compose.Service)
+		if err != nil {
+			return bad(err.Error())
+		}
+		recreateAttempts, err := r.composeAttempts(ctx, store, compose, "up", "-d", "--force-recreate", compose.Service)
+		if err != nil {
+			return bad(err.Error())
+		}
 		stages = append(stages,
-			opStage{label: "pull", attempts: r.composeAttempts(ctx, resolved.Path, compose, "pull", compose.Service)},
-			opStage{label: "recreate", attempts: r.composeAttempts(ctx, resolved.Path, compose, "up", "-d", "--force-recreate", compose.Service)},
+			opStage{label: "pull", attempts: pullAttempts},
+			opStage{label: "recreate", attempts: recreateAttempts},
 		)
 	case strings.HasPrefix(slug, "container."):
 		verb := strings.TrimPrefix(slug, "container.")
@@ -556,7 +559,7 @@ func (r *nativeOpRunner) planNativeOp(
 				continue
 			}
 			attempts = append(attempts, opAttempt{command: path, args: args})
-			if elevated, elevatedOK := elevationAttempt(ctx, path, args...); elevatedOK {
+			if elevated, elevatedOK := elevationAttempt(path, args...); elevatedOK {
 				attempts = append(attempts, opAttempt{command: elevated[0], args: elevated[1:]})
 			}
 		}
@@ -690,13 +693,25 @@ func (r *nativeOpRunner) planNativeOp(
 		compose := composeUpdateTarget{
 			Project: params.target, Directory: directory, Files: files,
 		}
+		store, err := r.composeProjectStore(ctx, params.target, nil)
+		if err != nil {
+			return bad(err.Error())
+		}
 		if verb == "update" {
 			// An upgrade is the same two steps a container update runs, for
 			// every service the project declares: fetch the images, then
 			// recreate on them.
+			pullAttempts, err := r.composeAttempts(ctx, store, compose, "pull")
+			if err != nil {
+				return bad(err.Error())
+			}
+			recreateAttempts, err := r.composeAttempts(ctx, store, compose, "up", "-d", "--force-recreate")
+			if err != nil {
+				return bad(err.Error())
+			}
 			stages = append(stages,
-				opStage{label: "pull", attempts: r.composeAttemptsFor(ctx, compose, "pull")},
-				opStage{label: "recreate", attempts: r.composeAttemptsFor(ctx, compose, "up", "-d", "--force-recreate")},
+				opStage{label: "pull", attempts: pullAttempts},
+				opStage{label: "recreate", attempts: recreateAttempts},
 			)
 			break
 		}
@@ -704,7 +719,11 @@ func (r *nativeOpRunner) planNativeOp(
 		if !known {
 			return bad("unknown compose action")
 		}
-		attempts = append(attempts, r.composeAttemptsFor(ctx, compose, strings.Fields(cliArgs)...)...)
+		verbAttempts, err := r.composeAttempts(ctx, store, compose, strings.Fields(cliArgs)...)
+		if err != nil {
+			return bad(err.Error())
+		}
+		attempts = append(attempts, verbAttempts...)
 	default:
 		return bad("unknown operation")
 	}
@@ -829,6 +848,7 @@ func resolveOpContainer(ctx context.Context, runtimes map[string]string, target 
 		}
 		return opContainerResolution{
 			Runtime: runtime, Path: path, ImageRef: info.ImageRef, Labels: info.Labels,
+			Elevated: info.Elevated,
 		}, nil
 	}
 	if lastErr != nil {
@@ -844,6 +864,10 @@ type opContainerResolution struct {
 	Path     string
 	ImageRef string
 	Labels   map[string]string
+	// Elevated records that root's store is where this container was found, so
+	// a write built from it addresses the same store instead of creating a
+	// second container in the daemon user's own.
+	Elevated bool
 }
 
 // composeUpdateTarget is the compose identity a container's labels declare.
@@ -950,26 +974,224 @@ func composeLabel(labels map[string]string, key string) string {
 	return ""
 }
 
-// composeAttempts builds one compose step for [target] against the runtime that
-// holds the container, with the standalone compose tool as the last
-// alternative and the runtime's elevation as the option that runs beside it —
-// where elevation means anything at all for that runtime (see
-// elevationPrefix: it never does for a rootless one).
+// composeStore is the store a compose project's containers live in: the runtime
+// that holds them, and whether reaching that store takes root.
+//
+// One runtime binary reaches two stores. `podman` run by the daemon user keeps
+// its containers in that user's own store; the same binary through `sudo -n`
+// keeps root's. A compose project belongs to exactly one of them, and a step
+// run in the other store is not "the same operation with less privilege": it
+// creates a second copy of the project — same project name, same container
+// names — in a store nobody was looking at, where it then fights the original
+// for its published ports. That is why [nativeOpRunner.composeAttempts] builds a
+// step for one store and never offers the other as a fallback.
+type composeStore struct {
+	Runtime  string
+	Path     string
+	Elevated bool
+}
+
+// describe names a store the way an operator describes it: by whose containers
+// it holds.
+func (s composeStore) describe() string {
+	if s.Elevated {
+		return s.Runtime + " in root's store"
+	}
+	return s.Runtime + " in the daemon user's own store"
+}
+
+// runStoreCommand runs a runtime command in exactly [store], never falling back
+// to the other one, which is the point of naming it.
+func runStoreCommand(ctx context.Context, store composeStore, args ...string) ([]byte, error) {
+	if !store.Elevated {
+		return runCommand(ctx, store.Path, args...)
+	}
+	elevated, ok := elevationAttempt(store.Path, args...)
+	if !ok {
+		return nil, fmt.Errorf("root's store is out of reach for this daemon: `%s` is not installed", "sudo")
+	}
+	return runCommand(ctx, elevated[0], elevated[1:]...)
+}
+
+// sudoRuns reports whether `sudo -n` may run [command] on this host.
+//
+// It is what separates "this daemon can reach root's store" from "this daemon
+// would only print a password prompt": a sudoers rule that grants the runtime
+// binary does not grant the standalone compose tool, and a step that needs the
+// latter has no business being attempted. `sudo -n -l <command>` answers the
+// question without running anything.
+func sudoRuns(ctx context.Context, command string) bool {
+	prefix := elevationPrefix()
+	if prefix == nil {
+		return false
+	}
+	probe, cancel := context.WithTimeout(ctx, collectorExecTimeout)
+	defer cancel()
+	return exec.CommandContext(probe, prefix[0], "-n", "-l", command).Run() == nil
+}
+
+// composeStores lists the stores of every available runtime, the daemon user's
+// own next to root's, in probe order.
+func composeStores(runtimes map[string]string) []composeStore {
+	stores := make([]composeStore, 0, 4)
+	for _, runtime := range []string{"podman", "docker"} {
+		path, ok := runtimes[runtime]
+		if !ok {
+			continue
+		}
+		stores = append(stores, composeStore{Runtime: runtime, Path: path})
+		if _, ok := elevationAttempt(path); ok {
+			stores = append(stores, composeStore{Runtime: runtime, Path: path, Elevated: true})
+		}
+	}
+	return stores
+}
+
+// storeProjectContainers lists the containers of [project] that live in one
+// store. The whole listing is read and matched here rather than filtered by the
+// runtime, because the two compose tools name the project under different label
+// keys — podman-compose writes both, docker writes its own — so a filter would
+// have to guess which one a given container carries.
+func storeProjectContainers(ctx context.Context, store composeStore, project string) ([]containerEntry, error) {
+	out, err := runStoreCommand(ctx, store, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	entries, err := parseContainerLines(out)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]containerEntry, 0, len(entries))
+	for _, entry := range entries {
+		if strings.EqualFold(entry.ComposeProject, project) {
+			matches = append(matches, entry)
+		}
+	}
+	return matches, nil
+}
+
+// composeStorePresence is one store that holds containers of a project, with
+// what it holds, for reporting the stores a project was found in.
+type composeStorePresence struct {
+	store      composeStore
+	containers []containerEntry
+}
+
+// summarizeContainers names what a store holds, capped so a project with many
+// services still reads as one line.
+func summarizeContainers(containers []containerEntry) string {
+	parts := make([]string, 0, len(containers))
+	for index, entry := range containers {
+		if index == 4 {
+			parts = append(parts, fmt.Sprintf("and %d more", len(containers)-index))
+			break
+		}
+		name := entry.Name
+		if name == "" {
+			name = entry.ID
+			if len(name) > 12 {
+				name = name[:12]
+			}
+		}
+		state := entry.State
+		if state == "" {
+			state = "unknown"
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", name, state))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// composeProjectStores finds every store that holds containers of [project].
+//
+// A store that does not answer is skipped, with one exception: when `sudo -n`
+// may run that runtime — the grant the shipped sudoers rule sets up — an
+// unreadable store is reported as a failure rather than as an absence. The
+// daemon cannot then tell whether the project is there, and acting on that
+// guess is how a project ends up with a second copy.
+func (r *nativeOpRunner) composeProjectStores(ctx context.Context, project string) ([]composeStorePresence, error) {
+	found := make([]composeStorePresence, 0, 2)
+	for _, store := range composeStores(r.runtimes(ctx)) {
+		containers, err := storeProjectContainers(ctx, store, project)
+		if err != nil {
+			if store.Elevated && sudoRuns(ctx, store.Path) {
+				return nil, fmt.Errorf(
+					"cannot read %s (%v), and a project that might be there must not be written a second time",
+					store.describe(), err)
+			}
+			continue
+		}
+		if len(containers) > 0 {
+			found = append(found, composeStorePresence{store: store, containers: containers})
+		}
+	}
+	return found, nil
+}
+
+// composeProjectStore decides which store a step for [project] belongs in.
+//
+// One store holds the project: that store. More than one: an error naming them,
+// because choosing silently is how a second copy of a stack appears — the
+// operator removes the copy they do not want, and the message says which ones
+// exist. Nowhere yet: [fallback] when the caller has one (the store the named
+// container lives in), else the daemon's own store of the first available
+// runtime, which is where a project this daemon creates belongs.
+func (r *nativeOpRunner) composeProjectStore(ctx context.Context, project string, fallback *composeStore) (composeStore, error) {
+	found, err := r.composeProjectStores(ctx, project)
+	if err != nil {
+		return composeStore{}, err
+	}
+	switch {
+	case len(found) == 1:
+		return found[0].store, nil
+	case len(found) > 1:
+		described := make([]string, 0, len(found))
+		for _, presence := range found {
+			described = append(described, presence.store.describe()+": "+summarizeContainers(presence.containers))
+		}
+		return composeStore{}, fmt.Errorf(
+			"project %q exists in more than one store (%s); this daemon will not choose between them — remove the copy you do not want, then try again",
+			project, strings.Join(described, "; "))
+	}
+	if fallback != nil {
+		return *fallback, nil
+	}
+	for _, runtime := range []string{"podman", "docker"} {
+		if path, ok := r.runtimes(ctx)[runtime]; ok {
+			return composeStore{Runtime: runtime, Path: path}, nil
+		}
+	}
+	return composeStore{}, fmt.Errorf("no container runtime available")
+}
+
+// composeAttempts builds the compose step for [target] in [store]: every tool
+// that can run it, in the order that runtime prefers (see composeTools), each in
+// the form that reaches that store.
+//
+// It returns an error instead of a shorter ladder when no tool can reach the
+// store. A step that belongs in root's store has no unprivileged form worth
+// running — the unprivileged form is the daemon user's own store, which is a
+// different project on the same host — so the answer is a refusal that names
+// the grant which would let the daemon run it, not a step that quietly creates
+// the project a second time.
 //
 // The compose file list comes from the container's own labels when they record
 // it, so the step reads the same file the container was created from even when
 // the project directory holds several. A project whose files the labels do not
 // name is run from its own directory, where compose reads the default file.
-func (r *nativeOpRunner) composeAttempts(ctx context.Context, path string, target composeUpdateTarget, args ...string) []opAttempt {
+func (r *nativeOpRunner) composeAttempts(ctx context.Context, store composeStore, target composeUpdateTarget, args ...string) ([]opAttempt, error) {
 	files := make([]string, 0, len(target.Files))
 	for _, file := range target.Files {
 		if resolved, ok := resolveComposeFile(target.Directory, file); ok {
 			files = append(files, resolved)
 		}
 	}
-	sudo := elevationPrefix(ctx, path)
-	tools := composeTools(path)
-	attempts := make([]opAttempt, 0, 2*len(tools))
+	tools := composeTools(store.Path)
+	if len(tools) == 0 {
+		return nil, fmt.Errorf("no compose tool is installed for %s", store.Runtime)
+	}
+	attempts := make([]opAttempt, 0, len(tools))
+	denied := make([]string, 0, len(tools))
 	for _, tool := range tools {
 		inner := append([]string{}, tool.prefix...)
 		inner = append(inner, "-p", target.Project)
@@ -977,32 +1199,45 @@ func (r *nativeOpRunner) composeAttempts(ctx context.Context, path string, targe
 			inner = append(inner, "-f", file)
 		}
 		inner = append(inner, args...)
-		attempts = append(attempts, opAttempt{
-			command: tool.command, args: inner, cwd: target.Directory,
-		})
-		if sudo != nil {
-			wrapped := append([]string{}, sudo[1:]...)
-			wrapped = append(wrapped, tool.command)
-			wrapped = append(wrapped, inner...)
+		if !store.Elevated {
 			attempts = append(attempts, opAttempt{
-				command: sudo[0], args: wrapped, cwd: target.Directory,
+				command: tool.command, args: inner, cwd: target.Directory,
 			})
+			continue
 		}
+		if !sudoRuns(ctx, tool.command) {
+			denied = append(denied, tool.command)
+			continue
+		}
+		attempts = append(attempts, opAttempt{
+			command: "sudo", args: append([]string{"-n", tool.command}, inner...), cwd: target.Directory,
+		})
 	}
-	return attempts
+	if len(attempts) == 0 {
+		return nil, fmt.Errorf(
+			"project %q lives in %s, and `sudo -n` may not run %s on this host; grant one of them (for example `%s ALL=(root) NOPASSWD: %s` in a file under /etc/sudoers.d/) or run the step yourself as root",
+			target.Project, store.describe(), strings.Join(denied, " or "),
+			"maidcafe", strings.Join(denied, ", "))
+	}
+	return attempts, nil
 }
 
-// runtimePullAttempts builds the pull for [imageRef] on the runtime that holds
-// the container. Only that runtime is asked: the image has to land in the store
-// the container runs from, so the alternate runtime would be the wrong answer,
-// not a fallback.
-func (r *nativeOpRunner) runtimePullAttempts(ctx context.Context, path, imageRef string) []opAttempt {
+// runtimePullAttempts builds the pull for [imageRef] in [store]. Only that
+// store is asked: the image has to land where the container runs from, so the
+// daemon user's own store is not a fallback for a root-owned container — it is
+// a different store that would hold a second copy of the image while the
+// container's own store kept the old one.
+func (r *nativeOpRunner) runtimePullAttempts(ctx context.Context, store composeStore, imageRef string) ([]opAttempt, error) {
 	args := []string{"pull", imageRef}
-	attempts := []opAttempt{{command: path, args: args}}
-	if elevated, ok := elevationAttempt(ctx, path, args...); ok {
-		attempts = append(attempts, opAttempt{command: elevated[0], args: elevated[1:]})
+	if !store.Elevated {
+		return []opAttempt{{command: store.Path, args: args}}, nil
 	}
-	return attempts
+	if !sudoRuns(ctx, store.Path) {
+		return nil, fmt.Errorf(
+			"the container lives in %s, and `sudo -n` may not run %s on this host; grant it (for example `maidcafe ALL=(root) NOPASSWD: %s` in a file under /etc/sudoers.d/) or pull the image yourself",
+			store.describe(), store.Path, store.Path)
+	}
+	return []opAttempt{{command: "sudo", args: append([]string{"-n", store.Path}, args...)}}, nil
 }
 
 // runStage runs one stage's alternative attempts in order and returns the

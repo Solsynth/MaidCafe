@@ -278,7 +278,12 @@ func TestComposeAttemptsCarryNoAnsiFlag(t *testing.T) {
 	runner := newTestOpsRunner(t, map[string]string{"podman": runtime})
 	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
 
-	attempts := runner.composeAttempts(t.Context(), runtime, target, "pull")
+	attempts, err := runner.composeAttempts(
+		t.Context(), composeStore{Runtime: "podman", Path: runtime}, target, "pull",
+	)
+	if err != nil {
+		t.Fatalf("compose attempts: %v", err)
+	}
 	if len(attempts) == 0 {
 		t.Fatal("no compose attempts were built")
 	}
@@ -304,17 +309,24 @@ func TestComposeAttemptsPreferPodmanComposeDirectly(t *testing.T) {
 		Project: "myapp", Directory: "/srv/myapp", Files: []string{"compose.yml"},
 	}
 
-	attempts := runner.composeAttempts(t.Context(), runtime, target, "up", "-d", "--force-recreate", "web")
-	// The `sudo -n` variants are added when the host has sudo, which a test
-	// machine usually does; the relation under test is which tool runs first.
+	attempts, err := runner.composeAttempts(
+		t.Context(), composeStore{Runtime: "podman", Path: runtime}, target,
+		"up", "-d", "--force-recreate", "web",
+	)
+	if err != nil {
+		t.Fatalf("compose attempts: %v", err)
+	}
+	// Every attempt runs the tool itself: the store is the daemon user's own,
+	// so nothing here is elevated. The relation under test is which tool runs
+	// first.
 	direct := make([]opAttempt, 0, 2)
 	for _, attempt := range attempts {
 		if attempt.command == runtime || attempt.command == standalone {
 			direct = append(direct, attempt)
 		}
 	}
-	if len(direct) != 2 {
-		t.Fatalf("direct attempts = %+v, want the standalone tool and the runtime", direct)
+	if len(direct) != len(attempts) || len(direct) != 2 {
+		t.Fatalf("attempts = %+v, want exactly the standalone tool and the runtime", attempts)
 	}
 	first := direct[0]
 	if first.command != standalone || !equalStrings(first.args, []string{
@@ -346,15 +358,20 @@ func TestComposeAttemptsPreferTheDockerPlugin(t *testing.T) {
 	runner := newTestOpsRunner(t, map[string]string{"docker": runtime})
 	target := composeUpdateTarget{Project: "myapp", Directory: "/srv/myapp"}
 
-	attempts := runner.composeAttempts(t.Context(), runtime, target, "pull")
+	attempts, err := runner.composeAttempts(
+		t.Context(), composeStore{Runtime: "docker", Path: runtime}, target, "pull",
+	)
+	if err != nil {
+		t.Fatalf("compose attempts: %v", err)
+	}
 	direct := make([]opAttempt, 0, 2)
 	for _, attempt := range attempts {
 		if attempt.command == runtime || attempt.command == standalone {
 			direct = append(direct, attempt)
 		}
 	}
-	if len(direct) != 2 {
-		t.Fatalf("direct attempts = %+v, want the plugin and the standalone tool", direct)
+	if len(direct) != len(attempts) || len(direct) != 2 {
+		t.Fatalf("attempts = %+v, want exactly the plugin and the standalone tool", attempts)
 	}
 	if direct[0].command != runtime || !equalStrings(direct[0].args, []string{
 		"compose", "-p", "myapp", "pull",

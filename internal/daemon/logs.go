@@ -384,7 +384,7 @@ func (c *LogsCollector) tail(ctx context.Context, runtimePath, id string) ([]con
 	}
 	out, err = runCommandBounded(ctx, runtimePath, args...)
 	if err != nil {
-		if elevated, ok := elevationAttempt(ctx, runtimePath, args...); ok {
+		if elevated, ok := elevationAttempt(runtimePath, args...); ok {
 			if sudoOut, sudoErr := runCommandBounded(ctx, elevated[0], elevated[1:]...); sudoErr == nil {
 				c.setSudoPath(runtimePath, true)
 				out = sudoOut
