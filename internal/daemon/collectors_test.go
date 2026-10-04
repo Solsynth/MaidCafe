@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -410,66 +409,108 @@ func TestProbeContainerRuntimesSkipsPodmanDockerShim(t *testing.T) {
 	}
 }
 
-// TestRunRuntimeListElevatedFallback pins the root-visibility retry: an
-// empty direct listing is retried through `sudo -n` so containers/images
-// owned by root stay visible to a non-root daemon with passwordless sudo,
-// while a successful direct listing never escalates and a failed elevated
-// retry is surfaced as an error instead of a misleading empty list.
-func TestRunRuntimeListElevatedFallback(t *testing.T) {
+// TestContainerStoresAreListedSeparately pins what the container list is after
+// two stores: one entry per store the daemon can read, each carrying its own
+// containers and its own answer about itself. A single stray container in the
+// daemon user's store used to make that listing the whole answer — it was
+// non-empty, so root's store was never read — which is a list that hides every
+// container the operator actually runs.
+func TestContainerStoresAreListedSeparately(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("requires a non-root test user to exercise the sudo retry")
+		t.Skip("requires a non-root test user to exercise the sudo path")
 	}
-	dir := t.TempDir()
-	mk := func(name, body string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return path
+	// One runtime, two stores: the unprivileged invocation is the daemon
+	// user's, and the fake sudo marks the elevated one.
+	runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
+		"case \"$1\" in\n"+
+		"info)\n"+
+		"  if [ \"$FAKE_STORE\" = root ]; then printf 'false systemd\\n'; else printf 'true cgroupfs\\n'; fi\n"+
+		"  ;;\n"+
+		"ps)\n"+
+		"  if [ \"$FAKE_STORE\" = root ]; then\n"+
+		"    printf '%s\\n' '{\"ID\":\"rootctr\",\"Names\":[\"drasl_drasl_1\"],\"State\":\"running\",\"Labels\":\"com.docker.compose.project=drasl\"}'\n"+
+		"  else\n"+
+		"    printf '%s\\n' '{\"ID\":\"ownctr\",\"Names\":[\"stray\"],\"State\":\"created\",\"Labels\":\"\"}'\n"+
+		"  fi\n"+
+		"  ;;\n"+
+		"esac\n"+
+		"exit 0\n")
+	fakeCommand(t, "sudo", "#!/bin/sh\nif [ \"$3\" = \"--version\" ]; then exit 0; fi\nshift\nFAKE_STORE=root exec \"$@\"\n")
+
+	collector := &ContainersCollector{
+		probe: &runtimeProbeState{
+			probed:       true,
+			runtimes:     []string{"podman"},
+			runtimePaths: map[string]string{"podman": runtimePath},
+		},
 	}
-	// Fake runtime: the "root-owned" container is only visible through the
-	// elevated retry (env marker set by the fake sudo shim).
-	runtimePath := mk("podman", `if [ "$MAIDCAFE_ROOT" = "1" ]; then echo '{"ID":"rootctr"}'; fi`)
-	sudoMarker := filepath.Join(dir, "sudo-ran")
-	mk("sudo", `shift; : > "`+sudoMarker+`"; MAIDCAFE_ROOT=1 exec "$@"`)
-	mk("podman-visible", `echo '{"ID":"seenas-user"}'`)
-	t.Setenv("PATH", dir)
-
-	ctx := context.Background()
-
-	// Direct success short-circuits the elevated retry.
-	out, err := runRuntimeList(ctx, filepath.Join(dir, "podman-visible"), "ps")
+	data, err := collector.snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(out, []byte("seenas-user")) {
-		t.Fatalf("direct listing output = %q", out)
+	var payload containersPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
 	}
-	if _, statErr := os.Stat(sudoMarker); statErr == nil {
-		t.Fatal("elevated retry ran although the direct listing succeeded")
+	if len(payload.Runtimes) != 2 {
+		t.Fatalf("runtimes = %+v, want one entry per store", payload.Runtimes)
 	}
+	own, root := payload.Runtimes[0], payload.Runtimes[1]
+	if own.Store != "own" || own.Runtime != "podman" {
+		t.Fatalf("first entry = %+v, want podman's own store", own)
+	}
+	if len(own.Containers) != 1 || own.Containers[0].Name != "stray" {
+		t.Fatalf("own containers = %+v", own.Containers)
+	}
+	if own.Rootless == nil || !*own.Rootless || own.Cgroups != "cgroupfs" {
+		t.Fatalf("own store facts = rootless %v cgroups %q", own.Rootless, own.Cgroups)
+	}
+	if root.Store != "root" || root.Runtime != "podman" {
+		t.Fatalf("second entry = %+v, want root's store", root)
+	}
+	if len(root.Containers) != 1 || root.Containers[0].Name != "drasl_drasl_1" {
+		t.Fatalf("root containers = %+v", root.Containers)
+	}
+	if root.Rootless == nil || *root.Rootless || root.Cgroups != "systemd" {
+		t.Fatalf("root store facts = rootless %v cgroups %q", root.Rootless, root.Cgroups)
+	}
+}
 
-	// Empty direct listing retries through sudo and sees the root container.
-	out, err = runRuntimeList(ctx, runtimePath, "ps")
+// TestContainerStoreOmittedWhenSudoIsNotPermitted pins the quiet half: a host
+// whose sudo policy does not grant the runtime gets its own store's list alone,
+// rather than a permission error repeated on every collection cycle.
+func TestContainerStoreOmittedWhenSudoIsNotPermitted(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires a non-root test user to exercise the sudo path")
+	}
+	runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+
+		"case \"$1\" in\n"+
+		"info) printf 'true cgroupfs\\n' ;;\n"+
+		"ps) printf '%s\\n' '{\"ID\":\"ownctr\",\"Names\":[\"stray\"],\"State\":\"created\",\"Labels\":\"\"}' ;;\n"+
+		"esac\n"+
+		"exit 0\n")
+	fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
+
+	collector := &ContainersCollector{
+		probe: &runtimeProbeState{
+			probed:       true,
+			runtimes:     []string{"podman"},
+			runtimePaths: map[string]string{"podman": runtimePath},
+		},
+	}
+	data, err := collector.snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(out, []byte("rootctr")) {
-		t.Fatalf("elevated listing output = %q", out)
+	var payload containersPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
 	}
-	if _, statErr := os.Stat(sudoMarker); statErr != nil {
-		t.Fatal("elevated retry did not run for an empty direct listing")
+	if len(payload.Runtimes) != 1 {
+		t.Fatalf("runtimes = %+v, want the daemon user's own store alone", payload.Runtimes)
 	}
-
-	// Empty direct listing with a failing elevated retry surfaces the sudo
-	// error instead of masking the empty direct result as "no containers".
-	mk("sudo", `shift; exit 7`)
-	out, err = runRuntimeList(ctx, runtimePath, "ps")
-	if err == nil {
-		t.Fatal("elevated retry failure was masked as a successful empty listing")
-	}
-	if len(out) != 0 {
-		t.Fatalf("masked output = %q", out)
+	if payload.Runtimes[0].Store != "own" || payload.Runtimes[0].Error != nil {
+		t.Fatalf("entry = %+v, want the own store with no error", payload.Runtimes[0])
 	}
 }
 
@@ -713,6 +754,10 @@ func TestContainerSnapshotReportsWhatTheRuntimeIs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeCommand(t, "podman-compose", "#!/bin/sh\nexit 0\n")
+			// A sudo that refuses everything: this test is about what one store
+			// answers about itself, and a machine whose own sudo would permit
+			// the runtime would add root's store to the list.
+			fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
 			podman := fakeCommand(t, "podman", "#!/bin/sh\n"+
 				"if [ \"$1\" = info ]; then "+tc.infoAnswer+"exit 0; fi\n"+
 				"exit 0\n")
@@ -778,73 +823,6 @@ func TestRuntimeModeReadsTheRuntimeOwnAnswer(t *testing.T) {
 			path := fakeCommand(t, tc.binary, "#!/bin/sh\n"+tc.body)
 			if got := probeRuntimeFacts(context.Background(), path); got != tc.want {
 				t.Fatalf("facts = %+v, want %+v", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestRuntimeListReadsOwnStoreFirstThenRoots pins the rule the container list
-// follows: the daemon user's own store answers whenever it has containers, and
-// root's store fills in only when it has none. The runtime's own mode does not
-// enter into it — this is a read, and reaching root's containers is what the
-// shipped sudoers grant is for. A non-empty direct answer is never
-// second-guessed: asking twice on every poll costs a process, and replacing a
-// real answer with root's would hide the containers the daemon user runs.
-func TestRuntimeListReadsOwnStoreFirstThenRoots(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("the daemon does not elevate when it is already root")
-	}
-	cases := []struct {
-		name       string
-		direct     string
-		sudoBody   string
-		sudoStatus string
-		wantOut    string
-		wantErr    bool
-		wantElev   bool
-	}{
-		{
-			name: "own store answers", direct: "printf 'abc\\n'\n",
-			sudoBody: "exit 0\n", wantOut: "abc", wantElev: false,
-		},
-		{
-			name: "own store is empty", direct: "exit 0\n",
-			sudoBody: "printf 'root\\n'\n", wantOut: "root", wantElev: true,
-		},
-		{
-			name: "own store fails", direct: "exit 1\n",
-			sudoBody: "printf 'root\\n'\n", wantOut: "root", wantElev: true,
-		},
-		{
-			name: "neither store answers", direct: "exit 0\n",
-			sudoBody: "exit 1\n", wantErr: true, wantElev: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sudoLog := filepath.Join(t.TempDir(), "sudo")
-			fakeCommand(t, "sudo", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+sudoLog+"\n"+tc.sudoBody)
-			runtimePath := fakeCommand(t, "podman", "#!/bin/sh\n"+tc.direct)
-
-			out, err := runRuntimeList(context.Background(), runtimePath, "ps", "-a")
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("an empty own store with a failed elevated retry must not read as an empty list")
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("listing: %v", err)
-				}
-				if got := strings.TrimSpace(string(out)); got != tc.wantOut {
-					t.Fatalf("out = %q, want %q", got, tc.wantOut)
-				}
-			}
-			elevated := recordedElevations(t, sudoLog)
-			if tc.wantElev && !strings.Contains(elevated, "ps -a") {
-				t.Fatalf("the listing did not reach root's store: %q", elevated)
-			}
-			if !tc.wantElev && elevated != "" {
-				t.Fatalf("a listing that answered was elevated anyway: %q", elevated)
 			}
 		})
 	}

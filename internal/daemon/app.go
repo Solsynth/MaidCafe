@@ -1138,24 +1138,45 @@ func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, r
 func containerStatusBatch(payload containersPayload, rt *reloadableConfig) ([]containerStatusEntry, []string) {
 	entries := make([]containerStatusEntry, 0, 8)
 	covered := make([]string, 0, len(payload.Runtimes))
-	for _, runtime := range payload.Runtimes {
-		if !runtime.Available || runtime.Error != nil {
+	order := make([]string, 0, len(payload.Runtimes))
+	partial := make(map[string]bool, len(payload.Runtimes))
+	for _, group := range payload.Runtimes {
+		known := false
+		for _, seen := range order {
+			if seen == group.Runtime {
+				known = true
+				break
+			}
+		}
+		if !known {
+			order = append(order, group.Runtime)
+		}
+		if !group.Available || group.Error != nil {
+			// A store of this runtime did not answer, so this snapshot is not
+			// the runtime's whole truth: its containers are held at their last
+			// known state rather than retired from a batch that is missing the
+			// other store's half.
+			partial[group.Runtime] = true
 			continue
 		}
-		covered = append(covered, runtime.Runtime)
-		for _, c := range runtime.Containers {
+		for _, c := range group.Containers {
 			if !matchManagedContainer(c.ID, c.Name, c.ComposeProject, rt.managedContainers, rt.managedComposes) {
 				continue
 			}
 			entries = append(entries, containerStatusEntry{
 				ContainerID:    c.ID,
-				Runtime:        runtime.Runtime,
+				Runtime:        group.Runtime,
 				Name:           c.Name,
 				Image:          c.Image,
 				State:          c.State,
 				Status:         c.Status,
 				ComposeProject: c.ComposeProject,
 			})
+		}
+	}
+	for _, runtime := range order {
+		if !partial[runtime] {
+			covered = append(covered, runtime)
 		}
 	}
 	return entries, covered

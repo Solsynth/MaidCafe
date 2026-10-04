@@ -62,6 +62,12 @@ type containersRuntimePayload struct {
 	Runtime   string  `json:"runtime"`
 	Available bool    `json:"available"`
 	Error     *string `json:"error"`
+	// Store names which store of that runtime the entry describes: "own" for
+	// the daemon user's own containers, "root" for the ones behind `sudo -n`.
+	// A runtime has one entry per store it was read from, so a client can show
+	// what the daemon runs next to what root runs instead of one hiding the
+	// other.
+	Store string `json:"store,omitempty"`
 	// Rootless is what the runtime says about itself: true when its containers
 	// belong to the invoking user (no elevation reaches them), false when a
 	// root daemon owns them, and absent when the runtime did not answer.
@@ -92,8 +98,10 @@ type runtimeProbeState struct {
 	runtimePaths map[string]string
 	probed       bool
 	lastProbe    time.Time
-	facts        map[string]runtimeFacts
+	facts        map[composeStore]runtimeFacts
 	factsAt      time.Time
+	permitted    map[string]bool
+	permittedAt  time.Time
 }
 
 // runtimeFactsTTL bounds how long the probe's answer about one runtime is
@@ -102,28 +110,63 @@ type runtimeProbeState struct {
 // minute to minute.
 const runtimeFactsTTL = 1 * time.Minute
 
-// factsFor reports what the runtime at [path] is, caching the answer for
-// runtimeFactsTTL so a collector that reports it every tick does not spawn a
-// runtime subprocess every tick. An empty path, or a collector wired without a
-// probe, reports an unknown runtime; elevation asks probeRuntimeFacts directly
-// instead, because it is about to spend a subprocess on the command itself and
-// a stale answer there would change which store a mutation lands in.
-func (p *runtimeProbeState) factsFor(ctx context.Context, path string) runtimeFacts {
-	if p == nil || path == "" {
+// factsFor reports what one store is, caching the answer for runtimeFactsTTL so
+// a collector that reports it every tick does not spawn a runtime subprocess
+// every tick. An empty path, or a collector wired without a probe, reports an
+// unknown runtime.
+func (p *runtimeProbeState) factsFor(ctx context.Context, store composeStore) runtimeFacts {
+	if p == nil || store.Path == "" {
 		return runtimeFacts{}
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.facts == nil || time.Since(p.factsAt) >= runtimeFactsTTL {
-		p.facts = make(map[string]runtimeFacts, 2)
+		p.facts = make(map[composeStore]runtimeFacts, 4)
 		p.factsAt = time.Now()
 	}
-	if facts, ok := p.facts[path]; ok {
+	if facts, ok := p.facts[store]; ok {
 		return facts
 	}
-	facts := probeRuntimeFacts(ctx, path)
-	p.facts[path] = facts
+	facts := probeRuntimeFactsStore(ctx, store)
+	p.facts[store] = facts
 	return facts
+}
+
+// sudoPermits reports whether `sudo -n` may run the runtime at [path] on this
+// host — the difference between a store the daemon can read and one it can only
+// ask about. The verdict is cached like the facts, because it costs a `sudo -l`
+// process and a sudoers policy is host configuration, not something that
+// changes minute to minute. A collector wired without a probe permits nothing.
+func (p *runtimeProbeState) sudoPermits(ctx context.Context, path string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.permitted == nil || time.Since(p.permittedAt) >= runtimeFactsTTL {
+		p.permitted = make(map[string]bool, 2)
+		p.permittedAt = time.Now()
+	}
+	if verdict, ok := p.permitted[path]; ok {
+		return verdict
+	}
+	verdict := sudoRuns(ctx, path)
+	p.permitted[path] = verdict
+	return verdict
+}
+
+// stores lists the stores a collector reads for one runtime, in the order they
+// are read: the daemon user's own, then root's when `sudo -n` may run this
+// runtime. Both are enumerated on every cycle, because they are different sets
+// of containers and images — one stray object in the daemon user's store used
+// to make its listing non-empty and hide root's workload entirely, which is
+// exactly the state an operator cannot diagnose.
+func (p *runtimeProbeState) stores(ctx context.Context, runtime, path string) []composeStore {
+	own := composeStore{Runtime: runtime, Path: path}
+	if _, ok := elevationAttempt(path); !ok || !p.sudoPermits(ctx, path) {
+		return []composeStore{own}
+	}
+	return []composeStore{own, {Runtime: runtime, Path: path, Elevated: true}}
 }
 
 // probePathSnapshot ensures the probe has run and returns the current
@@ -208,9 +251,17 @@ func runtimeName(path string) string {
 // Callers ask where they are about to elevate a runtime command, because the
 // answer costs a subprocess and only a failed or empty direct call needs it.
 func probeRuntimeFacts(ctx context.Context, path string) runtimeFacts {
-	switch runtimeName(path) {
+	return probeRuntimeFactsStore(ctx, composeStore{Path: path})
+}
+
+// probeRuntimeFactsStore is [probeRuntimeFacts] for one store, so a collector
+// reporting root's store describes that store — rootful, with the system cgroup
+// manager — instead of what the daemon user's own invocation of the same binary
+// says about itself.
+func probeRuntimeFactsStore(ctx context.Context, store composeStore) runtimeFacts {
+	switch runtimeName(store.Path) {
 	case "podman":
-		out, err := runCommand(ctx, path, "info", "--format", "{{.Host.Security.Rootless}} {{.Host.CgroupManager}}")
+		out, err := runStoreCommand(ctx, store, "info", "--format", "{{.Host.Security.Rootless}} {{.Host.CgroupManager}}")
 		if err != nil {
 			return runtimeFacts{}
 		}
@@ -224,7 +275,7 @@ func probeRuntimeFacts(ctx context.Context, path string) runtimeFacts {
 		}
 		return facts
 	case "docker":
-		out, err := runCommand(ctx, path, "info", "--format", "{{.SecurityOptions}}")
+		out, err := runStoreCommand(ctx, store, "info", "--format", "{{.SecurityOptions}}")
 		if err != nil {
 			return runtimeFacts{}
 		}
@@ -273,48 +324,6 @@ func elevationAttempt(path string, args ...string) ([]string, bool) {
 	argv = append(argv, path)
 	argv = append(argv, args...)
 	return argv, true
-}
-
-// runRuntimeList runs a runtime CLI listing command, retrying through `sudo -n`
-// (never interactive) when the direct invocation fails or returns nothing and
-// the daemon is not root. Rootful runtimes are invisible to a non-root daemon —
-// e.g. the shipped systemd unit runs as the maidcafe user while operators run
-// containers as root — and the elevated retry sees them whenever the daemon
-// user has passwordless sudo. The retry is never interactive.
-//
-// The direct answer wins whenever it has something to say, so the daemon's list
-// is its own store's containers first and root's only to fill a blind spot. An
-// empty direct listing whose elevated retry fails is reported as an error
-// rather than a misleading empty list, so invisible root-owned containers never
-// masquerade as "no containers".
-//
-// This is a *read* rule, and only reads may treat the two stores as one view:
-// the direct answer and the elevated one are the daemon user's containers and
-// root's, in that order of preference. A step that creates containers must
-// never fall back that way, because the fallback would create the project a
-// second time in the other store — see composeStore.
-func runRuntimeList(ctx context.Context, path string, args ...string) ([]byte, error) {
-	out, err := runCommand(ctx, path, args...)
-	if err == nil && len(bytes.TrimSpace(out)) > 0 {
-		return out, nil
-	}
-	elevated, ok := elevationAttempt(path, args...)
-	if !ok {
-		return out, err
-	}
-	sudoOut, sudoErr := runCommand(ctx, elevated[0], elevated[1:]...)
-	if sudoErr != nil {
-		if err != nil {
-			// The direct failure stays the primary signal.
-			return out, err
-		}
-		// The direct listing succeeded but returned nothing and the
-		// elevated retry failed: root-owned containers are invisible to
-		// this daemon. Surface the retry failure instead of a misleading
-		// empty list.
-		return nil, fmt.Errorf("empty listing, elevated retry failed: %w", sudoErr)
-	}
-	return sudoOut, nil
 }
 
 // ContainersCollector lists podman/docker containers (podman first), caching
@@ -405,39 +414,43 @@ func (c *ContainersCollector) collectRuntimes(ctx context.Context, paths map[str
 		if path == "" {
 			continue
 		}
-		// What the runtime says about itself travels with its containers: it
-		// is what tells an operator why a rootless host repeats podman's
-		// cgroup fallback on every invocation, and which compose tool a stack
-		// action will run.
-		facts := c.probe.factsFor(ctx, path)
-		// The mode is absent, rather than "rootful", when the runtime did not
-		// answer: a reader is never told a runtime is rootful when it said
-		// nothing at all.
-		var rootless *bool
-		if facts.Known {
-			rootless = new(facts.Rootless)
+		for _, store := range c.probe.stores(ctx, runtime, path) {
+			payload.Runtimes = append(payload.Runtimes, c.collectStore(ctx, store))
 		}
-		entry := containersRuntimePayload{
-			Runtime: runtime, Available: true, Containers: []containerEntry{},
-			Rootless: rootless, Cgroups: facts.Cgroups,
-			ComposeTool: composeToolResolution(path),
-		}
-		out, err := runRuntimeList(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
-		if err != nil {
-			entry.Error = strPtr("list containers: " + err.Error())
-			payload.Runtimes = append(payload.Runtimes, entry)
-			continue
-		}
-		entries, err := parseContainerLines(out)
-		if err != nil {
-			entry.Error = strPtr("parse container list: " + err.Error())
-			payload.Runtimes = append(payload.Runtimes, entry)
-			continue
-		}
-		entry.Containers = entries
-		payload.Runtimes = append(payload.Runtimes, entry)
 	}
 	return json.Marshal(payload)
+}
+
+// collectStore reads one store's container list into its own entry, because the
+// stores are different sets of containers and a list that merges or prefers one
+// of them is a list an operator cannot act on. The entry carries the store it
+// describes and what *that* store says about itself.
+func (c *ContainersCollector) collectStore(ctx context.Context, store composeStore) containersRuntimePayload {
+	facts := c.probe.factsFor(ctx, store)
+	// The mode is absent, rather than "rootful", when the runtime did not
+	// answer: a reader is never told a runtime is rootful when it said
+	// nothing at all.
+	var rootless *bool
+	if facts.Known {
+		rootless = new(facts.Rootless)
+	}
+	entry := containersRuntimePayload{
+		Runtime: store.Runtime, Store: store.label(), Available: true, Containers: []containerEntry{},
+		Rootless: rootless, Cgroups: facts.Cgroups,
+		ComposeTool: composeToolResolution(store.Path),
+	}
+	out, err := runStoreCommand(ctx, store, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
+	if err != nil {
+		entry.Error = strPtr("list containers: " + err.Error())
+		return entry
+	}
+	entries, err := parseContainerLines(out)
+	if err != nil {
+		entry.Error = strPtr("parse container list: " + err.Error())
+		return entry
+	}
+	entry.Containers = entries
+	return entry
 }
 
 func (c *ContainersCollector) marshal() ([]byte, error) {
@@ -603,10 +616,14 @@ type imageEntry struct {
 }
 
 type imagesRuntimePayload struct {
-	Runtime   string       `json:"runtime"`
-	Available bool         `json:"available"`
-	Error     *string      `json:"error"`
-	Images    []imageEntry `json:"images"`
+	Runtime   string  `json:"runtime"`
+	Available bool    `json:"available"`
+	Error     *string `json:"error"`
+	// Store names which store of that runtime the entry describes: "own" or
+	// "root", the same split the container list carries. An image pulled into
+	// one store says nothing about the other.
+	Store  string       `json:"store,omitempty"`
+	Images []imageEntry `json:"images"`
 }
 
 type imagesPayload struct {
@@ -666,27 +683,33 @@ func (c *ImagesCollector) collectRuntimes(ctx context.Context, paths map[string]
 		if path == "" {
 			continue
 		}
-		out, err := runRuntimeList(ctx, path, "images", "--no-trunc", "--format", "{{json .}}")
-		if err != nil {
-			payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
-				Runtime: runtime, Available: true, Error: strPtr("list images: " + err.Error()),
-				Images: []imageEntry{},
-			})
-			continue
+		for _, store := range c.probe.stores(ctx, runtime, path) {
+			payload.Runtimes = append(payload.Runtimes, c.collectStore(ctx, store))
 		}
-		entries, err := parseImageLines(out)
-		if err != nil {
-			payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
-				Runtime: runtime, Available: true, Error: strPtr("parse image list: " + err.Error()),
-				Images: []imageEntry{},
-			})
-			continue
-		}
-		payload.Runtimes = append(payload.Runtimes, imagesRuntimePayload{
-			Runtime: runtime, Available: true, Images: entries,
-		})
 	}
 	return json.Marshal(payload)
+}
+
+// collectStore reads one store's image list into its own entry: the images a
+// store holds are that store's, and an image pulled into the daemon user's
+// store answers nothing about the images root's store holds for the containers
+// that are actually running.
+func (c *ImagesCollector) collectStore(ctx context.Context, store composeStore) imagesRuntimePayload {
+	entry := imagesRuntimePayload{
+		Runtime: store.Runtime, Store: store.label(), Available: true, Images: []imageEntry{},
+	}
+	out, err := runStoreCommand(ctx, store, "images", "--no-trunc", "--format", "{{json .}}")
+	if err != nil {
+		entry.Error = strPtr("list images: " + err.Error())
+		return entry
+	}
+	entries, err := parseImageLines(out)
+	if err != nil {
+		entry.Error = strPtr("parse image list: " + err.Error())
+		return entry
+	}
+	entry.Images = entries
+	return entry
 }
 
 func (c *ImagesCollector) marshal() ([]byte, error) {

@@ -229,34 +229,19 @@ func TestNativeSystemdOpNormalizesAndExecutes(t *testing.T) {
 	}
 }
 
-// recordedElevations returns what a fake sudo recorded. An absent log means
-// nothing was elevated: the fake only creates its file when it runs.
-func recordedElevations(t *testing.T, path string) string {
-	t.Helper()
-	if _, err := os.Stat(path); err != nil {
-		return ""
-	}
-	recorded, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.TrimSpace(string(recorded))
-}
-
-// fakeSudoScript is a sudo that records nothing of its own and hands the
-// command to the fake runtime with FAKE_STORE=root set, which is how the fake
-// runtime knows it is root's store answering. `sudo -n -l <command>` answers
-// about the standalone compose tools only: the shipped sudoers rule grants the
-// runtime binary and not the tool, and [grantsComposeTool] says which shape
-// this test is pinning.
+// fakeSudoScript is a sudo that hands the command to the fake runtime with
+// FAKE_STORE=root set, which is how the fake runtime knows it is root's store
+// answering. The `--version` probe the daemon runs to ask whether it may run a
+// tool at all is answered here: the standalone compose tools get
+// [grantsComposeTool]'s verdict, everything else is permitted.
 func fakeSudoScript(grantsComposeTool bool) string {
 	verdict := "exit 1"
 	if grantsComposeTool {
 		verdict = "exit 0"
 	}
 	return "#!/bin/sh\n" +
-		"if [ \"$2\" = \"-l\" ]; then\n" +
-		"  case \"$3\" in\n" +
+		"if [ \"$3\" = \"--version\" ]; then\n" +
+		"  case \"$2\" in\n" +
 		"    *podman-compose|*docker-compose) " + verdict + " ;;\n" +
 		"  esac\n" +
 		"  exit 0\n" +

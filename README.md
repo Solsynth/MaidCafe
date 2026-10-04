@@ -364,21 +364,20 @@ Authorization: Bearer <metrics-secret>
   `processesLimit` (default `50`, valid `1..500`) CPU consumers.
 - `systemd` frames (every `systemdInterval`, default `30s`) report the merged
   systemd unit list, including enabled-but-inactive units.
-- Container and image listing retries through `sudo -n` when the direct query
-  fails or returns nothing and the daemon is not root, so root-owned
-  containers stay visible to a non-root daemon (e.g. the systemd `maidcafe`
-  user) when passwordless sudo is available. The retry is never interactive.
-  A failed direct query keeps its own error; an empty direct listing whose
-  elevated retry also fails is reported as an error rather than a misleading
-  empty list, so invisible root-owned containers never look like "no
-  containers".
-- That retry is the *read* rule, and it is a fallback in one direction only:
-  the daemon user's own store answers whenever it has containers, and root's
-  fills in when it has none. A store that does not answer is skipped, unless
-  `sudo -n` may run that runtime — the grant the shipped sudoers rule sets up —
-  in which case a store that is reachable by policy but does not answer is an
-  error rather than an absence, because a project that might be there must not
-  be written a second time.
+- Container and image listing reads **every store it can reach**: the daemon
+  user's own, and root's when `sudo -n` may run that runtime — the grant the
+  shipped sudoers rule sets up. Each store is its own entry in the payload
+  (`store`: `"own"` or `"root"`), with its own containers, images, error and
+  answer about itself, so an operator sees what the daemon runs next to what
+  root runs. A merge or a preference between the two is what hides one of them:
+  preferring whichever listing is non-empty, for instance, let a single stray
+  image in the daemon user's store hide all thirty-five in root's.
+- A store that `sudo -n` may not run is not read at all, and therefore not
+  listed: a host without the grant gets its own store with no repeated
+  permission error attached to every cycle. A store that is permitted but does
+  not answer keeps its own entry with its own error, and the container status
+  batch a runtime covers requires *every* store of it to have answered — a
+  snapshot missing root's half must not retire root's containers in the cloud.
 - Container and compose **actions** follow the same distinction, because one
   runtime binary reaches two stores: `podman` run by the daemon user keeps its
   containers in that user's own store, and the same binary through `sudo -n`
@@ -678,17 +677,27 @@ clients can paint first data from the daemon instead of an SSH fallback. They
 reuse the stream collectors' probe cache and rate limits:
 
 - `GET /api/v1/containers` — same payload as the `containers` event: a
-  `runtimes` list covering every runtime found on the host (podman first),
-  each with `runtime`, `available`, `error`, `containers`, and what the
-  runtime says about itself: `rootless` (absent when it did not answer),
-  `cgroups` (the manager it will use — `systemd` or `cgroupfs`) and
-  `compose_tool` (the tool a stack action for that runtime runs first, e.g.
-  `podman-compose` or `podman compose`). A podman that reports `cgroupfs`
-  because the user has no systemd session repeats that fallback, with the
-  remedy it suggests, on every invocation it makes — the daemon's own task
-  logs no longer add anything to it beyond the runtime's output.
+  `runtimes` list with **one entry per store of each runtime found on the host**
+  (podman first, the daemon user's own store before root's), each with
+  `runtime`, `store` (`"own"` or `"root"`), `available`, `error`,
+  `containers`, and what that store says about itself: `rootless` (absent when
+  it did not answer), `cgroups` (the manager it will use — `systemd` or
+  `cgroupfs`) and `compose_tool` (the tool a stack action for that runtime runs
+  first, e.g. `podman-compose` or `podman compose`).
+- The stores are separate sets of containers, so they are listed separately
+  rather than merged or preferred: one stray container in the daemon user's
+  store must not be able to hide root's, which is what a single "prefer the
+  non-empty listing" rule did. Root's store is read only when `sudo -n` may run
+  that runtime, and it is left out of the list entirely when it may not — a
+  host without the grant gets its own store's containers and no repeated
+  permission error. A podman that reports `cgroupfs` because the user has no
+  systemd session repeats that fallback, with the remedy it suggests, on every
+  invocation it makes — the daemon's own task logs no longer add anything to it
+  beyond the runtime's output.
 - `GET /api/v1/images` — same payload as the `images` event: a `runtimes`
-  list, each with `runtime`, `available`, `error` and `images`.
+  list with the same one-entry-per-store split, each with `runtime`, `store`,
+  `available`, `error` and `images`. An image pulled into one store says
+  nothing about the other's.
 - `GET /api/v1/processes` — same payload as the `processes` event. `?limit=N`
   overrides the daemon's configured `processesLimit`: `0` returns the complete
   process table (no cap), a positive value keeps the top N CPU consumers.

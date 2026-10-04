@@ -1000,6 +1000,14 @@ func (s composeStore) describe() string {
 	return s.Runtime + " in the daemon user's own store"
 }
 
+// label names a store in a payload: the short form a client switches on.
+func (s composeStore) label() string {
+	if s.Elevated {
+		return "root"
+	}
+	return "own"
+}
+
 // runStoreCommand runs a runtime command in exactly [store], never falling back
 // to the other one, which is the point of naming it.
 func runStoreCommand(ctx context.Context, store composeStore, args ...string) ([]byte, error) {
@@ -1018,8 +1026,11 @@ func runStoreCommand(ctx context.Context, store composeStore, args ...string) ([
 // It is what separates "this daemon can reach root's store" from "this daemon
 // would only print a password prompt": a sudoers rule that grants the runtime
 // binary does not grant the standalone compose tool, and a step that needs the
-// latter has no business being attempted. `sudo -n -l <command>` answers the
-// question without running anything.
+// latter has no business being attempted. The question is asked by running the
+// tool's own `--version` through sudo — a version print touches nothing, and the
+// exit status is the answer. `sudo -l <command>` is a different question: a host
+// whose account has a general sudo rule reports the command as permitted while
+// still asking for a password.
 func sudoRuns(ctx context.Context, command string) bool {
 	prefix := elevationPrefix()
 	if prefix == nil {
@@ -1027,7 +1038,7 @@ func sudoRuns(ctx context.Context, command string) bool {
 	}
 	probe, cancel := context.WithTimeout(ctx, collectorExecTimeout)
 	defer cancel()
-	return exec.CommandContext(probe, prefix[0], "-n", "-l", command).Run() == nil
+	return exec.CommandContext(probe, prefix[0], "-n", command, "--version").Run() == nil
 }
 
 // composeStores lists the stores of every available runtime, the daemon user's

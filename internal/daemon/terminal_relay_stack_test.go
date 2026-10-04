@@ -208,16 +208,30 @@ func TestRelayedTerminalEndToEnd(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// The daemon audited the session with the cloud identity it was told.
-	audit := string(mustRead(t, auditPath))
-	if !strings.Contains(audit, `"source":"terminal"`) {
-		t.Fatalf("audit entry missing terminal source: %s", audit)
-	}
-	if !strings.Contains(audit, `"invoked_by":"cloud:`+identity+`"`) {
-		t.Fatalf("audit entry missing relayed identity: %s", audit)
-	}
-	if !strings.Contains(audit, `"ok":true`) {
-		t.Fatalf("audit entry does not record a clean session: %s", audit)
+	// The daemon audited the session with the cloud identity it was told. The
+	// session state above is the relay's, and the audit line is the daemon's:
+	// they are written on either side of the WebSocket closing, so the file is
+	// polled rather than read once.
+	auditDeadline := time.Now().Add(5 * time.Second)
+	for {
+		audit := string(mustRead(t, auditPath))
+		switch {
+		case !strings.Contains(audit, `"source":"terminal"`):
+			if time.Now().After(auditDeadline) {
+				t.Fatalf("audit entry missing terminal source: %s", audit)
+			}
+		case !strings.Contains(audit, `"invoked_by":"cloud:`+identity+`"`):
+			if time.Now().After(auditDeadline) {
+				t.Fatalf("audit entry missing relayed identity: %s", audit)
+			}
+		case !strings.Contains(audit, `"ok":true`):
+			if time.Now().After(auditDeadline) {
+				t.Fatalf("audit entry does not record a clean session: %s", audit)
+			}
+		default:
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
