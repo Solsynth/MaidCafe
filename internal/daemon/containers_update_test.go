@@ -46,6 +46,53 @@ func TestContainerUpdatesServesTheCacheWithoutChecking(t *testing.T) {
 	}
 }
 
+// TestContainerUpdatesForgetsAReplacedContainer pins the daemon half of the
+// update badge. An update recreates a compose container under the same name
+// with a new id, and a client matches a status to a container by name when the
+// ids differ, so the predecessor's answer must not survive the read — or the
+// badge the update was meant to clear stays lit on the container that replaced
+// it (which is exactly what "the update hint remains" is).
+func TestContainerUpdatesForgetsAReplacedContainer(t *testing.T) {
+	t.Setenv("FAKE_RUNTIME_CALLS", filepath.Join(t.TempDir(), "calls"))
+	fakeRuntimeBinary(t, fakeRuntimeScript(composeLabels(t.TempDir())))
+
+	app, err := NewApp(detailTestConfig(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	defer app.Shutdown(ctx)
+
+	outdated := true
+	// The container the daemon saw before the recreate: same name, an id the
+	// host no longer has. The live one is what the fake runtime still lists.
+	app.updateCheck.store(containerUpdateStatus{
+		Container: "04160c5e60afaf970ab48c112b03f65af7096bf03e571c5944feb4d0257dd641",
+		Name:      "web", Runtime: "podman", Image: "nginx:1.25",
+		CheckedAt: time.Now().UTC(), Outdated: &outdated,
+	})
+	app.updateCheck.store(containerUpdateStatus{
+		Container: containerID, Name: "web", Runtime: "podman", Image: "nginx:1.25",
+		CheckedAt: time.Now().UTC(), Outdated: &outdated,
+	})
+
+	status, body := detailRequest(t, "http://"+app.ListenAddr(), "/api/v1/updates")
+	if status != http.StatusOK {
+		t.Fatalf("updates status = %d: %s", status, body)
+	}
+	var updates containerUpdatesPayload
+	if err := json.Unmarshal(body, &updates); err != nil {
+		t.Fatalf("updates body %s: %v", body, err)
+	}
+	if len(updates.Containers) != 1 || updates.Containers[0].Container != containerID {
+		t.Fatalf("updates = %+v, want only the live container", updates.Containers)
+	}
+}
+
 // stubRegistry serves one image manifest and counts the requests, so a test can
 // assert both the digest comparison and that a cached result was reused.
 func stubRegistry(t *testing.T, digest string) (*httptest.Server, *atomic.Int64) {

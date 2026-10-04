@@ -35,7 +35,13 @@ func (a *App) handleContainerUpdateCheck(c *gin.Context) {
 // handleContainerUpdates serves every cached update status without touching a
 // registry, so a client can paint badges from one cheap request and then ask
 // for individual containers to be checked.
+//
+// It prunes first. An update recreates its container under the same name with a
+// new id, and a client falls back to the name when the ids differ, so the
+// replaced container's answer would otherwise keep painting the badge the
+// update was meant to clear (see [updateChecker.ForgetStale]).
 func (a *App) handleContainerUpdates(c *gin.Context) {
+	a.updateCheck.ForgetStale(c.Request.Context())
 	interval := int64(0)
 	if rt := a.rt.Load(); rt != nil {
 		interval = int64(rt.intervals.updateCheck.Seconds())

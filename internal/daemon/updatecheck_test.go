@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -328,6 +329,53 @@ func TestUpdateCheckerRoundSkipsFreshAndForgetsGoneContainers(t *testing.T) {
 	}
 	if _, ok := checker.Status("other"); !ok {
 		t.Fatalf("the container that replaced it must be checked: %+v", checker.Results())
+	}
+}
+
+// TestUpdateCheckerForgetStalePrunesOnlyWhatIsGone pins the read-path prune
+// that keeps a replaced container's answer off its replacement. A recreate
+// keeps the container's name and mints a new id, and a client matches a status
+// to a container by name when the ids differ, so the predecessor has to be
+// dropped the moment it is gone — not at the next cadence, which is the only
+// other place a prune ran.
+func TestUpdateCheckerForgetStalePrunesOnlyWhatIsGone(t *testing.T) {
+	inspect := containerInspect{ImageRef: "nginx:1.25", ImageID: containerRunningID}
+	local := containerImageInfo{ID: containerRunningID, RepoDigests: []string{"docker.io/library/nginx@" + containerLocalDigest}}
+	server := manifestServer(t, "application/vnd.oci.image.manifest.v1+json", `{"schemaVersion":2}`)
+	checker := stubChecker(t, inspect, local, server.URL)
+
+	// The container the daemon still sees, and the one a recreate replaced
+	// under the same name.
+	if status := checker.Refresh(context.Background(), containerRef{Runtime: "podman", ID: containerID, Name: "web"}, 0); status.Outdated == nil {
+		t.Fatalf("seed live status = %+v", status)
+	}
+	checker.store(containerUpdateStatus{
+		Container: "replaced", Name: "web", Runtime: "podman", CheckedAt: time.Now().UTC(),
+	})
+
+	checker.ForgetStale(context.Background())
+	if _, ok := checker.Status("replaced"); ok {
+		t.Fatal("a container the host no longer has must be forgotten on the read path")
+	}
+	if _, ok := checker.Status(containerID); !ok {
+		t.Fatal("a container that is still here must be kept")
+	}
+
+	// A listing that fails must not empty the cache: a store that did not
+	// answer this second is not a store whose containers are gone.
+	checker.containers = func(context.Context) ([]containerRef, error) {
+		return nil, errors.New("podman unavailable")
+	}
+	checker.ForgetStale(context.Background())
+	if len(checker.Results()) != 1 {
+		t.Fatalf("a failed listing emptied the cache: %+v", checker.Results())
+	}
+
+	// Nor may an empty listing, for the same reason.
+	checker.containers = func(context.Context) ([]containerRef, error) { return nil, nil }
+	checker.ForgetStale(context.Background())
+	if len(checker.Results()) != 1 {
+		t.Fatalf("an empty listing emptied the cache: %+v", checker.Results())
 	}
 }
 

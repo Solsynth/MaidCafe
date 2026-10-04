@@ -739,7 +739,10 @@ what:
   cached answer is older than a minute.
 - `GET /api/v1/updates` — every cached update answer in one request, with
   `interval_seconds` (the cadence they are refreshed on) and no registry
-  traffic at all.
+  traffic at all. It drops answers for containers the daemon no longer sees
+  before answering: an update recreates its container under the same name with
+  a new id, and a client that matches a status to a container by name would
+  otherwise keep painting the update badge on the container that replaced it.
 
 Like the snapshots, all of these are authenticated with the metrics secret and
 each costs one runtime command (the update check costs a registry request too).

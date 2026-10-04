@@ -140,12 +140,11 @@ func (c *updateChecker) CheckAll(ctx context.Context, minAge time.Duration) {
 	if err != nil || len(refs) == 0 {
 		return
 	}
-	seen := make(map[string]bool, len(refs))
+	seen := liveIDs(refs)
 	for _, ref := range refs {
 		if ctx.Err() != nil {
 			return
 		}
-		seen[ref.ID] = true
 		if cached, ok := c.Status(ref.ID); ok && time.Since(cached.CheckedAt) < minAge {
 			continue
 		}
@@ -176,6 +175,39 @@ func (c *updateChecker) forget(seen map[string]bool) {
 			delete(c.results, id)
 		}
 	}
+}
+
+// liveIDs is the set of container ids the daemon currently sees, the key the
+// cache is pruned against.
+func liveIDs(refs []containerRef) map[string]bool {
+	seen := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		seen[ref.ID] = true
+	}
+	return seen
+}
+
+// ForgetStale drops answers for containers the daemon no longer sees.
+//
+// The cache is keyed by container id, but a client matches a status to a
+// container by id *or by name*, because a recreate keeps the name and mints a
+// new id and the two surfaces that paint badges do not always agree on the id.
+// A predecessor's answer would therefore be read as its replacement's, and the
+// badge an update was meant to clear would stay lit on the container that
+// replaced it — for as long as the id sat in the cache, which the cadence alone
+// does not bound to anything an operator would call prompt. This runs the same
+// prune a round does, on the read path, so an answer cannot outlive the
+// container it describes.
+//
+// The listing is the daemon's own snapshot (see [App.containersForRead]), and a
+// listing that fails or comes back empty leaves the cache alone: a store that
+// did not answer this second is not a store whose containers are gone.
+func (c *updateChecker) ForgetStale(ctx context.Context) {
+	refs, err := c.containers(ctx)
+	if err != nil || len(refs) == 0 {
+		return
+	}
+	c.forget(liveIDs(refs))
 }
 
 // check resolves one container's image and compares it against its registry.
