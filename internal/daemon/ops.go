@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -223,6 +226,19 @@ type opStage struct {
 	// its slug's verb.
 	label    string
 	attempts []opAttempt
+	// build, when set, replaces [attempts] and is asked for them once the
+	// stages before it have succeeded. A step whose command depends on what an
+	// earlier step produced cannot be planned up front: a stack update only
+	// knows which containers it recreates after the pull that moved their
+	// images (see [nativeOpRunner.composeUpdateRecreate]).
+	//
+	// An error from it fails the operation where it stands, and no attempts
+	// means the step had nothing to do, which [idle] reports.
+	build func(ctx context.Context) ([]opAttempt, error)
+	// idle is what a [build] that returned no attempts reports in the step's
+	// place: an operator watching a run reads why a step did nothing rather
+	// than an empty one.
+	idle string
 }
 
 // nativeOpRunner executes native operations through the executor's
@@ -699,19 +715,26 @@ func (r *nativeOpRunner) planNativeOp(
 		}
 		if verb == "update" {
 			// An upgrade is the same two steps a container update runs, for
-			// every service the project declares: fetch the images, then
-			// recreate on them.
+			// the whole project: fetch the images, then recreate on them. What
+			// the recreate covers is decided after the pull — the containers
+			// whose images that pull moved are the ones it names, which only
+			// the pull itself can tell (see
+			// [nativeOpRunner.composeUpdateRecreate]).
 			pullAttempts, err := r.composeAttempts(ctx, store, compose, "pull")
-			if err != nil {
-				return bad(err.Error())
-			}
-			recreateAttempts, err := r.composeAttempts(ctx, store, compose, "up", "-d", "--force-recreate")
 			if err != nil {
 				return bad(err.Error())
 			}
 			stages = append(stages,
 				opStage{label: "pull", attempts: pullAttempts},
-				opStage{label: "recreate", attempts: recreateAttempts},
+				opStage{
+					label: "recreate",
+					idle: fmt.Sprintf(
+						"every container of project %q already runs the image its reference points at; nothing to recreate",
+						compose.Project),
+					build: func(ctx context.Context) ([]opAttempt, error) {
+						return r.composeUpdateRecreate(ctx, store, compose)
+					},
+				},
 			)
 			break
 		}
@@ -1059,26 +1082,181 @@ func composeStores(runtimes map[string]string) []composeStore {
 }
 
 // storeProjectContainers lists the containers of [project] that live in one
-// store. The whole listing is read and matched here rather than filtered by the
-// runtime, because the two compose tools name the project under different label
-// keys — podman-compose writes both, docker writes its own — so a filter would
-// have to guess which one a given container carries.
+// store, as the entry shape the rest of the daemon reads.
 func storeProjectContainers(ctx context.Context, store composeStore, project string) ([]containerEntry, error) {
+	facts, err := storeProjectContainerFacts(ctx, store, project)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]containerEntry, 0, len(facts))
+	for _, fact := range facts {
+		entries = append(entries, containerEntry{
+			ID:             fact.id,
+			Name:           fact.name,
+			Image:          fact.image,
+			State:          fact.state,
+			Status:         fact.status,
+			ComposeProject: fact.project,
+		})
+	}
+	return entries, nil
+}
+
+// projectContainer is one container of a compose project, with everything the
+// daemon asks the store about it: what it is called, what it runs, and which
+// service of the project compose created it for.
+type projectContainer struct {
+	id      string
+	name    string
+	image   string
+	state   string
+	status  string
+	project string
+	service string
+}
+
+// storeProjectContainerFacts reads the containers of [project] that live in
+// one store. The whole listing is read and matched here rather than filtered by
+// the runtime, because the two compose tools name the project under different
+// label keys — podman-compose writes both, docker writes its own — so a filter
+// would have to guess which one a given container carries.
+func storeProjectContainerFacts(ctx context.Context, store composeStore, project string) ([]projectContainer, error) {
 	out, err := runStoreCommand(ctx, store, "ps", "-a", "--no-trunc", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
 	}
-	entries, err := parseContainerLines(out)
+	facts := make([]projectContainer, 0, 4)
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var raw containerJSONLine
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			return nil, fmt.Errorf("container line %q: %w", line, err)
+		}
+		labels := parseContainerLabels(raw.Labels)
+		recorded := composeLabel(labels, "project")
+		if !strings.EqualFold(recorded, project) {
+			continue
+		}
+		id := raw.ID
+		if id == "" {
+			id = raw.Id
+		}
+		names := parseNames(raw.Names)
+		name := ""
+		if len(names) > 0 {
+			name = names[0]
+		}
+		facts = append(facts, projectContainer{
+			id:      id,
+			name:    name,
+			image:   raw.Image,
+			state:   raw.State,
+			status:  raw.Status,
+			project: recorded,
+			service: composeLabel(labels, "service"),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return facts, nil
+}
+
+// storeProjectContainersBehind lists the containers of [project] in [store]
+// that a compose pull has left behind: the ones not running the image their
+// reference points at now, and the ones not running at all. The second result
+// reports whether that store holds any container of the project.
+//
+// The comparison is the store's own answer, read from the two things it knows:
+// the image a container runs, and the image a reference resolves to. A
+// container whose reference resolves to nothing here is not behind — no image
+// landed for it, so there is nothing to apply to it, and asking compose for an
+// image this host does not have would fail the step.
+func storeProjectContainersBehind(ctx context.Context, store composeStore, project string) ([]projectContainer, bool, error) {
+	containers, err := storeProjectContainerFacts(ctx, store, project)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(containers) == 0 {
+		return nil, false, nil
+	}
+	behind := make([]projectContainer, 0, len(containers))
+	resolved := make(map[string]string, len(containers))
+	for _, container := range containers {
+		running, err := runStoreCommand(ctx, store, "inspect", "--format", "{{.Image}}", container.id)
+		if err != nil {
+			// The container went away between the listing and this read:
+			// nothing is running it, so nothing is recreated for it.
+			continue
+		}
+		wanted, asked := resolved[container.image]
+		if !asked {
+			out, err := runStoreCommand(ctx, store, "image", "inspect", "--format", "{{.Id}}", container.image)
+			if err != nil {
+				wanted = ""
+			} else {
+				wanted = strings.TrimSpace(string(out))
+			}
+			resolved[container.image] = wanted
+		}
+		if wanted != "" && strings.TrimSpace(string(running)) == wanted && container.state == "running" {
+			continue
+		}
+		behind = append(behind, container)
+	}
+	return behind, true, nil
+}
+
+// composeUpdateRecreate builds the recreate half of a stack update: the
+// containers the pull left behind, recreated by name.
+//
+// The set comes from the project's own containers rather than from the compose
+// file, because which of them the update touches is a fact about this host, not
+// about the declaration. Naming them is what makes the step mean "the
+// containers that changed": `up -d` alone recreates a container only when
+// compose sees the project's configuration change — a new image under the same
+// tag is invisible to podman-compose's config hash — and
+// `up -d --force-recreate` with no service named recreates the whole project,
+// a stack's cache and database included, which no image change asked for.
+//
+// Two answers fall back to that project-wide recreate instead of one built on a
+// guess: a project with no containers in [store] yet, which compose creates
+// rather than recreates, and a container that is behind but whose labels name
+// no service, which no argv can single out. A listing that fails is neither:
+// it stops the update where it stands, because the daemon will not choose what
+// to recreate without knowing what the store holds.
+func (r *nativeOpRunner) composeUpdateRecreate(ctx context.Context, store composeStore, target composeUpdateTarget) ([]opAttempt, error) {
+	wholeProject := func() ([]opAttempt, error) {
+		return r.composeAttempts(ctx, store, target, "up", "-d", "--force-recreate")
+	}
+	behind, present, err := storeProjectContainersBehind(ctx, store, target.Project)
 	if err != nil {
 		return nil, err
 	}
-	matches := make([]containerEntry, 0, len(entries))
-	for _, entry := range entries {
-		if strings.EqualFold(entry.ComposeProject, project) {
-			matches = append(matches, entry)
-		}
+	if !present {
+		return wholeProject()
 	}
-	return matches, nil
+	services := make([]string, 0, len(behind))
+	seen := make(map[string]bool, len(behind))
+	for _, container := range behind {
+		if container.service == "" {
+			return wholeProject()
+		}
+		if seen[container.service] {
+			continue
+		}
+		seen[container.service] = true
+		services = append(services, container.service)
+	}
+	if len(services) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"up", "-d", "--force-recreate"}, services...)
+	return r.composeAttempts(ctx, store, target, args...)
 }
 
 // composeStorePresence is one store that holds containers of a project, with
@@ -1362,7 +1540,40 @@ func (r *nativeOpRunner) runStages(
 		if task != nil {
 			task.stageStarted(stage.label)
 		}
-		stageStdout, stageStderr, exitCode, err := runStage(ctx, stage.attempts, outputSink(task))
+		attempts := stage.attempts
+		if stage.build != nil {
+			built, err := stage.build(ctx)
+			if err != nil {
+				// The step could not even be worked out. Nothing is run in its
+				// place: an operation that cannot say what to do stops with
+				// the reason, rather than doing the wider thing and calling it
+				// a success.
+				appendStageOutput(&stderr, err.Error())
+				if task != nil {
+					task.stageFinished(stage.label, false)
+				}
+				failure = err
+				response.ExitCode = -1
+				break
+			}
+			attempts = built
+		}
+		if len(attempts) == 0 {
+			// A step with nothing to run is a step that did its job: the
+			// stages before it answered the question it exists to ask, and
+			// the run says so instead of recreating something for nothing.
+			if note := strings.TrimSpace(stage.idle); note != "" {
+				appendStageOutput(&stdout, note)
+				if sink := outputSink(task); sink != nil {
+					fmt.Fprintln(sink, note)
+				}
+			}
+			if task != nil {
+				task.stageFinished(stage.label, true)
+			}
+			continue
+		}
+		stageStdout, stageStderr, exitCode, err := runStage(ctx, attempts, outputSink(task))
 		appendStageOutput(&stdout, stageStdout)
 		appendStageOutput(&stderr, stageStderr)
 		if task != nil {

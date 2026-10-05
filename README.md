@@ -921,9 +921,27 @@ configuration the same way the container's creation did.
   device, a sysctl or a network alias is worse than one that was not touched.
   `container.pull` still works for those: pull, then recreate it where its
   lifecycle is declared.
-- `compose.update` is the same two steps for a whole project — every service,
-  no container named. It is the one call behind "upgrade this stack", and it
-  takes its directory from the registry unless the caller sends one.
+- `compose.update` is the same two steps for a whole project — the pull covers
+  every service — but its recreate is decided *after* that pull and names what
+  it recreates. Each container of the project is compared with the image its
+  own reference points at in that store, and the services that moved, plus the
+  containers that are not running, are the ones handed to
+  `up -d --force-recreate <service> …`. A container already running what its
+  reference points at is left alone, so a stack's cache and its database are
+  not bounced because an application image moved; a container whose reference
+  resolves to nothing on the host is not one of them either — no image landed
+  for it, so there is nothing to apply to it. Neither compose tool can make
+  that distinction for the daemon: podman-compose recreates a service only when
+  the project's *configuration* changed, which a new image under the same tag
+  does not, and `--force-recreate` without a service name recreates every
+  container in the project. Two answers fall back to that whole-project
+  recreate rather than one built on a guess: a project this store holds no
+  container of yet, which compose creates rather than recreates, and a
+  container that is behind but whose labels name no service, which no argv can
+  single out. A store that will not say what the project holds is the one case
+  that stops the update instead: the daemon will not recreate a project it
+  cannot list. It is the one call behind "upgrade this stack", and it takes its
+  directory from the registry unless the caller sends one.
 
 Both run under the executor's concurrency slot and audit trail like every other
 native op, with a 5 minute bound (a pull is slow by nature), so they are also

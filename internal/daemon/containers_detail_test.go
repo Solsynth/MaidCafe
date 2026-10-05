@@ -48,10 +48,16 @@ ps)
 	printf '%s\n' '{"ID":"` + containerID + `","Names":["web"],"Image":"nginx:1.25","State":"running","Status":"Up 2 hours","Labels":` + labels + `}'
 	;;
 inspect)
-	printf '%s\n' '{"Id":"` + containerID + `","Image":"` + containerRunningID + `","ImageName":"docker.io/library/nginx:1.25","Config":{"Image":"nginx:1.25","Labels":` + labels + `}}'
+	case "$*" in
+	*'{{.Image}}'*) printf '%s\n' '` + containerRunningID + `' ;;
+	*) printf '%s\n' '{"Id":"` + containerID + `","Image":"` + containerRunningID + `","ImageName":"docker.io/library/nginx:1.25","Config":{"Image":"nginx:1.25","Labels":` + labels + `}}' ;;
+	esac
 	;;
 image)
-	printf '%s\n' '{"Id":"` + containerLocalImageID + `","RepoDigests":["docker.io/library/nginx@` + containerLocalDigest + `"]}'
+	case "$*" in
+	*'{{.Id}}'*) printf '%s\n' '` + containerLocalImageID + `' ;;
+	*) printf '%s\n' '{"Id":"` + containerLocalImageID + `","RepoDigests":["docker.io/library/nginx@` + containerLocalDigest + `"]}' ;;
+	esac
 	;;
 stats)
 	printf '%s\n' '[{"id":"` + containerID + `","name":"web","cpu_percent":"1.50%","mem_usage":"3.092MB / 16.7GB","mem_percent":"0.02%","netio":"1.0kB / 2.0kB","blocki":"0B / 0B","pids":"7"}]'

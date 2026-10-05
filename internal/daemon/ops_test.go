@@ -535,6 +535,199 @@ func TestNativeComposeOpUsesDirectoryAndArgs(t *testing.T) {
 	}
 }
 
+// fakeProjectContainer is one container a fake runtime reports as part of a
+// project: what the store says it is running, and where its image reference
+// points now. Equal IDs mean the container is current.
+type fakeProjectContainer struct {
+	id       string
+	name     string
+	service  string
+	image    string
+	running  string
+	resolves string
+	state    string
+}
+
+// fakeProjectRuntime returns a runtime that lists [containers] as the
+// containers of [project], answers the two reads a stack update compares with —
+// the image a container runs, and the image a reference points at — and records
+// every compose step it is asked to run under FAKE_STORE_CALLS.
+func fakeProjectRuntime(project string, containers []fakeProjectContainer) string {
+	lines := make([]string, 0, len(containers))
+	byID := make([]string, 0, len(containers))
+	byRef := make([]string, 0, len(containers))
+	seen := make(map[string]bool, len(containers))
+	for _, container := range containers {
+		state := container.state
+		if state == "" {
+			state = "running"
+		}
+		lines = append(lines, fmt.Sprintf(
+			`{"Id":%q,"Names":[%q],"Image":%q,"State":%q,"Status":"Up","Labels":{"com.docker.compose.project":%q,"com.docker.compose.service":%q}}`,
+			container.id, container.name, container.image, state, project, container.service))
+		// `inspect --format {{.Image}} <id>`: the image that container runs.
+		byID = append(byID, fmt.Sprintf("%s) printf '%%s\\n' %q ;;", container.id, container.running))
+		if !seen[container.image] {
+			seen[container.image] = true
+			// `image inspect --format {{.Id}} <ref>`: where that reference points.
+			byRef = append(byRef, fmt.Sprintf("%s) printf '%%s\\n' %q ;;", container.image, container.resolves))
+		}
+	}
+	return "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"ps)\n" +
+		"  cat <<'EOF'\n" + strings.Join(lines, "\n") + "\nEOF\n" +
+		"  ;;\n" +
+		"inspect)\n" +
+		"  case \"$4\" in\n" + strings.Join(byID, "\n") + "\n  esac\n" +
+		"  ;;\n" +
+		"image)\n" +
+		"  case \"$5\" in\n" + strings.Join(byRef, "\n") + "\n  esac\n" +
+		"  ;;\n" +
+		"compose)\n" +
+		"  printf 'cwd=%s\\n' \"$PWD\" >> \"$FAKE_STORE_CALLS\"\n" +
+		"  printf 'args=%s\\n' \"$*\" >> \"$FAKE_STORE_CALLS\"\n" +
+		"  ;;\n" +
+		"esac\n"
+}
+
+// composeSteps returns the compose invocations a fake runtime recorded, in
+// order.
+func composeSteps(t *testing.T, path string) []string {
+	t.Helper()
+	steps := make([]string, 0, 2)
+	for _, call := range readCallLog(t, path) {
+		if args, ok := strings.CutPrefix(call, "args="); ok {
+			steps = append(steps, args)
+		}
+	}
+	return steps
+}
+
+// updateStackOn runs one stack update against a fake runtime installed with
+// [containers] as the project's containers.
+func updateStackOn(t *testing.T, calls string, containers []fakeProjectContainer) executionResponse {
+	t.Helper()
+	t.Setenv("FAKE_STORE_CALLS", calls)
+	fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
+	podman := fakeCommand(t, "podman", fakeProjectRuntime("myapp", containers))
+	runner := newTestOpsRunner(t, map[string]string{"podman": podman})
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "compose.update",
+		opParams{target: "myapp", directory: t.TempDir()}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusOK || !response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	return response
+}
+
+// TestComposeUpdateRecreatesOnlyTheContainersThatMoved is the point of the
+// stack update's second half: the pull moves some services' images, and only
+// those are recreated. The stack's cache and database are not bounced because
+// an application image moved.
+func TestComposeUpdateRecreatesOnlyTheContainersThatMoved(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	updateStackOn(t, calls, []fakeProjectContainer{
+		{id: "c-web", name: "myapp_web_1", service: "web", image: "nginx:1.25", running: "sha256:old", resolves: "sha256:new"},
+		{id: "c-db", name: "myapp_db_1", service: "db", image: "postgres:16", running: "sha256:db", resolves: "sha256:db"},
+	})
+	want := []string{"compose -p myapp pull", "compose -p myapp up -d --force-recreate web"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v", got, want)
+	}
+}
+
+// TestComposeUpdateRecreatesAStoppedContainer pins the other half of "which
+// containers an update touches": one that is down is brought up on its image
+// whether or not that image moved, which is what a compose `up` means.
+func TestComposeUpdateRecreatesAStoppedContainer(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	updateStackOn(t, calls, []fakeProjectContainer{
+		{id: "c-web", name: "myapp_web_1", service: "web", image: "nginx:1.25", running: "sha256:same", resolves: "sha256:same", state: "exited"},
+	})
+	want := []string{"compose -p myapp pull", "compose -p myapp up -d --force-recreate web"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v", got, want)
+	}
+}
+
+// TestComposeUpdateRecreatesNothingWhenNothingMoved pins what an up-to-date
+// stack costs: nothing. Pulling is what the caller asked for, and a project
+// whose containers all run the image their references point at has no recreate
+// to run — the stage says so instead of restarting services for no reason.
+func TestComposeUpdateRecreatesNothingWhenNothingMoved(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	response := updateStackOn(t, calls, []fakeProjectContainer{
+		{id: "c-web", name: "myapp_web_1", service: "web", image: "nginx:1.25", running: "sha256:same", resolves: "sha256:same"},
+		{id: "c-db", name: "myapp_db_1", service: "db", image: "postgres:16", running: "sha256:db", resolves: "sha256:db"},
+	})
+	want := []string{"compose -p myapp pull"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v", got, want)
+	}
+	if !strings.Contains(response.Stdout, "nothing to recreate") {
+		t.Fatalf("the run did not say why it recreated nothing: %q", response.Stdout)
+	}
+}
+
+// TestComposeUpdateCreatesAProjectWithNoContainers pins the exception: a
+// project this store holds no container of is created, not compared, so the
+// recreate stays the whole-project one.
+func TestComposeUpdateCreatesAProjectWithNoContainers(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	updateStackOn(t, calls, nil)
+	want := []string{"compose -p myapp pull", "compose -p myapp up -d --force-recreate"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v", got, want)
+	}
+}
+
+// TestComposeUpdateFallsBackToTheWholeProjectWhenAContainerCannotBeNamed pins
+// the other exception: a container that is behind but whose labels name no
+// service cannot be singled out in an argv, and it is not left behind either —
+// compose is handed the whole project instead of a partial list it would
+// silently skip that container from.
+func TestComposeUpdateFallsBackToTheWholeProjectWhenAContainerCannotBeNamed(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	updateStackOn(t, calls, []fakeProjectContainer{
+		{id: "c-web", name: "myapp_web_1", service: "", image: "nginx:1.25", running: "sha256:old", resolves: "sha256:new"},
+	})
+	want := []string{"compose -p myapp pull", "compose -p myapp up -d --force-recreate"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v", got, want)
+	}
+}
+
+// TestComposeUpdateFailsWhenTheStoreCannotBeListed pins the one comparison that
+// is not made on a guess: a store that will not say what the project holds
+// stops the update after its pull, rather than handing compose a recreate the
+// daemon cannot justify.
+func TestComposeUpdateFailsWhenTheStoreCannotBeListed(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("FAKE_STORE_CALLS", calls)
+	fakeCommand(t, "sudo", "#!/bin/sh\nexit 1\n")
+	podman := fakeCommand(t, "podman", "#!/bin/sh\n"+
+		"case \"$1\" in\n"+
+		"ps) exit 1 ;;\n"+
+		"compose) printf 'args=%s\\n' \"$*\" >> \"$FAKE_STORE_CALLS\" ;;\n"+
+		"esac\n")
+	runner := newTestOpsRunner(t, map[string]string{"podman": podman})
+
+	response, status, requestErr := runner.dispatch(
+		context.Background(), "compose.update",
+		opParams{target: "myapp", directory: t.TempDir()}, "test", "tester",
+	)
+	if requestErr != nil || status != http.StatusBadGateway || response.OK {
+		t.Fatalf("status=%d err=%+v resp=%+v", status, requestErr, response)
+	}
+	want := []string{"compose -p myapp pull"}
+	if got := composeSteps(t, calls); !equalStrings(got, want) {
+		t.Fatalf("compose steps = %#v, want %#v (the pull ran, the recreate did not)", got, want)
+	}
+}
+
+// TestNativeOpReport pins the report the cloud lists invocable operations from.
 func TestNativeOpReport(t *testing.T) {
 	report := nativeOpReport()
 	if len(report) != len(config.NativeOpNames) {

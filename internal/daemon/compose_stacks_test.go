@@ -534,11 +534,13 @@ func TestComposeScanAssignsAProjectAndTheContainerUpdateUsesIt(t *testing.T) {
 
 // TestComposeUpdateActionRunsBothStages asserts the stack-level upgrade: one
 // call pulls every service's image and then recreates on it, in the stack's own
-// directory, with no directory from the caller.
+// directory, with no directory from the caller. The recreate names the
+// container the pull left behind — the fake runtime reports one running an
+// image its reference has moved past — instead of recreating the whole project.
 func TestComposeUpdateActionRunsBothStages(t *testing.T) {
 	calls := filepath.Join(t.TempDir(), "calls")
 	t.Setenv("FAKE_RUNTIME_CALLS", calls)
-	fakeRuntimeBinary(t, fakeRuntimeScript(`{"com.docker.compose.project":"myapp"}`))
+	fakeRuntimeBinary(t, fakeRuntimeScript(`{"com.docker.compose.project":"myapp","com.docker.compose.service":"web"}`))
 
 	projectDir := filepath.Join(t.TempDir(), "myapp")
 	writeComposeFile(t, filepath.Join(projectDir, "compose.yaml"),
@@ -566,8 +568,8 @@ func TestComposeUpdateActionRunsBothStages(t *testing.T) {
 	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" pull") {
 		t.Fatalf("no pull stage: %s", recorded)
 	}
-	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" up -d --force-recreate") {
-		t.Fatalf("no recreate stage: %s", recorded)
+	if !strings.Contains(recorded, "compose -p myapp -f "+composeFile+" up -d --force-recreate web") {
+		t.Fatalf("no recreate stage for the container the pull moved: %s", recorded)
 	}
 	if !strings.Contains(recorded, "cwd="+projectDir+" compose ") {
 		t.Fatalf("the upgrade did not run in the stack's directory: %s", recorded)
