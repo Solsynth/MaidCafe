@@ -151,6 +151,11 @@ shells = ["/bin/bash"]
 # env = ["LANG=C.UTF-8"]
 # Browser origins allowed to open the socket (path.Match against the Origin
 # host unless the pattern contains "://"); empty = same-host origins only.
+# This list also decides which origins this daemon answers CORS for on its HTTP
+# API: a browser build reads metrics, containers, files and the event stream
+# over HTTP, and the browser refuses those reads unless the page's origin is
+# named here. An origin named here can already open a shell, so it is not being
+# granted anything the socket did not.
 # allowedOrigins = ["maidkit.solsynth.dev"]
 # Allow sessions from outside loopback/RFC1918/link-local/Tailscale CGNAT.
 # allowRemote = false

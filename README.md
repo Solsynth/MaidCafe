@@ -290,6 +290,61 @@ unwritable path disables it with a warning and never affects execution.
 `GET /api/v1/audit?limit=N` returns the newest entries (default 50, max 500)
 newest first, authenticated with the metrics secret.
 
+### Browser origins and CORS
+
+A browser build has no SSH, so it reaches a host through this daemon — and a
+browser will not let a page *read* an answer from a server that did not name it.
+That rule covers every HTTP read a browser build makes (metrics, the event
+stream, containers, files, the config API), while the WebSocket terminal is not
+policed that way at all. A daemon whose terminal works can therefore look
+unreachable to a browser everywhere else, with the console reporting a
+cross-origin failure rather than any answer from the daemon.
+
+The origins in `daemon.terminal.allowedOrigins` are answered with CORS headers
+here too. One list is deliberate: an origin named there may already open an
+interactive shell on this host, which is strictly more than the control plane
+offers, and an operator who has named the web build once should not have to name
+it twice.
+
+```text
+OPTIONS /api/v1/metrics
+Origin: https://mkw.solsynth.dev
+Access-Control-Request-Method: GET
+Access-Control-Request-Headers: Authorization
+
+204 No Content
+Access-Control-Allow-Origin: https://mkw.solsynth.dev
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Headers: Authorization, Content-Type
+Access-Control-Max-Age: 600
+Vary: Origin
+```
+
+The rules, and what they deliberately do not do:
+
+- The caller's own origin is echoed, never `*`, and
+  `Access-Control-Allow-Credentials` is never sent. Every credential this API
+  takes travels in an `Authorization` header (or a subprotocol token on the
+  socket), so a page cannot ride a session the browser would attach by itself.
+- A header a caller asks for in the preflight is echoed back, so a client header
+  newer than the daemon still works. The default list covers the credential, a
+  JSON body's content type and the two headers a signed action carries.
+- `X-MaidCafe-File-Size` is exposed so a page can read the size of a file it
+  fetched; `Content-Type` and `Content-Length` are readable without being
+  listed.
+- An origin that is not listed gets no headers rather than an error. The browser
+  blocks the read — the intended answer — while a non-browser client, which
+  sends no `Origin` at all, is unaffected.
+- The middleware runs before the credential check, so a wrong secret arrives as
+  a `401` a page can read instead of an opaque cross-origin failure.
+- The list is re-read on every request, so a config reload takes effect without
+  a restart. A reload that *removes* the web build's origin takes the browser's
+  reads away with it.
+
+An origin can also be avoided rather than listed: a reverse proxy that serves
+the web build and the daemon from one origin needs no CORS at all, because the
+browser then treats every request as same-origin.
+
 ### Overview health
 
 `GET /api/v1/health` evaluates the daemon's current metric sample and returns a
@@ -462,7 +517,9 @@ Operator notes:
 - Browser origins must be listed in `daemon.terminal.allowedOrigins`
   (`path.Match` against the `Origin` host, or `scheme://host` when the pattern
   contains `://`); an origin equal to the request host is always allowed, and a
-  request without an `Origin` header (native client, tunnel) always is.
+  request without an `Origin` header (native client, tunnel) always is. The same
+  list decides which origins this daemon answers CORS for on its HTTP API — see
+  [Browser origins and CORS](#browser-origins-and-cors).
 - Sessions are accepted from loopback, RFC1918, link-local and Tailscale
   addresses (`100.64.0.0/10`). `daemon.terminal.allowRemote = true` lifts that
   restriction, and only the TCP peer address is ever inspected —

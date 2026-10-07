@@ -199,6 +199,16 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+	// A browser cannot open a raw socket, so the control plane it reaches is
+	// this HTTP API — and the browser refuses to let a page read an answer from
+	// a server that did not name it. The origins the terminal allowlist names
+	// are answered here too: one list, because an origin trusted with a shell on
+	// this host is trusted with what the API offers. It runs before the
+	// authorizer so a refused credential still arrives as a 401 a page can see,
+	// instead of as an opaque cross-origin failure.
+	router.Use(corsMiddleware(func() config.TerminalConfig {
+		return app.rt.Load().terminal
+	}))
 	authorizeMetrics := func(c *gin.Context) {
 		if !authorizedRequest(c.Request, cfg.MetricsSecret) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "unauthorized"})
