@@ -14,10 +14,17 @@ port = "8080"
 # Replace the example password and connection settings before deployment.
 dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"
 
+[discovery]
+# Blade service registry (DyServiceDiscoveryService). Outbound gRPC
+# dependencies are addressed by logical service name, so no endpoint is
+# configured by hand. The auth service is resolved as `service` below; the
+# cloud dials it over TLS and verifies the fleet certificate.
+target = "blade:7001"
+service = "stargate"
+
 [auth]
-target = "stargate:9090"
-useTLS = true
-tlsSkipVerify = false
+# The fleet serves self-signed certificates on in-network gRPC.
+tlsSkipVerify = true
 
 [workspace]
 # WattEngine workspace service (DyWorkspaceService). Daemons belong to a

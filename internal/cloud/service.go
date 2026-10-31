@@ -57,18 +57,16 @@ type AccountClient interface {
 }
 
 // NewAccountClient dials the account service hosted alongside authentication.
-func NewAccountClient(cfg config.AuthConfig) (AccountClient, *grpc.ClientConn, error) {
-	target, useTLS := dyauth.NormalizeAuthGRPCTarget(cfg.Target, cfg.UseTLS)
+// target is a gRPC target, normally the blade:/// registry name.
+func NewAccountClient(target string, tlsSkipVerify bool) (AccountClient, *grpc.ClientConn, error) {
 	if strings.TrimSpace(target) == "" {
 		return nil, nil, errors.New("account gRPC target is empty")
 	}
-	var transportCredentials credentials.TransportCredentials
-	if useTLS {
-		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSSkipVerify})
-	} else {
-		transportCredentials = insecure.NewCredentials()
-	}
-	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(transportCredentials))
+	transportCredentials := credentials.NewTLS(&tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: tlsSkipVerify, // #nosec G402 -- explicitly configured for internal deployments.
+	})
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial account service: %w", err)
 	}

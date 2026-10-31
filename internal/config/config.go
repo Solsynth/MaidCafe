@@ -24,11 +24,22 @@ type Config struct {
 	HTTP      HTTPConfig      `mapstructure:"http"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Auth      AuthConfig      `mapstructure:"auth"`
+	Discovery DiscoveryConfig `mapstructure:"discovery"`
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
 	Eventbus  EventbusConfig  `mapstructure:"eventbus"`
 	Ring      RingConfig      `mapstructure:"ring"`
 	Cloud     CloudConfig     `mapstructure:"cloud"`
 	Daemon    DaemonConfig    `mapstructure:"daemon"`
+}
+
+// DiscoveryConfig points the cloud at Blade's service registry. The auth
+// service (Stargate) is resolved by logical service name instead of a
+// hand-written endpoint.
+type DiscoveryConfig struct {
+	Target string `mapstructure:"target"`
+	// Service is the registry name Stargate registers under; empty falls back
+	// to "stargate".
+	Service string `mapstructure:"service"`
 }
 
 type CloudConfig struct {
@@ -58,10 +69,12 @@ type HTTPConfig struct {
 type DatabaseConfig struct {
 	DSN string `mapstructure:"dsn"`
 }
+
+// AuthConfig holds no endpoint: the auth service is resolved through Blade.
+// TLSSkipVerify stays because the fleet serves self-signed certificates on
+// in-network gRPC.
 type AuthConfig struct {
-	Target        string `mapstructure:"target"`
-	UseTLS        bool   `mapstructure:"useTLS"`
-	TLSSkipVerify bool   `mapstructure:"tlsSkipVerify"`
+	TLSSkipVerify bool `mapstructure:"tlsSkipVerify"`
 }
 type WorkspaceConfig struct {
 	Target        string `mapstructure:"target"`
@@ -828,9 +841,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("app.name", "MaidCafe")
 	viper.SetDefault("http.port", "8080")
 	viper.SetDefault("database.dsn", "")
-	viper.SetDefault("auth.target", "")
-	viper.SetDefault("auth.useTLS", true)
-	viper.SetDefault("auth.tlsSkipVerify", false)
+	viper.SetDefault("discovery.target", "")
+	viper.SetDefault("discovery.service", "stargate")
+	viper.SetDefault("auth.tlsSkipVerify", true)
 	viper.SetDefault("workspace.target", "")
 	viper.SetDefault("workspace.useTLS", true)
 	viper.SetDefault("workspace.tlsSkipVerify", false)
@@ -1208,8 +1221,9 @@ func loadLogAlertFragment(path string) (LogAlertConfig, error) {
 
 func applyEnvAliases() {
 	aliases := map[string]string{
-		"AUTH_TARGET": "auth.target", "AUTH_USE_TLS": "auth.useTLS", "AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
-		"WORKSPACE_TARGET": "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
+		"DISCOVERY_TARGET": "discovery.target", "DISCOVERY_SERVICE": "discovery.service",
+		"AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
+		"WORKSPACE_TARGET":     "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
 		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
 		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_DAEMON_DISCONNECT_NOTIFICATION_COOLDOWN": "cloud.daemonDisconnectNotificationCooldown", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
@@ -1247,8 +1261,11 @@ func (c *Config) ValidateCloud() error {
 	if strings.TrimSpace(c.Database.DSN) == "" {
 		return fmt.Errorf("database.dsn is required in cloud mode")
 	}
-	if strings.TrimSpace(c.Auth.Target) == "" {
-		return fmt.Errorf("auth.target is required in cloud mode")
+	if strings.TrimSpace(c.Discovery.Target) == "" {
+		return fmt.Errorf("discovery.target is required in cloud mode")
+	}
+	if strings.TrimSpace(c.Discovery.Service) == "" {
+		return fmt.Errorf("discovery.service is required in cloud mode")
 	}
 	if strings.TrimSpace(c.Workspace.Target) == "" {
 		return fmt.Errorf("workspace.target is required in cloud mode")

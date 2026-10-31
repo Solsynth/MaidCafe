@@ -13,6 +13,7 @@ import (
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
+	"src.solsynth.dev/solsynth/maidcafe/internal/discovery"
 	"src.solsynth.dev/solsynth/maidcafe/internal/eventbus"
 	"src.solsynth.dev/solsynth/maidcafe/internal/ring"
 	"src.solsynth.dev/solsynth/maidcafe/internal/server"
@@ -40,15 +41,23 @@ func main() {
 		log.Fatal().Err(err).Msg("migrate database")
 	}
 
+	resolver, err := discovery.NewResolver(cfg.Discovery.Target)
+	if err != nil {
+		log.Fatal().Err(err).Msg("initialize service discovery")
+	}
+	defer resolver.Close()
+	discovery.RegisterResolver(resolver)
+	authTarget := discovery.Target(cfg.Discovery.Service)
+
 	authenticator, err := dyauth.NewGrpcTokenAuthenticator(dyauth.GrpcAuthDialConfig{
-		Target:        cfg.Auth.Target,
-		UseTLS:        cfg.Auth.UseTLS,
+		Target:        authTarget,
+		UseTLS:        true,
 		TLSSkipVerify: cfg.Auth.TLSSkipVerify,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize auth")
 	}
-	accounts, accountConn, err := cloud.NewAccountClient(cfg.Auth)
+	accounts, accountConn, err := cloud.NewAccountClient(authTarget, cfg.Auth.TLSSkipVerify)
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize account client")
 	}

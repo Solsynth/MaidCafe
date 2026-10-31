@@ -1250,7 +1250,8 @@ Configuration is typed TOML loaded through Viper and can also be selected with
 Cloud requires:
 
 - `database.dsn`
-- `auth.target`
+- `discovery.target` (Blade service registry; the auth service is resolved
+  through it under `discovery.service`, default `stargate`)
 - `workspace.target`
 - `http.port` (default `8080`)
 
@@ -1306,7 +1307,8 @@ docker run --rm \
 
 For PostgreSQL plus the cloud service, copy
 [`docker-compose.example.yml`](docker-compose.example.yml), then replace the
-example database credentials and Solar auth target.
+example database credentials and point `discovery.target` at the fleet's Blade
+registry.
 
 ## Daemon deployment with systemd
 
