@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -59,6 +60,11 @@ const (
 	terminalPendingLimit = 8
 )
 
+// cloudTmuxName mirrors the daemon's own tmux session name rule. The name is
+// only stored and forwarded here, but rejecting a bad one at creation keeps
+// the daemon from having to say no after the browser already has a ticket.
+var cloudTmuxName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$`)
+
 // TerminalTicket is the one-time credential a browser uses to open its
 // session socket. The plain ticket is returned once; only its hash is stored.
 type TerminalTicket struct {
@@ -69,13 +75,16 @@ type TerminalTicket struct {
 }
 
 // TerminalSessionView is the admin/daemon-visible view of a session. It never
-// carries PTY bytes or the ticket.
+// carries PTY bytes or the ticket. Tmux names the tmux session the daemon
+// attaches to (empty for a bare shell), and rides the pickup payload so a
+// relayed session reattaches to the same session by name.
 type TerminalSessionView struct {
 	ID        string     `json:"id"`
 	DaemonID  string     `json:"daemon_id"`
 	InvokedBy string     `json:"invoked_by"`
 	Shell     string     `json:"shell"`
 	User      string     `json:"user"`
+	Tmux      string     `json:"tmux"`
 	Cols      int        `json:"cols"`
 	Rows      int        `json:"rows"`
 	Status    string     `json:"status"`
@@ -103,6 +112,7 @@ func viewTerminalSession(row database.TerminalSession) TerminalSessionView {
 		InvokedBy: row.InvokedBy,
 		Shell:     row.Shell,
 		User:      row.User,
+		Tmux:      row.Tmux,
 		Cols:      row.Columns,
 		Rows:      row.Rows,
 		Status:    row.Status,
@@ -148,8 +158,10 @@ func (s *Service) wakeTerminalWaiters(daemonID string) {
 
 // CreateTerminalSession mints a ticket for an interactive shell on
 // [daemonID]. It enforces the workspace concurrency cap and requires the
-// daemon to have opted in with terminal_relay_enabled.
-func (s *Service) CreateTerminalSession(ctx context.Context, accountID, daemonID, invokedBy, shell, user string, cols, rows int) (TerminalTicket, error) {
+// daemon to have opted in with terminal_relay_enabled. A non-empty [tmux] asks
+// the daemon to attach that tmux session instead of starting a bare shell, so
+// the process tree outlives the relayed socket.
+func (s *Service) CreateTerminalSession(ctx context.Context, accountID, daemonID, invokedBy, shell, user, tmux string, cols, rows int) (TerminalTicket, error) {
 	d, err := s.daemonForAccount(ctx, accountID, daemonID)
 	if err != nil {
 		return TerminalTicket{}, err
@@ -165,11 +177,18 @@ func (s *Service) CreateTerminalSession(ctx context.Context, accountID, daemonID
 	}
 	shell = strings.TrimSpace(shell)
 	user = strings.TrimSpace(user)
+	tmux = strings.TrimSpace(tmux)
 	if len(shell) > 1024 {
 		return TerminalTicket{}, fmt.Errorf("shell must be at most 1024 bytes")
 	}
 	if len(user) > 64 {
 		return TerminalTicket{}, fmt.Errorf("user must be at most 64 bytes")
+	}
+	if len(tmux) > 64 {
+		return TerminalTicket{}, fmt.Errorf("tmux must match [A-Za-z0-9][A-Za-z0-9_.-]{0,39}")
+	}
+	if tmux != "" && !cloudTmuxName.MatchString(tmux) {
+		return TerminalTicket{}, fmt.Errorf("tmux must match [A-Za-z0-9][A-Za-z0-9_.-]{0,39}")
 	}
 
 	quotas, err := s.workspaceQuota(ctx, d.WorkspaceID)
@@ -203,6 +222,7 @@ func (s *Service) CreateTerminalSession(ctx context.Context, accountID, daemonID
 		InvokedBy:   invokedBy,
 		Shell:       shell,
 		User:        user,
+		Tmux:        tmux,
 		Columns:     cols,
 		Rows:        rows,
 		TicketHash:  hashTerminalTicket(ticket),

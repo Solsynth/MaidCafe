@@ -123,7 +123,7 @@ func TestRelayedTerminalEndToEnd(t *testing.T) {
 		<-appDone
 	}()
 
-	ticket, err := svc.CreateTerminalSession(ctx, accountID, credential.ID, identity, "", "", 120, 36)
+	ticket, err := svc.CreateTerminalSession(ctx, accountID, credential.ID, identity, "", "", "", 120, 36)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,12 +31,15 @@ const terminalRelayDialTimeout = 15 * time.Second
 // terminalRelaySession is one session the cloud handed over in a pickup. Its
 // JSON names are the cloud's frozen pickup payload, so the two sides agree on
 // the wire shape without either parsing PTY bytes.
+// Tmux is the session name to attach to, empty for a bare shell. The cloud
+// carries it as a name only; it never proxies tmux itself.
 type terminalRelaySession struct {
 	ID        string `json:"id"`
 	Shell     string `json:"shell"`
 	User      string `json:"user"`
 	Cols      int    `json:"cols"`
 	Rows      int    `json:"rows"`
+	Tmux      string `json:"tmux"`
 	InvokedBy string `json:"invoked_by"`
 	CreatedAt string `json:"created_at"`
 }
@@ -165,6 +168,7 @@ func (r *terminalRelay) serve(ctx context.Context, handed terminalRelaySession) 
 		User:  handed.User,
 		Cols:  handed.Cols,
 		Rows:  handed.Rows,
+		Tmux:  handed.Tmux,
 	})
 	switch {
 	case errors.Is(err, errTerminalShellNotAllowed):
@@ -172,6 +176,9 @@ func (r *terminalRelay) serve(ctx context.Context, handed terminalRelaySession) 
 		return
 	case errors.Is(err, errTerminalUserNotAllowed):
 		reject(websocket.StatusPolicyViolation, "terminal user not allowed")
+		return
+	case errors.Is(err, errTerminalTmuxInvalid):
+		reject(websocket.StatusPolicyViolation, "terminal tmux name is invalid")
 		return
 	case err != nil:
 		reject(websocket.StatusPolicyViolation, err.Error())

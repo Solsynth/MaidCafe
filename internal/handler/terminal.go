@@ -394,6 +394,7 @@ func createTerminalSession(svc *cloud.Service) gin.HandlerFunc {
 		var in struct {
 			Shell string `json:"shell"`
 			User  string `json:"user"`
+			Tmux  string `json:"tmux"`
 			Cols  int    `json:"cols"`
 			Rows  int    `json:"rows"`
 		}
@@ -408,7 +409,7 @@ func createTerminalSession(svc *cloud.Service) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "rows must be between 0 and 500"})
 			return
 		}
-		out, err := svc.CreateTerminalSession(c.Request.Context(), accountID(c), c.Param("id"), "@"+userHandle(c), in.Shell, in.User, in.Cols, in.Rows)
+		out, err := svc.CreateTerminalSession(c.Request.Context(), accountID(c), c.Param("id"), "@"+userHandle(c), in.Shell, in.User, in.Tmux, in.Cols, in.Rows)
 		if err != nil {
 			if errors.Is(err, cloud.ErrForbidden) || errors.Is(err, cloud.ErrNotFound) || errors.Is(err, cloud.ErrRateLimited) {
 				serviceStatus(c, err)

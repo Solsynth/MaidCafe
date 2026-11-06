@@ -180,6 +180,7 @@ type TerminalSession struct {
 	InvokedBy   string `gorm:"size:191"` // handle shown in the daemon audit log
 	Shell       string `gorm:"size:1024"`
 	User        string `gorm:"size:64"`
+	Tmux        string `gorm:"size:64"` // tmux session name, empty for a bare shell
 	Columns     int
 	Rows        int
 	TicketHash  string `gorm:"size:64;not null;index" json:"-"`

@@ -43,6 +43,10 @@ type terminalHelloFrame struct {
 	User    string `json:"user"`
 	Cols    int    `json:"cols"`
 	Rows    int    `json:"rows"`
+	// Tmux names the tmux session this client is attached to, empty for a bare
+	// login shell. A control-mode client checks it to confirm it attached to
+	// the session it asked for.
+	Tmux string `json:"tmux,omitempty"`
 }
 
 // terminalExitFrame reports why the session ended. Reason is empty for a
@@ -173,8 +177,17 @@ func (a *App) handleTerminal(c *gin.Context) {
 	case errors.Is(err, errTerminalUserNotAllowed):
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"ok": false, "error": "terminal user not allowed"})
 		return
+	case errors.Is(err, errTerminalTmuxInvalid):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"ok": false, "error": "terminal tmux name is invalid"})
+		return
 	case err != nil:
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error()})
+		return
+	}
+	// A control-mode session needs tmux on this host. Refusing before the
+	// upgrade gives the client a plain HTTP answer instead of an in-band frame.
+	if request.Tmux != "" && !terminalTmuxInstalled() {
+		c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{"ok": false, "error": errTerminalTmuxUnavailable.Error()})
 		return
 	}
 	if a.terminal.Count() >= terminalSessionCap(policy) {
@@ -222,6 +235,7 @@ func terminalPump(ctx context.Context, session *terminalSession, conn terminalCo
 		User:    terminalSessionUser(session),
 		Cols:    session.Cols(),
 		Rows:    session.Rows(),
+		Tmux:    session.Tmux(),
 	})
 	ping := time.NewTicker(terminalPingInterval)
 	defer ping.Stop()
@@ -458,6 +472,7 @@ func terminalQueryRequest(c *gin.Context) (terminalRequest, int, error) {
 	request := terminalRequest{
 		Shell: strings.TrimSpace(c.Query("shell")),
 		User:  strings.TrimSpace(c.Query("user")),
+		Tmux:  strings.TrimSpace(c.Query("tmux")),
 	}
 	cols, err := terminalQueryDimension(c.Query("cols"), terminalMinCols, terminalMaxCols)
 	if err != nil {

@@ -85,7 +85,7 @@ func (h *terminalHarness) wsURL(path string) string {
 
 func (h *terminalHarness) mint(t *testing.T) cloud.TerminalTicket {
 	t.Helper()
-	ticket, err := h.svc.CreateTerminalSession(context.Background(), "account-a", h.daemon.ID, "@alice", "/bin/sh", "", 120, 40)
+	ticket, err := h.svc.CreateTerminalSession(context.Background(), "account-a", h.daemon.ID, "@alice", "/bin/sh", "", "", 120, 40)
 	if err != nil {
 		t.Fatal(err)
 	}

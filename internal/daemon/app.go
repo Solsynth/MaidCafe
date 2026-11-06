@@ -243,6 +243,11 @@ func NewApp(cfg config.DaemonConfig, logger *slog.Logger) (*App, error) {
 	// arrive as a Sec-WebSocket-Protocol token instead and the metrics
 	// middleware would reject it before the token is read.
 	router.GET("/api/v1/terminal", app.handleTerminal)
+	// Background tmux sessions. These are plain HTTP, so they authenticate on
+	// the bearer header inside the handler with the terminal's own credential;
+	// the metrics middleware would only accept the metrics secret.
+	router.GET("/api/v1/terminal/sessions", app.handleTerminalSessions)
+	router.DELETE("/api/v1/terminal/sessions/:name", app.handleTerminalSessionKill)
 	router.GET("/api/v1/metrics/history", authorizeMetrics, func(c *gin.Context) {
 		parseTime := func(name string) (*time.Time, error) {
 			raw := strings.TrimSpace(c.Query(name))

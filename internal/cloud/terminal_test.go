@@ -28,7 +28,7 @@ func TestTerminalTicketMintAndAuthenticate(t *testing.T) {
 	ctx := context.Background()
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "/bin/bash", "deploy", 120, 36)
+	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "/bin/bash", "deploy", "", 120, 36)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestTerminalTicketRejections(t *testing.T) {
 	ctx := context.Background()
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestTerminalTicketRejections(t *testing.T) {
 		t.Fatalf("re-used ticket: %v", err)
 	}
 
-	second, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	second, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestTerminalSessionAuthorization(t *testing.T) {
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
 	// A non-member of the daemon's workspace cannot open a session.
-	if _, err := svc.CreateTerminalSession(ctx, "account-b", daemon.ID, "@bob", "", "", 0, 0); !errors.Is(err, ErrForbidden) {
+	if _, err := svc.CreateTerminalSession(ctx, "account-b", daemon.ID, "@bob", "", "", "", 0, 0); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("non-member: %v", err)
 	}
 
@@ -109,12 +109,12 @@ func TestTerminalSessionAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", plain.ID, "@alice", "", "", 0, 0); !errors.Is(err, ErrForbidden) {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", plain.ID, "@alice", "", "", "", 0, 0); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("relay disabled: %v", err)
 	}
 
 	// Unknown daemon.
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", "missing", "@alice", "", "", 0, 0); !errors.Is(err, ErrNotFound) {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", "missing", "@alice", "", "", "", 0, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown daemon: %v", err)
 	}
 }
@@ -126,10 +126,10 @@ func TestTerminalWorkspaceCap(t *testing.T) {
 	workspaces.quotas = map[string]map[string]int64{"ws-a": {"max_daemons": 10, terminalQuotaKey: 1}}
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); err != nil {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); !errors.Is(err, ErrRateLimited) {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("cap not enforced: %v", err)
 	}
 }
@@ -141,11 +141,11 @@ func TestTerminalWorkspaceCapDefault(t *testing.T) {
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
 	for i := range terminalDefaultWorkspaceSessions {
-		if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); err != nil {
+		if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); err != nil {
 			t.Fatalf("session %d: %v", i, err)
 		}
 	}
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); !errors.Is(err, ErrRateLimited) {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("default cap not enforced: %v", err)
 	}
 }
@@ -156,7 +156,7 @@ func TestTerminalPickupLeaseAndReclaim(t *testing.T) {
 	ctx := context.Background()
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "/bin/sh", "", 0, 0)
+	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "/bin/sh", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestTerminalAgentAttachAndFinish(t *testing.T) {
 	ctx := context.Background()
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestTerminalCloseSession(t *testing.T) {
 	ctx := context.Background()
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 
-	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	ticket, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestSweepTerminalSessions(t *testing.T) {
 	daemon := relayDaemon(t, svc, "account-a", "ws-a", "host")
 	now := time.Now().UTC()
 
-	stale, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	stale, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,12 +268,12 @@ func TestSweepTerminalSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fresh, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	fresh, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	old, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	old, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestSweepFailsStaleActiveSessions(t *testing.T) {
 
 	// A live session whose sockets died without either side reporting it would
 	// otherwise hold a workspace session slot forever.
-	abandoned, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	abandoned, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestSweepFailsStaleActiveSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	running, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0)
+	running, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestTerminalWait(t *testing.T) {
 	parked := svc.TerminalWait(daemon.ID)
 	go func() { done <- parked(ctx, 5*time.Second) }()
 	time.Sleep(20 * time.Millisecond)
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); err != nil {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -396,7 +396,7 @@ func TestTerminalWait(t *testing.T) {
 	// create leaves behind making that park return at once instead of holding
 	// the whole poll interval.
 	registered := svc.TerminalWait(daemon.ID)
-	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", 0, 0); err != nil {
+	if _, err := svc.CreateTerminalSession(ctx, "account-a", daemon.ID, "@alice", "", "", "", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	start = time.Now()

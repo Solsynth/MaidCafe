@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,7 +45,13 @@ var (
 	errTerminalShellNotAllowed = errors.New("terminal shell not allowed")
 	errTerminalUserNotAllowed  = errors.New("terminal user not allowed")
 	errTerminalTooMany         = errors.New("too many terminal sessions")
+	errTerminalTmuxInvalid     = errors.New("terminal tmux name is invalid")
+	errTerminalTmuxUnavailable = errors.New("tmux is not installed on this host")
 )
+
+// terminalTmuxName constrains a requested tmux session name. The name reaches
+// tmux as its own argv entry, so it is validated rather than escaped.
+var terminalTmuxName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$`)
 
 // Fixed terminal close reasons. They land in the audit entry's error field and
 // in the exit frame, so a client can tell a normal shell exit (empty reason)
@@ -65,6 +72,11 @@ type terminalRequest struct {
 	User  string // empty = the daemon's own account
 	Cols  int
 	Rows  int
+	// Tmux, when set, runs the session as a tmux control-mode client attached
+	// to that session name instead of as a bare login shell. The session, not
+	// the PTY, owns the process tree: the client detaching or dying leaves it
+	// running.
+	Tmux string
 }
 
 // terminalSession is one live shell attached to a PTY master. The PTY reader
@@ -75,6 +87,9 @@ type terminalSession struct {
 	remote string
 	shell  string
 	user   string
+	// tmux is the tmux session name this client is attached to, or "" for a
+	// bare login shell.
+	tmux string
 
 	cmd     *exec.Cmd
 	pty     *os.File
@@ -162,6 +177,9 @@ func (m *terminalManager) Resolve(policy config.TerminalConfig, req terminalRequ
 			return req, errTerminalUserNotAllowed
 		}
 	}
+	if req.Tmux != "" && !terminalTmuxName.MatchString(req.Tmux) {
+		return req, errTerminalTmuxInvalid
+	}
 	if req.Cols == 0 {
 		req.Cols = terminalDefaultCols
 	}
@@ -179,7 +197,10 @@ func (m *terminalManager) Open(policy config.TerminalConfig, req terminalRequest
 	if len(m.sessions) >= terminalSessionCap(policy) {
 		return nil, errTerminalTooMany
 	}
-	cmd := buildTerminalCommand(policy, req)
+	cmd, err := buildTerminalCommand(policy, req)
+	if err != nil {
+		return nil, err
+	}
 	master, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(req.Rows), Cols: uint16(req.Cols)})
 	if err != nil {
 		if errors.Is(err, pty.ErrUnsupported) {
@@ -193,6 +214,7 @@ func (m *terminalManager) Open(policy config.TerminalConfig, req terminalRequest
 		remote:   remote,
 		shell:    req.Shell,
 		user:     req.User,
+		tmux:     req.Tmux,
 		cmd:      cmd,
 		pty:      master,
 		manager:  m,
@@ -251,8 +273,14 @@ func (m *terminalManager) CloseAll() {
 // buildTerminalCommand mirrors buildRunCommand: the shell runs directly for
 // the daemon's own account and through `sudo -H -u <user>` otherwise, with
 // KEY=VALUE entries passed as sudo assignments so env_reset still applies.
-// No caller input reaches argv.
-func buildTerminalCommand(policy config.TerminalConfig, req terminalRequest) *exec.Cmd {
+// No caller input reaches argv: the shell comes from the policy allowlist and
+// the tmux name is validated against terminalTmuxName before it gets here.
+//
+// A tmux request runs `tmux -CC new-session -A -s <name>` instead of a login
+// shell. `-A` attaches when the session exists and creates it otherwise, and
+// `-CC` turns the client into a control-mode one whose notifications a client
+// can project as its own panes.
+func buildTerminalCommand(policy config.TerminalConfig, req terminalRequest) (*exec.Cmd, error) {
 	cwd := policy.Cwd
 	if cwd == "" {
 		if req.User == "" {
@@ -265,17 +293,29 @@ func buildTerminalCommand(policy config.TerminalConfig, req terminalRequest) *ex
 		cwd = "/"
 	}
 	env := append([]string{"TERM=xterm-256color"}, policy.Env...)
+	argv := []string{req.Shell, "-l"}
+	if req.Tmux != "" {
+		bin, err := exec.LookPath("tmux")
+		if err != nil {
+			return nil, errTerminalTmuxUnavailable
+		}
+		argv = []string{bin, "-CC", "new-session", "-A", "-s", req.Tmux}
+		// The session's first window starts where the shell would have.
+		if policy.Cwd != "" {
+			argv = append(argv, "-c", policy.Cwd)
+		}
+	}
 	if req.User == "" {
-		cmd := exec.Command(req.Shell, "-l")
+		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Dir = cwd
 		cmd.Env = append(os.Environ(), env...)
-		return cmd
+		return cmd, nil
 	}
-	argv := append([]string{"sudo", "-H", "-u", req.User}, env...)
-	argv = append(argv, req.Shell, "-l")
-	cmd := exec.Command(argv[0], argv[1:]...)
+	wrapped := append([]string{"sudo", "-H", "-u", req.User}, env...)
+	wrapped = append(wrapped, argv...)
+	cmd := exec.Command(wrapped[0], wrapped[1:]...)
 	cmd.Dir = cwd
-	return cmd
+	return cmd, nil
 }
 
 // currentTerminalUser names the account a session without a run-as user runs
@@ -290,6 +330,9 @@ func currentTerminalUser() string {
 func (s *terminalSession) ID() string    { return s.id }
 func (s *terminalSession) Shell() string { return s.shell }
 func (s *terminalSession) User() string  { return s.user }
+
+// Tmux is the tmux session this client is attached to, or "" for a bare shell.
+func (s *terminalSession) Tmux() string { return s.tmux }
 
 func (s *terminalSession) Cols() int {
 	s.mu.Lock()
