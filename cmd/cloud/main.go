@@ -13,11 +13,11 @@ import (
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
-	"src.solsynth.dev/solsynth/maidcafe/internal/discovery"
 	"src.solsynth.dev/solsynth/maidcafe/internal/eventbus"
 	"src.solsynth.dev/solsynth/maidcafe/internal/ring"
 	"src.solsynth.dev/solsynth/maidcafe/internal/server"
-	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
+	dyauth "src.solsynth.dev/sosys/lighthouse/shared/pkg/auth"
+	"src.solsynth.dev/sosys/lighthouse/shared/platform/discovery"
 )
 
 func main() {
@@ -41,11 +41,17 @@ func main() {
 		log.Fatal().Err(err).Msg("migrate database")
 	}
 
-	resolver, err := discovery.NewResolver(cfg.Discovery.Target)
+	// files is the fleet certificate material every outbound dial presents:
+	// the CA bundle verifies peers, the client certificate satisfies services
+	// that enforce mutual TLS.
+	files := cfg.ClientFiles()
+
+	provider, err := discovery.NewRemoteProvider(cfg.Discovery.Target, files)
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize service discovery")
 	}
-	defer resolver.Close()
+	defer provider.Close()
+	resolver := discovery.NewResolver(provider, nil)
 	discovery.RegisterResolver(resolver)
 	authTarget := discovery.Target(cfg.Discovery.Service)
 
@@ -53,17 +59,20 @@ func main() {
 		Target:        authTarget,
 		UseTLS:        true,
 		TLSSkipVerify: cfg.Auth.TLSSkipVerify,
+		CAFile:        files.CAFile,
+		CertFile:      files.CertFile,
+		KeyFile:       files.KeyFile,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize auth")
 	}
-	accounts, accountConn, err := cloud.NewAccountClient(authTarget, cfg.Auth.TLSSkipVerify)
+	accounts, accountConn, err := cloud.NewAccountClient(authTarget, cfg.Auth.TLSSkipVerify, files)
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize account client")
 	}
 	defer accountConn.Close()
 
-	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(cfg.Workspace)
+	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(cfg.Workspace, files)
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize workspace client")
 	}
@@ -82,6 +91,7 @@ func main() {
 			cfg.Ring.Target,
 			cfg.Ring.UseTLS,
 			cfg.Ring.TLSSkipVerify,
+			files,
 		)
 		if err != nil {
 			log.Fatal().Err(err).Msg("initialize Metoer push client")

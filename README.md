@@ -1255,6 +1255,22 @@ Cloud requires:
 - `workspace.target`
 - `http.port` (default `8080`)
 
+Cloud gRPC is mutual TLS. The fleet's inbound gRPC listeners (Stargate,
+Valve, Metoer, Blade discovery) require a client certificate signed by the
+fleet CA, so the cloud must present one:
+
+- `grpc.caFile` — the fleet CA bundle; also enables peer verification
+- `grpc.clientCertFile` / `grpc.clientKeyFile` — the certificate and key the
+  cloud presents, together or not at all
+- `GRPC_CA_FILE`, `GRPC_CLIENT_CERT_FILE`, `GRPC_CLIENT_KEY_FILE` — the same
+  three paths from the environment, used when the `[grpc]` block is empty
+
+With no CA configured, dials skip verification: that keeps a self-signed
+deployment reachable but leaves it unauthenticated, and the fleet's
+`clientCAFile` will reject it. `auth.tlsSkipVerify`, `workspace.tlsSkipVerify`
+and `ring.tlsSkipVerify` only exist to drop verification again; leave them
+false once a CA is mounted. A bare `host:port` gRPC target defaults to TLS.
+
 Daemon requires:
 
 - `daemon.id`
@@ -1309,6 +1325,23 @@ For PostgreSQL plus the cloud service, copy
 [`docker-compose.example.yml`](docker-compose.example.yml), then replace the
 example database credentials and point `discovery.target` at the fleet's Blade
 registry.
+
+The cloud needs the fleet certificate material at runtime. Mount it and point
+the environment at it (or set the `[grpc]` paths in the config):
+
+```sh
+docker run --rm \
+  -p 8080:8080 \
+  -v "$PWD/config.cloud.toml:/etc/maidcafe/config.toml:ro" \
+  -v "$PWD/Keys:/keys:ro" \
+  -e CONFIG_PATH=/etc/maidcafe/config.toml \
+  -e GRPC_CA_FILE=/keys/ca.crt \
+  -e GRPC_CLIENT_CERT_FILE=/keys/maidcafe.crt \
+  -e GRPC_CLIENT_KEY_FILE=/keys/maidcafe.key \
+  maidcafe-cloud
+```
+
+The same three files must be readable by whatever runs the compose example.
 
 ## Daemon deployment with systemd
 

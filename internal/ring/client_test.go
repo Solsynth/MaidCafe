@@ -9,7 +9,8 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
-	gen "src.solsynth.dev/sosys/go/proto"
+	"src.solsynth.dev/sosys/lighthouse/shared/platform/grpctls"
+	gen "src.solsynth.dev/sosys/lighthouse/shared/proto"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 )
@@ -39,7 +40,7 @@ func TestPublishSendsMetoerNotification(t *testing.T) {
 	defer grpcServer.Stop()
 	defer listener.Close()
 
-	client, err := NewClient(listener.Addr().String(), false, false)
+	client, err := NewClient(listener.Addr().String(), false, false, grpctls.Files{})
 	if err != nil {
 		t.Fatal(err)
 	}

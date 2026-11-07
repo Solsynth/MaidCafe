@@ -8,7 +8,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
-	shared "src.solsynth.dev/sosys/go/pkg/eventbus"
+	shared "src.solsynth.dev/sosys/lighthouse/shared/pkg/eventbus"
 )
 
 // Bus is nil-safe and only used for cloud push fan-out.

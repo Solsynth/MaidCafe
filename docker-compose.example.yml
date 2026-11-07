@@ -4,8 +4,14 @@ services:
       context: .
     environment:
       CONFIG_PATH: /etc/maidcafe/config.toml
+      # Fleet certificate material; the fleet's gRPC listeners require a
+      # client certificate signed by the fleet CA.
+      GRPC_CA_FILE: /keys/ca.crt
+      GRPC_CLIENT_CERT_FILE: /keys/maidcafe.crt
+      GRPC_CLIENT_KEY_FILE: /keys/maidcafe.key
     volumes:
       - ./config.cloud.toml:/etc/maidcafe/config.toml:ro
+      - ./Keys:/keys:ro
     ports:
       - "8080:8080"
     depends_on:

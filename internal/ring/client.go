@@ -3,16 +3,15 @@ package ring
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	gen "src.solsynth.dev/sosys/go/proto"
+	"src.solsynth.dev/sosys/lighthouse/shared/platform/grpctls"
+	gen "src.solsynth.dev/sosys/lighthouse/shared/proto"
 
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
+	"src.solsynth.dev/solsynth/maidcafe/internal/grpctl"
 )
 
 const maidKitAppID = "dev.solsynth.maid"
@@ -23,20 +22,13 @@ type Client struct {
 	client gen.DyRingServiceClient
 }
 
-func NewClient(target string, useTLS, tlsSkipVerify bool) (*Client, error) {
+// NewClient dials Metoer's push service. files carries the fleet CA bundle and
+// the certificate this cloud presents to peers enforcing mutual TLS.
+func NewClient(target string, useTLS, tlsSkipVerify bool, files grpctls.Files) (*Client, error) {
 	if strings.TrimSpace(target) == "" {
 		return nil, fmt.Errorf("ring target is required")
 	}
-	var transport credentials.TransportCredentials
-	if useTLS {
-		transport = credentials.NewTLS(&tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: tlsSkipVerify, // #nosec G402 -- explicitly configured for internal deployments.
-		})
-	} else {
-		transport = insecure.NewCredentials()
-	}
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(transport))
+	conn, err := grpctl.Dial(target, useTLS, tlsSkipVerify, files)
 	if err != nil {
 		return nil, fmt.Errorf("connect to ring: %w", err)
 	}

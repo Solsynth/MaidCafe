@@ -14,7 +14,7 @@ import (
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
-	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
+	dyauth "src.solsynth.dev/sosys/lighthouse/shared/pkg/auth"
 )
 
 func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc, cfg *config.Config) {

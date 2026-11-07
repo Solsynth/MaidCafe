@@ -8,8 +8,8 @@ import (
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/handler"
-	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
-	gen "src.solsynth.dev/sosys/go/proto"
+	dyauth "src.solsynth.dev/sosys/lighthouse/shared/pkg/auth"
+	gen "src.solsynth.dev/sosys/lighthouse/shared/proto"
 )
 
 func NewRouter(cfg *config.Config, svc *cloud.Service, authenticator dyauth.TokenAuthenticator) *gin.Engine {

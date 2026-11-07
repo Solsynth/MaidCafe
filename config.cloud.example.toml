@@ -14,17 +14,32 @@ port = "8080"
 # Replace the example password and connection settings before deployment.
 dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"
 
+[grpc]
+# Fleet certificate material for every outbound gRPC dial: Blade discovery,
+# the auth service (Stargate), the workspace service (Valve) and Metoer (Ring).
+# Fleet gRPC now requires a client certificate signed by the fleet CA, so
+# without these the cloud cannot reach Stargate at all. The files are PEM; a
+# relative path resolves against the process working directory.
+#
+# Leave caFile empty only when the peers present certificates this host cannot
+# verify (self-signed deployments) — dials then skip verification.
+# GRPC_CA_FILE, GRPC_CLIENT_CERT_FILE and GRPC_CLIENT_KEY_FILE set the same
+# three paths from the environment, which is how a mounted secret is injected.
+# caFile = "Keys/ca.crt"
+# clientCertFile = "Keys/maidcafe.crt"
+# clientKeyFile = "Keys/maidcafe.key"
+
 [discovery]
-# Blade service registry (DyServiceDiscoveryService). Outbound gRPC
-# dependencies are addressed by logical service name, so no endpoint is
-# configured by hand. The auth service is resolved as `service` below; the
-# cloud dials it over TLS and verifies the fleet certificate.
+# Blade service registry (DyServiceDiscoveryService). The dial follows the
+# target scheme: grpc:// is plaintext, grpcs:// and https:// are TLS, and a
+# bare host:port (below) is TLS — the fleet convention.
 target = "blade:7001"
 service = "stargate"
 
 [auth]
-# The fleet serves self-signed certificates on in-network gRPC.
-tlsSkipVerify = true
+# Turns off peer verification for the auth dial. With [grpc] caFile set this
+# must stay false: setting it drops the CA and disables verification.
+tlsSkipVerify = false
 
 [workspace]
 # WattEngine workspace service (DyWorkspaceService). Daemons belong to a
@@ -34,7 +49,9 @@ useTLS = true
 tlsSkipVerify = false
 
 [ring]
-# Optional Metoer/Ring gRPC target for device push delivery.
+# Optional Metoer/Ring gRPC target for device push delivery. Mutual TLS only
+# applies once useTLS is on; Metoer's shipped listener is plaintext, so the
+# client certificate above is idle until that changes.
 target = "metoer:9090"
 useTLS = false
 tlsSkipVerify = false

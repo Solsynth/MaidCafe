@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -20,15 +19,14 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
-	dyauth "src.solsynth.dev/sosys/go/pkg/auth"
-	gen "src.solsynth.dev/sosys/go/proto"
+	"src.solsynth.dev/solsynth/maidcafe/internal/grpctl"
+	"src.solsynth.dev/sosys/lighthouse/shared/platform/grpctls"
+	gen "src.solsynth.dev/sosys/lighthouse/shared/proto"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
@@ -57,16 +55,13 @@ type AccountClient interface {
 }
 
 // NewAccountClient dials the account service hosted alongside authentication.
-// target is a gRPC target, normally the blade:/// registry name.
-func NewAccountClient(target string, tlsSkipVerify bool) (AccountClient, *grpc.ClientConn, error) {
+// target is a gRPC target, normally the blade:/// registry name; files carries
+// the fleet CA bundle and this cloud's client certificate.
+func NewAccountClient(target string, tlsSkipVerify bool, files grpctls.Files) (AccountClient, *grpc.ClientConn, error) {
 	if strings.TrimSpace(target) == "" {
 		return nil, nil, errors.New("account gRPC target is empty")
 	}
-	transportCredentials := credentials.NewTLS(&tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: tlsSkipVerify, // #nosec G402 -- explicitly configured for internal deployments.
-	})
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(transportCredentials))
+	conn, err := grpctl.Dial(target, true, tlsSkipVerify, files)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial account service: %w", err)
 	}
@@ -76,7 +71,7 @@ func NewAccountClient(target string, tlsSkipVerify bool) (AccountClient, *grpc.C
 // WorkspaceClient is the small slice of the DyWorkspaceService gRPC surface
 // MaidCafe needs. Keeping it an interface lets the service run against a fake
 // in tests while the production implementation talks to the workspace service
-// through the DysonGo SDK (src.solsynth.dev/sosys/go/proto).
+// through the fleet SDK (src.solsynth.dev/sosys/lighthouse/shared/proto).
 type WorkspaceClient interface {
 	IsMemberWithRole(ctx context.Context, workspaceID, accountID string, requiredRoles []int32) (bool, error)
 
@@ -120,18 +115,11 @@ func (c GrpcWorkspaceClient) GetPlanQuota(ctx context.Context, workspaceID strin
 
 // NewWorkspaceClient dials the DyWorkspaceService gRPC endpoint hosted by the
 // workspace service using the same TLS conventions as the auth client.
-func NewWorkspaceClient(cfg config.WorkspaceConfig) (WorkspaceClient, *grpc.ClientConn, error) {
-	target, useTLS := dyauth.NormalizeAuthGRPCTarget(cfg.Target, cfg.UseTLS)
-	if strings.TrimSpace(target) == "" {
+func NewWorkspaceClient(cfg config.WorkspaceConfig, files grpctls.Files) (WorkspaceClient, *grpc.ClientConn, error) {
+	if strings.TrimSpace(cfg.Target) == "" {
 		return nil, nil, errors.New("workspace gRPC target is empty")
 	}
-	var transportCredentials credentials.TransportCredentials
-	if useTLS {
-		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSSkipVerify})
-	} else {
-		transportCredentials = insecure.NewCredentials()
-	}
-	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(transportCredentials))
+	conn, err := grpctl.Dial(cfg.Target, cfg.UseTLS, cfg.TLSSkipVerify, files)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial workspace service: %w", err)
 	}

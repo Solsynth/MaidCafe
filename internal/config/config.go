@@ -17,6 +17,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 	"src.solsynth.dev/solsynth/maidcafe/internal/privfs"
+	"src.solsynth.dev/sosys/lighthouse/shared/platform/grpctls"
 )
 
 type Config struct {
@@ -28,6 +29,7 @@ type Config struct {
 	Workspace WorkspaceConfig `mapstructure:"workspace"`
 	Eventbus  EventbusConfig  `mapstructure:"eventbus"`
 	Ring      RingConfig      `mapstructure:"ring"`
+	GRPC      GRPCConfig      `mapstructure:"grpc"`
 	Cloud     CloudConfig     `mapstructure:"cloud"`
 	Daemon    DaemonConfig    `mapstructure:"daemon"`
 }
@@ -70,9 +72,59 @@ type DatabaseConfig struct {
 	DSN string `mapstructure:"dsn"`
 }
 
+// GRPCConfig carries the client certificate material the cloud presents to
+// every fleet gRPC dependency (Blade discovery, Stargate, Valve, Ring). Fleet
+// certificates are self-signed, so CAFile also decides whether peers are
+// verified: empty skips verification.
+type GRPCConfig struct {
+	CAFile         string `mapstructure:"caFile"`
+	ClientCertFile string `mapstructure:"clientCertFile"`
+	ClientKeyFile  string `mapstructure:"clientKeyFile"`
+}
+
+// ClientFiles returns the certificate material for outbound fleet dials. When
+// the config names no files, GRPC_CA_FILE, GRPC_CLIENT_CERT_FILE and
+// GRPC_CLIENT_KEY_FILE are used instead, matching the fleet's shared helpers.
+func (c *Config) ClientFiles() grpctls.Files {
+	if c == nil {
+		return grpctls.Files{}
+	}
+	files := grpctls.Files{
+		CAFile:   strings.TrimSpace(c.GRPC.CAFile),
+		CertFile: strings.TrimSpace(c.GRPC.ClientCertFile),
+		KeyFile:  strings.TrimSpace(c.GRPC.ClientKeyFile),
+	}
+	if files.CAFile == "" && files.CertFile == "" && files.KeyFile == "" {
+		files = grpctls.FromEnv()
+	}
+	return files
+}
+
+// validateGRPC fails startup on certificate material the fleet dials could
+// never use: half a client identity, or a CA bundle that cannot be read. An
+// empty [grpc] block is valid and keeps the self-signed skip-verify behaviour.
+func (c *Config) validateGRPC() error {
+	files := c.ClientFiles()
+	if (files.CertFile == "") != (files.KeyFile == "") {
+		return fmt.Errorf("grpc.clientCertFile and grpc.clientKeyFile must be set together")
+	}
+	for name, path := range map[string]string{
+		"grpc.caFile":         files.CAFile,
+		"grpc.clientCertFile": files.CertFile,
+	} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // AuthConfig holds no endpoint: the auth service is resolved through Blade.
-// TLSSkipVerify stays because the fleet serves self-signed certificates on
-// in-network gRPC.
+// TLSSkipVerify turns off peer verification when the fleet CA is not mounted
+// (self-signed certificates); with [grpc] caFile set it must stay false.
 type AuthConfig struct {
 	TLSSkipVerify bool `mapstructure:"tlsSkipVerify"`
 }
@@ -1225,6 +1277,7 @@ func applyEnvAliases() {
 		"AUTH_TLS_SKIP_VERIFY": "auth.tlsSkipVerify",
 		"WORKSPACE_TARGET":     "workspace.target", "WORKSPACE_USE_TLS": "workspace.useTLS", "WORKSPACE_TLS_SKIP_VERIFY": "workspace.tlsSkipVerify",
 		"RING_TARGET": "ring.target", "RING_USE_TLS": "ring.useTLS", "RING_TLS_SKIP_VERIFY": "ring.tlsSkipVerify",
+		"GRPC_CA_FILE": "grpc.caFile", "GRPC_CLIENT_CERT_FILE": "grpc.clientCertFile", "GRPC_CLIENT_KEY_FILE": "grpc.clientKeyFile",
 		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
 		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_DAEMON_DISCONNECT_NOTIFICATION_COOLDOWN": "cloud.daemonDisconnectNotificationCooldown", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
 		"DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
@@ -1269,6 +1322,9 @@ func (c *Config) ValidateCloud() error {
 	}
 	if strings.TrimSpace(c.Workspace.Target) == "" {
 		return fmt.Errorf("workspace.target is required in cloud mode")
+	}
+	if err := c.validateGRPC(); err != nil {
+		return err
 	}
 	if err := validatePort(c.HTTP.Port); err != nil {
 		return fmt.Errorf("http.port: %w", err)
