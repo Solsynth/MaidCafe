@@ -22,7 +22,6 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/database"
 	"src.solsynth.dev/solsynth/maidcafe/internal/grpctl"
 	"src.solsynth.dev/sosys/lighthouse/shared/platform/grpctls"
@@ -114,12 +113,13 @@ func (c GrpcWorkspaceClient) GetPlanQuota(ctx context.Context, workspaceID strin
 }
 
 // NewWorkspaceClient dials the DyWorkspaceService gRPC endpoint hosted by the
-// workspace service using the same TLS conventions as the auth client.
-func NewWorkspaceClient(cfg config.WorkspaceConfig, files grpctls.Files) (WorkspaceClient, *grpc.ClientConn, error) {
-	if strings.TrimSpace(cfg.Target) == "" {
+// workspace service. target is a gRPC target, normally the blade:/// registry
+// name, so the workspace service is found wherever it currently listens.
+func NewWorkspaceClient(target string, skipVerify bool, files grpctls.Files) (WorkspaceClient, *grpc.ClientConn, error) {
+	if strings.TrimSpace(target) == "" {
 		return nil, nil, errors.New("workspace gRPC target is empty")
 	}
-	conn, err := grpctl.Dial(cfg.Target, cfg.UseTLS, cfg.TLSSkipVerify, files)
+	conn, err := grpctl.Dial(target, true, skipVerify, files)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial workspace service: %w", err)
 	}

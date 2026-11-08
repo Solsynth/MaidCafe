@@ -1250,10 +1250,15 @@ Configuration is typed TOML loaded through Viper and can also be selected with
 Cloud requires:
 
 - `database.dsn`
-- `discovery.target` (Blade service registry; the auth service is resolved
-  through it under `discovery.service`, default `stargate`)
-- `workspace.target`
+- `discovery.target` (Blade service registry)
+- `discovery.service` (registry name of the auth service, default `stargate`)
+- `discovery.workspaceService` (registry name of the workspace service, default
+  `valve`)
 - `http.port` (default `8080`)
+
+Auth and workspace endpoints come from the registry, never from the config:
+Valve registers `valve:7201` while its HTTP listener is `5201`, so a
+hand-written `valve:9090` dials into a closed port.
 
 Cloud gRPC is mutual TLS. The fleet's inbound gRPC listeners (Stargate,
 Valve, Metoer, Blade discovery) require a client certificate signed by the

@@ -26,8 +26,7 @@ dsn = "host=db dbname=maidcafe"
 [discovery]
 target = "blade:7001"
 service = "stargate"
-[workspace]
-target = "valve:9090"
+workspaceService = "valve"
 `+extra))
 	if err != nil {
 		t.Fatal(err)

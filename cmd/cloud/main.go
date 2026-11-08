@@ -72,7 +72,8 @@ func main() {
 	}
 	defer accountConn.Close()
 
-	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(cfg.Workspace, files)
+	workspaceTarget := discovery.Target(cfg.Discovery.WorkspaceService)
+	workspaces, workspaceConn, err := cloud.NewWorkspaceClient(workspaceTarget, cfg.Workspace.TLSSkipVerify, files)
 	if err != nil {
 		log.Fatal().Err(err).Msg("initialize workspace client")
 	}

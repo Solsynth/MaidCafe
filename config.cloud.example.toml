@@ -33,8 +33,15 @@ dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 
 # Blade service registry (DyServiceDiscoveryService). The dial follows the
 # target scheme: grpc:// is plaintext, grpcs:// and https:// are TLS, and a
 # bare host:port (below) is TLS — the fleet convention.
+#
+# Every fleet dependency below is addressed by its registry name, so the
+# cloud follows whatever address each instance registered with — Valve's
+# gRPC port is 7201, not the HTTP port its old static target guessed.
 target = "blade:7001"
+# Registry name of the auth service (DyAuthService, DyAccountService).
 service = "stargate"
+# Registry name of the workspace service (DyWorkspaceService).
+workspaceService = "valve"
 
 [auth]
 # Turns off peer verification for the auth dial. With [grpc] caFile set this
@@ -42,10 +49,9 @@ service = "stargate"
 tlsSkipVerify = false
 
 [workspace]
-# WattEngine workspace service (DyWorkspaceService). Daemons belong to a
-# workspace; membership is verified against this service on every access.
-target = "valve:9090"
-useTLS = true
+# Membership and quota calls follow discovery.workspaceService above.
+# Daemons belong to a workspace; membership is verified against this service
+# on every access.
 tlsSkipVerify = false
 
 [ring]
