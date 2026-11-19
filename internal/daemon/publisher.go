@@ -348,7 +348,11 @@ func (p *CloudPublisher) PublishLogs(ctx context.Context, entries []LogUploadEnt
 	if p == nil || len(entries) == 0 {
 		return nil
 	}
-	return p.request(ctx, http.MethodPost, "/logs", map[string]any{"entries": entries}, nil)
+	err := p.request(ctx, http.MethodPost, "/logs", map[string]any{"entries": entries}, nil)
+	if err != nil {
+		p.logger.Error("cloud publish failed", "suffix", "/logs", "error", err)
+	}
+	return err
 }
 
 // containerStatusEntry is one container's status pushed to the cloud. Status

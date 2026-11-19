@@ -1128,15 +1128,24 @@ func (a *App) isContainerManaged(id string, entry containerEntry) bool {
 func (a *App) publishContainerStatus(ctx context.Context, pub *CloudPublisher, rt *reloadableConfig) {
 	data, err := a.containers.snapshot(ctx)
 	if err != nil {
-		a.logger.Debug("container status snapshot failed", "error", err)
+		a.logger.Warn("container status snapshot failed", "error", err)
 		return
 	}
 	var payload containersPayload
 	if err := json.Unmarshal(data, &payload); err != nil {
+		a.logger.Warn("container status snapshot unreadable", "error", err)
 		return
+	}
+	for _, group := range payload.Runtimes {
+		if group.Error != nil && *group.Error != "" {
+			a.logger.Warn("container runtime unavailable for status upload",
+				"runtime", group.Runtime, "store", group.Store, "error", *group.Error)
+		}
 	}
 	entries, covered := containerStatusBatch(payload, rt)
 	if len(covered) == 0 {
+		a.logger.Warn("container status upload skipped: no runtime answered",
+			"runtimes", len(payload.Runtimes))
 		return
 	}
 	pub.PublishContainerStatus(ctx, containerStatusPayload{
