@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/icon-outline.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#171618" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#faf7f9" media="(prefers-color-scheme: light)" />
+    <meta
+      name="description"
+      content="MaidKit Cloud — inspect and operate the daemons registered to your workspace."
+    />
+    <title>MaidKit Cloud</title>
+    <script>
+      // Apply the stored (or OS) theme before first paint so a light-theme
+      // operator never sees a dark flash while the module bundle loads.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('maidkit.theme')
+          var theme =
+            stored === 'light' || stored === 'dark'
+              ? stored
+              : window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+          var resolved = theme === 'light' ? 'maidkit-light' : 'maidkit'
+          document.documentElement.dataset.theme = resolved
+          var meta = document.querySelector('meta[name="theme-color"]')
+          if (meta) {
+            meta.removeAttribute('media')
+            meta.content = theme === 'light' ? '#faf7f9' : '#171618'
+          }
+        } catch (error) {
+          /* Leave the default theme in place. */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

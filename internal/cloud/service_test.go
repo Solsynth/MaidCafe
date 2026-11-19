@@ -1217,3 +1217,35 @@ func TestDaemonHealthWithoutMetricsIsNotFound(t *testing.T) {
 		t.Fatalf("health for empty daemon = %v, want not found", err)
 	}
 }
+
+// catalogWorkspaces is a workspace service that can list the account's
+// memberships as well as answer the access checks.
+type catalogWorkspaces struct{ WorkspaceClient }
+
+func (catalogWorkspaces) UserWorkspaces(context.Context, string) ([]string, error) {
+	return []string{"ws-b", "ws-a"}, nil
+}
+
+func (catalogWorkspaces) WorkspaceBatch(_ context.Context, ids []string) ([]WorkspaceView, error) {
+	out := make([]WorkspaceView, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, WorkspaceView{ID: id, Slug: id, Name: "Workspace " + id, Type: "organization"})
+	}
+	return out, nil
+}
+
+func TestListWorkspacesUsesCatalog(t *testing.T) {
+	svc := &Service{workspaces: catalogWorkspaces{&fakeWorkspaces{}}}
+	workspaces, err := svc.ListWorkspaces(context.Background(), "account-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workspaces) != 2 || workspaces[0].ID != "ws-b" || workspaces[1].Name != "Workspace ws-a" {
+		t.Fatalf("workspaces = %#v", workspaces)
+	}
+
+	svc = &Service{workspaces: &fakeWorkspaces{}}
+	if _, err := svc.ListWorkspaces(context.Background(), "account-a"); err == nil {
+		t.Fatal("catalog-less workspace service accepted a listing")
+	}
+}

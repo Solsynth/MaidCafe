@@ -1,0 +1,850 @@
+@import 'tailwindcss';
+
+@plugin 'daisyui' {
+  themes: false;
+}
+
+/* MaidKit Cloud — Solar Network's neutral ramp. The cloud console is an
+   instrument for inspecting hosts, so the palette is Stargate's: a near-neutral
+   lavender-gray ground and one periwinkle signal. Semantic tones appear only
+   when a daemon's state needs them. */
+@plugin 'daisyui/theme' {
+  name: 'maidkit';
+  default: true;
+  color-scheme: dark;
+
+  --color-base-100: #171618;
+  --color-base-200: #1d1d20;
+  --color-base-300: #2e2e31;
+  --color-base-content: #edeaee;
+
+  --console-line: #4b4b4f;
+  --console-line-soft: #2a2a2d;
+  --console-faint: #97959b;
+  --console-dim: #c8c5ca;
+
+  --color-primary: #bac3ff;
+  --color-primary-content: #222c61;
+  --color-secondary: #c3c5dd;
+  --color-secondary-content: #2d2f42;
+  --color-accent: #d9bfcf;
+  --color-accent-content: #3a2b35;
+  --color-neutral: #242326;
+  --color-neutral-content: #c8c5ca;
+
+  --color-info: #a1cce8;
+  --color-info-content: #171618;
+  --color-success: #a8d1a8;
+  --color-success-content: #171618;
+  --color-warning: #fdba55;
+  --color-warning-content: #171618;
+  --color-error: #ffb4ab;
+  --color-error-content: #171618;
+
+  --radius-selector: 6px;
+  --radius-field: 10px;
+  --radius-box: 12px;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 0;
+  --depth: 0;
+  --noise: 0;
+
+  --field-fill: #232326;
+  --field-fill-hover: #28282c;
+  --field-fill-focus: #2d2d32;
+  --field-line: #3c3c40;
+
+  --surface-raised: #232326;
+  --surface-raised-hover: #2a2a2e;
+  --surface-tint: #262833;
+}
+
+@plugin 'daisyui/theme' {
+  name: 'maidkit-light';
+  default: false;
+  color-scheme: light;
+
+  --color-base-100: #faf7f9;
+  --color-base-200: #f6f2f6;
+  --color-base-300: #e4e1e5;
+  --color-base-content: #1f1f22;
+
+  --console-line: #d3d1d5;
+  --console-line-soft: #e9e6ea;
+  --console-faint: #636367;
+  --console-dim: #4b4b4f;
+
+  --color-primary: #515b92;
+  --color-primary-content: #ffffff;
+  --color-secondary: #5b5d72;
+  --color-secondary-content: #ffffff;
+  --color-accent: #6d5966;
+  --color-accent-content: #ffffff;
+  --color-neutral: #e4e1e5;
+  --color-neutral-content: #2a2a2d;
+
+  --color-info: #2d5f79;
+  --color-info-content: #ffffff;
+  --color-success: #315936;
+  --color-success-content: #ffffff;
+  --color-warning: #6f4800;
+  --color-warning-content: #ffffff;
+  --color-error: #9f352d;
+  --color-error-content: #ffffff;
+
+  --radius-selector: 6px;
+  --radius-field: 10px;
+  --radius-box: 12px;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 0;
+  --depth: 0;
+  --noise: 0;
+
+  --surface-raised: #efebf0;
+  --surface-raised-hover: #e9e4eb;
+  --surface-tint: #e8e9f5;
+
+  --field-fill: #efeaf0;
+  --field-fill-hover: #eae4eb;
+  --field-fill-focus: #e4dee6;
+  --field-line: #cbc5cc;
+}
+
+@theme {
+  --font-sans: 'Nunito', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-line: var(--console-line);
+  --color-line-soft: var(--console-line-soft);
+  --color-faint: var(--console-faint);
+  --color-dim: var(--console-dim);
+  --text-2xs: 0.6875rem;
+
+  --radius-mark: 4px;
+  --radius-chip: 6px;
+  --radius-input: 10px;
+  --radius-control: 6px;
+  --radius-card: 12px;
+  --radius-sheet: 16px;
+
+  --color-raised: var(--surface-raised);
+  --color-raised-hover: var(--surface-raised-hover);
+  --color-tint: var(--surface-tint);
+
+  --ease-out: cubic-bezier(0.33, 1, 0.68, 1);
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background: var(--color-base-100);
+    --skullet-base: color-mix(in oklab, var(--color-base-300) 70%, transparent);
+    --skullet-highlight: color-mix(in oklab, var(--color-base-100) 60%, transparent);
+    --skullet-radius: var(--radius-chip);
+    --skullet-animation: pulse;
+    --skullet-speed: fast;
+  }
+
+  html[data-theme='maidkit-light'] {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-base-100 font-sans text-[13.5px] leading-[1.55] text-base-content antialiased;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-primary) 30%, transparent);
+    color: var(--color-base-content);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border: 3px solid var(--color-base-100);
+    border-radius: 99px;
+  }
+}
+
+@layer components {
+  .brand-mark {
+    background-color: currentColor;
+    -webkit-mask: url('/icon-outline.svg') center / contain no-repeat;
+    mask: url('/icon-outline.svg') center / contain no-repeat;
+  }
+
+  .title {
+    @apply font-sans font-bold tracking-[-0.01em];
+  }
+
+  .eyebrow {
+    @apply text-2xs uppercase tracking-[0.14em] text-faint;
+  }
+
+  .voice {
+    @apply font-sans text-[14px] leading-relaxed text-dim;
+  }
+
+  .numeric {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .plate {
+    @apply rounded-card bg-raised;
+    border: 0;
+  }
+
+  .well {
+    @apply rounded-card bg-base-200;
+    border: 0;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 whitespace-nowrap font-sans text-[13px] font-semibold tracking-[0.005em];
+    border-width: 0;
+    border-radius: var(--radius-control);
+    box-shadow: none;
+    transition:
+      background-color var(--duration-base) var(--ease-out),
+      color var(--duration-base) var(--ease-out),
+      transform var(--duration-base) var(--ease-out);
+  }
+
+  .btn svg {
+    flex-shrink: 0;
+  }
+
+  .btn:not(:disabled):active {
+    transform: translateY(1px) scale(0.985);
+  }
+
+  .btn-outline {
+    border-width: 1px;
+    border-color: var(--color-line);
+  }
+
+  .btn-ghost {
+    @apply text-dim;
+  }
+
+  .btn-ghost:hover {
+    @apply bg-base-300 text-base-content;
+  }
+
+  .btn-quiet {
+    @apply bg-transparent text-dim;
+  }
+
+  .btn-quiet:hover {
+    background-color: color-mix(in oklab, var(--color-base-300) 70%, transparent);
+    @apply text-base-content;
+  }
+
+  .btn-primary {
+    @apply bg-primary text-primary-content;
+  }
+
+  .btn-error {
+    @apply bg-error/15 text-error;
+  }
+
+  .btn-error:hover {
+    @apply bg-error/25;
+  }
+
+  .link-quiet {
+    @apply inline-flex items-center gap-1 text-dim underline decoration-line underline-offset-4 transition-colors;
+  }
+
+  .link-quiet:hover {
+    @apply text-base-content decoration-faint;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-chip bg-base-200/70 px-2.5 py-1 text-2xs text-dim;
+    border: 0;
+    transition:
+      background-color var(--duration-base) var(--ease-out),
+      color var(--duration-base) var(--ease-out);
+  }
+
+  a.chip:hover,
+  button.chip:hover {
+    @apply bg-base-300 text-base-content;
+  }
+
+  .chip-active {
+    @apply bg-primary/15 font-semibold text-primary;
+  }
+
+  .note {
+    @apply rounded-chip px-3.5 py-2.5 text-xs leading-relaxed;
+    border: 0;
+  }
+
+  .note-error {
+    @apply bg-error/12 text-error;
+  }
+
+  .note-success {
+    @apply bg-success/12 text-success;
+  }
+
+  .note-warning {
+    @apply bg-warning/12 text-warning;
+  }
+
+  .card {
+    border-radius: var(--radius-card);
+    background-color: color-mix(in oklab, var(--color-base-200) 50%, transparent);
+    border: 0;
+    box-shadow: none;
+  }
+
+  .modal-box {
+    border-radius: var(--radius-sheet);
+    border: 0;
+    background-color: var(--color-base-100);
+    box-shadow: 0 30px 80px -40px rgb(0 0 0 / 0.7);
+  }
+
+  .sheet {
+    border-radius: var(--radius-sheet);
+    overflow: hidden;
+  }
+
+  .modal-box.sheet {
+    padding: 0;
+  }
+
+  .menu-plate {
+    border-radius: var(--radius-card);
+    background-color: var(--color-base-200);
+    box-shadow: 0 24px 50px -28px rgb(0 0 0 / 0.55);
+    border: 0;
+  }
+
+  .post-menu-row {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: var(--radius-control);
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    color: var(--color-dim);
+    transition:
+      background-color 150ms ease,
+      color 150ms ease;
+  }
+
+  .post-menu-row:hover {
+    background-color: var(--color-base-300);
+    color: var(--color-base-content);
+  }
+
+  .nav-tab {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 0.375rem;
+    border-radius: var(--radius-control);
+    padding: 0.375rem 0.625rem;
+    font-size: var(--text-2xs);
+    letter-spacing: 0.02em;
+    color: var(--color-faint);
+    transition:
+      background-color var(--duration-base) var(--ease-out),
+      color var(--duration-base) var(--ease-out);
+  }
+
+  .nav-tab:hover {
+    background-color: color-mix(in oklab, var(--color-base-200) 70%, transparent);
+    color: var(--color-dim);
+  }
+
+  .nav-tab-active {
+    background-color: color-mix(in oklab, var(--color-base-300) 80%, transparent);
+    color: var(--color-base-content);
+  }
+
+  .ledger {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0 2px;
+    text-align: left;
+  }
+
+  .ledger th {
+    padding: 0 14px 8px 0;
+    color: var(--color-faint);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .ledger td {
+    padding: 11px 14px;
+    vertical-align: middle;
+    background-color: color-mix(in oklab, var(--color-base-200) 45%, transparent);
+    font-variant-numeric: tabular-nums;
+    transition: background-color var(--duration-fast) var(--ease-out);
+    border: 0;
+  }
+
+  .ledger td:first-child {
+    border-radius: var(--radius-chip) 0 0 var(--radius-chip);
+    padding-left: 12px;
+  }
+
+  .ledger td:last-child {
+    border-radius: 0 var(--radius-chip) var(--radius-chip) 0;
+    text-align: right;
+  }
+
+  .ledger td:only-child {
+    border-radius: var(--radius-chip);
+  }
+
+  .ledger tbody tr:hover td {
+    background-color: color-mix(in oklab, var(--color-base-300) 70%, transparent);
+  }
+
+  @media (max-width: 640px) {
+    .ledger-stack {
+      display: block;
+    }
+
+    .ledger-stack thead {
+      display: none;
+    }
+
+    .ledger-stack tbody,
+    .ledger-stack tr,
+    .ledger-stack td {
+      display: block;
+      width: auto;
+    }
+
+    .ledger-stack tr {
+      padding: 12px;
+      border-radius: var(--radius-chip);
+      background: color-mix(in oklab, var(--color-base-200) 45%, transparent);
+      margin-bottom: 4px;
+    }
+
+    .ledger-stack tr:last-child {
+      margin-bottom: 0;
+    }
+
+    .ledger-stack td {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 2px 0;
+      border: 0;
+      text-align: right;
+    }
+
+    .ledger-stack td:first-child {
+      display: block;
+      padding: 0 0 6px;
+      text-align: left;
+    }
+
+    .ledger-stack td::before {
+      content: attr(data-label);
+      flex: none;
+      color: var(--color-faint);
+      font-size: 10.5px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      text-align: left;
+    }
+
+    .ledger-stack td:first-child::before,
+    .ledger-stack td:not([data-label])::before {
+      content: none;
+    }
+
+    .ledger-stack td:not([data-label]) {
+      display: flex;
+      justify-content: flex-end;
+      padding-top: 8px;
+    }
+
+    .ledger-cards thead {
+      display: none;
+    }
+
+    .ledger-cards tbody {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .ledger-cards tbody tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      column-gap: 12px;
+      row-gap: 6px;
+      padding: 12px;
+      border-radius: var(--radius-chip);
+      background: color-mix(in oklab, var(--color-base-300) 45%, transparent);
+    }
+
+    .ledger-cards tbody tr:hover td {
+      background: transparent;
+    }
+
+    .ledger-cards td {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 0;
+      border: 0;
+      grid-column: 1;
+      text-align: left;
+      white-space: normal;
+    }
+
+    .ledger-cards td:first-child {
+      grid-column: 1;
+      grid-row: 1;
+      padding: 0 0 2px;
+    }
+
+    .ledger-cards td:not([data-label]) {
+      grid-column: 2;
+      grid-row: 1;
+      justify-content: flex-end;
+      align-self: start;
+    }
+
+    .ledger-cards td[data-label]:not(:first-child) {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+    }
+
+    .ledger-cards td[data-label]::before {
+      content: attr(data-label);
+      flex: none;
+      color: var(--color-faint);
+      font-size: 10.5px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .ledger-cards td:first-child::before {
+      content: none;
+    }
+  }
+
+  .field {
+    display: block;
+    min-inline-size: 0;
+  }
+
+  .field-box {
+    position: relative;
+    border: 0;
+    border-radius: var(--radius-input);
+    background-color: var(--field-fill);
+    transition:
+      background-color var(--duration-base) var(--ease-out),
+      box-shadow var(--duration-base) var(--ease-out);
+  }
+
+  .field-box:hover:not(.is-disabled) {
+    background-color: var(--field-fill-hover);
+  }
+
+  .field-box:focus-within:not(.is-disabled) {
+    box-shadow: inset 0 0 0 2px var(--color-primary);
+    background-color: var(--field-fill-focus);
+  }
+
+  .field.is-invalid .field-box {
+    box-shadow: inset 0 0 0 1.5px var(--color-error);
+  }
+
+  .field-control {
+    display: block;
+    position: relative;
+    z-index: 1;
+    inline-size: 100%;
+    width: 100%;
+    block-size: var(--field-height);
+    min-block-size: var(--field-height);
+    padding: var(--field-text-top) var(--field-inset) var(--field-text-bottom);
+    border: none;
+    border-radius: var(--radius-input);
+    outline: none;
+    background: transparent;
+    color: var(--color-base-content);
+    font-family: var(--font-sans);
+    font-size: 13.5px;
+    line-height: 1.4;
+    caret-color: var(--color-primary);
+  }
+
+  .field-sm {
+    --field-height: 44px;
+    --field-inset: 13px;
+    --field-label-float: 10px;
+    --field-label-top: 5px;
+    --field-text-top: 18px;
+    --field-text-bottom: 4px;
+  }
+
+  .field-xs {
+    --field-height: 36px;
+    --field-inset: 11px;
+    --field-label-float: 9px;
+    --field-label-top: 4px;
+    --field-text-top: 14px;
+    --field-text-bottom: 3px;
+  }
+
+  .field textarea.field-control {
+    block-size: auto;
+    min-block-size: calc(var(--field-height) * 2);
+    resize: vertical;
+  }
+
+  .field select.field-control {
+    appearance: none;
+    padding-inline-end: calc(var(--field-inset) + 20px);
+    background-image:
+      linear-gradient(45deg, transparent 50%, currentColor 50%),
+      linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position:
+      calc(100% - 15px) calc(50% + 1px),
+      calc(100% - 10px) calc(50% + 1px);
+    background-size:
+      5px 5px,
+      5px 5px;
+    background-repeat: no-repeat;
+  }
+
+  .field-label-float {
+    position: absolute;
+    z-index: 2;
+    inset-inline-start: var(--field-inset);
+    inset-block-start: 50%;
+    translate: 0 -50%;
+    color: var(--color-faint);
+    font-size: 13.5px;
+    font-weight: 500;
+    line-height: 1.2;
+    pointer-events: none;
+    transition:
+      inset-block-start 160ms cubic-bezier(0.2, 0.7, 0.2, 1),
+      translate 160ms cubic-bezier(0.2, 0.7, 0.2, 1),
+      font-size 160ms cubic-bezier(0.2, 0.7, 0.2, 1),
+      color 160ms ease;
+  }
+
+  .field.is-floated .field-label-float,
+  .field:focus-within .field-label-float {
+    inset-block-start: var(--field-label-top);
+    translate: 0 0;
+    font-size: var(--field-label-float);
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+
+  .field:focus-within:not(.is-disabled) .field-label-float {
+    color: var(--color-primary);
+  }
+
+  .field.is-invalid .field-label-float {
+    color: var(--color-error);
+  }
+
+  .field-hint {
+    margin-block-start: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--color-faint);
+  }
+
+  .field-hint-error {
+    color: var(--color-error);
+  }
+
+  .cell-stack {
+    @apply flex flex-col;
+    min-width: 0;
+  }
+}
+
+@layer daisyui {
+  .checkbox,
+  .radio {
+    border: 0;
+    background-color: var(--field-fill);
+  }
+
+  .checkbox:checked,
+  .radio:checked {
+    background-color: var(--color-primary);
+    color: var(--color-primary-content);
+  }
+
+  input.input,
+  select.select,
+  textarea.textarea {
+    width: 100%;
+    border: 0;
+    border-radius: var(--radius-input);
+    background-color: var(--field-fill);
+    color: var(--color-base-content);
+    font-size: 13.5px;
+    box-shadow: none;
+  }
+
+  input.input:focus,
+  select.select:focus,
+  textarea.textarea:focus {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--color-primary);
+    background-color: var(--field-fill-focus);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* A select in the header or a panel toolbar is a control, not a form field:
+   the full-width field skin would push the neighbouring buttons onto a second
+   line. */
+select.select.control-select {
+  inline-size: auto;
+  width: auto;
+  min-height: 1.75rem;
+  height: 1.75rem;
+  padding-block: 0;
+  font-size: 0.6875rem;
+}
+
+/* A two-line value cell keeps its children at their own width. Without this
+   a status pill in a flex column stretches to the column and stops reading as
+   a pill. */
+.cell-stack {
+  align-items: flex-start;
+}
+
+/* Binary switches. daisyUI's toggle sizes resolve to a 4 px track under this
+   console's field tokens, so the console draws the control itself: a tinted
+   track, a raised knob, and the signal colour when on. */
+input.switch {
+  appearance: none;
+  flex: none;
+  inline-size: 2rem;
+  block-size: 1.05rem;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background-color: var(--field-fill);
+  box-shadow: inset 0 0 0 1px var(--field-line);
+  cursor: pointer;
+  position: relative;
+  transition:
+    background-color var(--duration-base) var(--ease-out),
+    box-shadow var(--duration-base) var(--ease-out);
+}
+
+input.switch::after {
+  content: '';
+  position: absolute;
+  inset-block-start: 2px;
+  inset-inline-start: 2px;
+  inline-size: calc(1.05rem - 4px);
+  block-size: calc(1.05rem - 4px);
+  border-radius: 999px;
+  background-color: var(--color-faint);
+  transition:
+    inset-inline-start var(--duration-base) var(--ease-out),
+    background-color var(--duration-base) var(--ease-out);
+}
+
+input.switch:checked {
+  background-color: var(--color-primary);
+  box-shadow: inset 0 0 0 1px var(--color-primary);
+}
+
+input.switch:checked::after {
+  inset-inline-start: calc(2rem - 1.05rem + 2px);
+  background-color: var(--color-primary-content);
+}
+
+input.switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Checks are a tinted box with a drawn tick, not the browser's default. */
+input.checkbox {
+  border: 1px solid var(--field-line);
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+input.checkbox:checked {
+  border-color: var(--color-primary);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2 5 8.7l4.5-5' fill='none' stroke='%23222c61' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-size: 10px 10px;
+}
+
+/* Destructive actions are a tinted control, not a filled alarm: the console
+   keeps the signal colour for the one action that moves the page forward. */
+.btn-error {
+  background-color: color-mix(in oklab, var(--color-error) 15%, transparent);
+  color: var(--color-error);
+}
+
+.btn-error:hover {
+  background-color: color-mix(in oklab, var(--color-error) 25%, transparent);
+}
+
+/* The footer language picker is inline, not a full-width form field. */
+select.select.footer-locale {
+  inline-size: auto;
+  width: auto;
+  height: 1.75rem;
+  min-height: 1.75rem;
+  padding-block: 0;
+  font-size: 0.6875rem;
+}
+
+.field-label {
+  @apply mb-2.5 block text-2xs uppercase tracking-[0.14em] text-faint;
+}

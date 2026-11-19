@@ -5,9 +5,11 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog/log"
 	"src.solsynth.dev/solsynth/maidcafe/internal/cloud"
 	"src.solsynth.dev/solsynth/maidcafe/internal/config"
 	"src.solsynth.dev/solsynth/maidcafe/internal/handler"
+	"src.solsynth.dev/solsynth/maidcafe/internal/webui"
 	dyauth "src.solsynth.dev/sosys/lighthouse/shared/pkg/auth"
 	gen "src.solsynth.dev/sosys/lighthouse/shared/proto"
 )
@@ -15,6 +17,19 @@ import (
 func NewRouter(cfg *config.Config, svc *cloud.Service, authenticator dyauth.TokenAuthenticator) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
+	webEnabled := false
+	if cfg != nil && strings.TrimSpace(cfg.Web.DistPath) != "" {
+		console, err := webui.New(cfg.Web.DistPath)
+		switch {
+		case err != nil:
+			log.Warn().Err(err).Str("dist", cfg.Web.DistPath).Msg("console dist unavailable; serving the status page")
+		case console.Enabled():
+			r.Use(console.ServeStatic)
+			r.NoRoute(console.Serve)
+			webEnabled = true
+		}
+	}
+	handler.RegisterAuthRoutes(r, cfg, authenticator)
 	userAuth := func(c *gin.Context) {
 		token, ok := dyauth.ExtractToken(c.Request)
 		if !ok || authenticator == nil {
@@ -46,6 +61,6 @@ func NewRouter(cfg *config.Config, svc *cloud.Service, authenticator dyauth.Toke
 		dyauth.WithAuth(c, result, token)
 		c.Next()
 	}
-	handler.RegisterRoutes(r, svc, userAuth, cfg)
+	handler.RegisterRoutes(r, svc, userAuth, cfg, webEnabled)
 	return r
 }

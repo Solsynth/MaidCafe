@@ -60,7 +60,7 @@ func newTerminalHarness(t *testing.T, cfg *config.Config, withCredential bool) *
 		}
 		c.Next()
 	}
-	RegisterRoutes(engine, svc, userAuth, cfg)
+	RegisterRoutes(engine, svc, userAuth, cfg, false)
 	server := httptest.NewServer(engine)
 	h := &terminalHarness{engine: engine, server: server, svc: svc, db: db, daemon: daemon}
 	t.Cleanup(h.close)

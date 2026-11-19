@@ -45,6 +45,13 @@ GET /health
 {"ok":true,"mode":"cloud"}
 ```
 
+- Web console (`internal/cloud/web`) served from the built dist: the fleet of
+  daemons with health, metrics, containers, logs, actions, notification
+  preferences, workspace quota, the notification inbox, and API credentials.
+  Sign-in uses the fleet session hand-off (`[handoff]`): the browser returns
+  with a single-use code, the cloud redeems it server-to-server, and the
+  console gets its own HttpOnly session cookies. Build it with `make web`.
+
 ### Daemon runtime
 
 - Gin HTTP routing with recovery middleware.

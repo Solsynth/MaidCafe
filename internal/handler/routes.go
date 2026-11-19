@@ -17,13 +17,15 @@ import (
 	dyauth "src.solsynth.dev/sosys/lighthouse/shared/pkg/auth"
 )
 
-func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc, cfg *config.Config) {
+func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc, cfg *config.Config, webEnabled bool) {
 	// The terminal pairing registry is per-router state: it pairs the in-memory
 	// browser and agent sockets of one relayed session.
 	terminalReg := newTerminalRegistry()
-	r.GET("/", func(c *gin.Context) {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cloudLandingPageHTML))
-	})
+	if !webEnabled {
+		r.GET("/", func(c *gin.Context) {
+			c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(cloudLandingPageHTML))
+		})
+	}
 	r.GET("/favicon.png", serveFavicon)
 	r.GET("/favicon.ico", serveFavicon)
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true, "mode": "cloud"}) })
@@ -33,6 +35,8 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc,
 	r.GET("/api/daemons/:id/terminal", browserTerminal(svc, cfg, terminalReg))
 	user := r.Group("/api")
 	user.Use(userAuth, requireUser())
+	user.GET("/auth/session", currentSession)
+	user.GET("/workspaces", listWorkspaces(svc))
 	user.POST("/daemons", createDaemon(svc))
 	user.GET("/daemons", listDaemons(svc))
 	user.GET("/daemons/:id/logs", listDaemonLogs(svc))
@@ -223,6 +227,16 @@ func listDaemons(s *cloud.Service) gin.HandlerFunc {
 			} else {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			}
+			return
+		}
+		c.JSON(http.StatusOK, out)
+	}
+}
+func listWorkspaces(s *cloud.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		out, err := s.ListWorkspaces(c, accountID(c))
+		if err != nil {
+			serviceStatus(c, err)
 			return
 		}
 		c.JSON(http.StatusOK, out)

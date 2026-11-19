@@ -10,6 +10,28 @@ port = "8080"
 # since a browser page on https:// cannot open ws://.
 # allowedOrigins = ["maidkit.solsynth.dev", "localhost:8080"]
 
+[web]
+# The built console. The default resolves the source tree and the container
+# image (`internal/cloud/web/dist` under the working directory, then beside
+# the config file); an empty value keeps only the status page. Build it with
+# `make web` or the Docker image.
+# distPath = "internal/cloud/web/dist"
+
+[handoff]
+# Session hand-off with the identity console (Stargate). The console redirects
+# the browser to `<baseUrl>/sign-in`; the issuer returns a single-use code,
+# which this cloud redeems server-to-server and turns into its own HttpOnly
+# session cookies. Without these values the console stays signed out.
+#
+# clientId and clientSecret are the credentials Stargate's hand-off client
+# registry issued for this console. baseUrl and clientId must be set together.
+# baseUrl = "https://id.solian.app"
+# clientId = "maidkit-cloud"
+# clientSecret = "change-me"
+# cookieDomain = ".solsynth.dev"
+# Set true whenever the console is served over HTTPS.
+# cookieSecure = true
+
 [database]
 # Replace the example password and connection settings before deployment.
 dsn = "host=postgres user=maidcafe password=change-me dbname=maidcafe port=5432 sslmode=disable"

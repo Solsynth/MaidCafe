@@ -32,6 +32,39 @@ type Config struct {
 	GRPC      GRPCConfig      `mapstructure:"grpc"`
 	Cloud     CloudConfig     `mapstructure:"cloud"`
 	Daemon    DaemonConfig    `mapstructure:"daemon"`
+	Web       WebConfig       `mapstructure:"web"`
+	Handoff   HandoffConfig   `mapstructure:"handoff"`
+}
+
+// WebConfig mounts the built console (internal/cloud/web/dist) on the cloud
+// HTTP server. An empty dist path leaves the status page as the only page.
+type WebConfig struct {
+	DistPath string `mapstructure:"distPath"`
+}
+
+// HandoffConfig is the relying-app side of the fleet's session hand-off: the
+// identity console (Stargate) issues a single-use code and this cloud redeems
+// it server-to-server, setting its own HttpOnly session cookies. ClientID and
+// ClientSecret identify the console in the fleet's hand-off client registry;
+// BaseURL is the issuer's public origin, e.g. https://id.solian.app.
+type HandoffConfig struct {
+	BaseURL      string `mapstructure:"baseUrl"`
+	ClientID     string `mapstructure:"clientId"`
+	ClientSecret string `mapstructure:"clientSecret"`
+	// CookieDomain lets sibling fleet hosts share the session cookie; empty
+	// keeps it host-only. CookieSecure marks the cookies Secure and must be on
+	// for a deployment served over TLS.
+	CookieDomain string `mapstructure:"cookieDomain"`
+	CookieSecure bool   `mapstructure:"cookieSecure"`
+}
+
+// HandoffEnabled reports whether the console can redeem a sign-in code. A
+// partial configuration stays disabled rather than failing every request.
+func (c *Config) HandoffEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.Handoff.BaseURL) != "" && strings.TrimSpace(c.Handoff.ClientID) != ""
 }
 
 // DiscoveryConfig points the cloud at Blade's service registry. Fleet
@@ -895,6 +928,12 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("app.name", "MaidCafe")
 	viper.SetDefault("http.port", "8080")
 	viper.SetDefault("database.dsn", "")
+	viper.SetDefault("web.distPath", "internal/cloud/web/dist")
+	viper.SetDefault("handoff.baseUrl", "")
+	viper.SetDefault("handoff.clientId", "")
+	viper.SetDefault("handoff.clientSecret", "")
+	viper.SetDefault("handoff.cookieDomain", "")
+	viper.SetDefault("handoff.cookieSecure", false)
 	viper.SetDefault("discovery.target", "")
 	viper.SetDefault("discovery.service", "stargate")
 	viper.SetDefault("discovery.workspaceService", "valve")
@@ -993,6 +1032,7 @@ func Load(configPath string) (*Config, error) {
 	if err := cfg.loadJobFragments(); err != nil {
 		return nil, err
 	}
+	anchorWebDistPath(&cfg, configPath)
 	// The stable host identity is written by the install flow, not derived
 	// from the config file; a missing file (hand-rolled installs) simply
 	// leaves the daemon unlinked in the cloud.
@@ -1282,6 +1322,8 @@ func applyEnvAliases() {
 		"GRPC_CA_FILE": "grpc.caFile", "GRPC_CLIENT_CERT_FILE": "grpc.clientCertFile", "GRPC_CLIENT_KEY_FILE": "grpc.clientKeyFile",
 		"EVENTBUS_URL": "eventbus.url", "EVENTBUS_SUBJECT_PREFIX": "eventbus.subjectPrefix",
 		"CLOUD_DAEMON_DISCONNECT_AFTER": "cloud.daemonDisconnectAfter", "CLOUD_DAEMON_DISCONNECT_NOTIFICATION_COOLDOWN": "cloud.daemonDisconnectNotificationCooldown", "CLOUD_ALARM_CHECK_INTERVAL": "cloud.alarmCheckInterval",
+		"WEB_DIST_PATH": "web.distPath", "HANDOFF_BASE_URL": "handoff.baseUrl", "HANDOFF_CLIENT_ID": "handoff.clientId",
+		"HANDOFF_CLIENT_SECRET": "handoff.clientSecret", "HANDOFF_COOKIE_DOMAIN": "handoff.cookieDomain", "HANDOFF_COOKIE_SECURE": "handoff.cookieSecure",
 		"DAEMON_ID": "daemon.id", "DAEMON_TRANSPORT": "daemon.transport", "DAEMON_LISTEN": "daemon.listen",
 		"DAEMON_METRICS_SECRET":          "daemon.metricsSecret",
 		"DAEMON_METRICS_HISTORY_PATH":    "daemon.metricsHistoryPath",
@@ -1345,7 +1387,43 @@ func (c *Config) ValidateCloud() error {
 	if c.Cloud.AlarmCheckInterval < 0 {
 		return fmt.Errorf("cloud.alarmCheckInterval must not be negative")
 	}
+	if (strings.TrimSpace(c.Handoff.BaseURL) == "") != (strings.TrimSpace(c.Handoff.ClientID) == "") {
+		return fmt.Errorf("handoff.baseUrl and handoff.clientId must be set together")
+	}
+	if c.HandoffEnabled() {
+		parsed, err := url.Parse(strings.TrimSpace(c.Handoff.BaseURL))
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("handoff.baseUrl must be an absolute URL")
+		}
+	}
 	return nil
+}
+
+// anchorWebDistPath resolves a relative [web] distPath the way the fleet's
+// consoles do: the process working directory first (the source tree and the
+// container image both put dist under it), then the config file's directory.
+// A path that resolves nowhere is left untouched so the server answers the
+// status page instead of silently mounting an empty tree.
+func anchorWebDistPath(cfg *Config, configPath string) {
+	dist := strings.TrimSpace(cfg.Web.DistPath)
+	if dist == "" || filepath.IsAbs(dist) {
+		return
+	}
+	if info, err := os.Stat(dist); err == nil && info.IsDir() {
+		if absolute, err := filepath.Abs(dist); err == nil {
+			cfg.Web.DistPath = absolute
+		}
+		return
+	}
+	if configPath == "" {
+		return
+	}
+	candidate := filepath.Join(filepath.Dir(configPath), dist)
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		if absolute, err := filepath.Abs(candidate); err == nil {
+			cfg.Web.DistPath = absolute
+		}
+	}
 }
 
 func (c *Config) ValidateDaemon() error {

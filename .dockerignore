@@ -2,5 +2,8 @@
 .github
 bin
 dist
+node_modules
+internal/cloud/web/dist
+internal/cloud/web/node_modules
 config.toml
 *.local

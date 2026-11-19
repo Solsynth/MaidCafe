@@ -80,6 +80,24 @@ type WorkspaceClient interface {
 	GetPlanQuota(ctx context.Context, workspaceID string) (map[string]int64, error)
 }
 
+// WorkspaceCatalog is the optional listing half of the workspace service.
+// It is separate from WorkspaceClient because the cloud only needs the two
+// access checks for its normal work; a deployment (or a test fake) that does
+// not implement it still serves daemon traffic, it just cannot show the
+// console's workspace picker.
+type WorkspaceCatalog interface {
+	UserWorkspaces(ctx context.Context, accountID string) ([]string, error)
+	WorkspaceBatch(ctx context.Context, ids []string) ([]WorkspaceView, error)
+}
+
+// WorkspaceView is one workspace the account can open in the console.
+type WorkspaceView struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 // GrpcWorkspaceClient adapts the generated DyWorkspaceServiceClient to
 // WorkspaceClient.
 type GrpcWorkspaceClient struct {
@@ -110,6 +128,62 @@ func (c GrpcWorkspaceClient) GetPlanQuota(ctx context.Context, workspaceID strin
 		return nil, err
 	}
 	return resp.GetQuotas(), nil
+}
+
+func (c GrpcWorkspaceClient) UserWorkspaces(ctx context.Context, accountID string) ([]string, error) {
+	if c.client == nil {
+		return nil, errors.New("workspace client is not configured")
+	}
+	resp, err := c.client.GetUserWorkspaces(ctx, &gen.DyGetUserWorkspacesRequest{AccountId: accountID})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetWorkspaceIds(), nil
+}
+
+func (c GrpcWorkspaceClient) WorkspaceBatch(ctx context.Context, ids []string) ([]WorkspaceView, error) {
+	if c.client == nil {
+		return nil, errors.New("workspace client is not configured")
+	}
+	if len(ids) == 0 {
+		return []WorkspaceView{}, nil
+	}
+	resp, err := c.client.GetWorkspaceBatch(ctx, &gen.DyGetWorkspaceBatchRequest{Ids: ids})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkspaceView, 0, len(resp.GetWorkspaces()))
+	for _, workspace := range resp.GetWorkspaces() {
+		name := strings.TrimSpace(workspace.GetName())
+		if name == "" {
+			name = workspace.GetSlug()
+		}
+		if name == "" {
+			name = workspace.GetId()
+		}
+		out = append(out, WorkspaceView{
+			ID:   workspace.GetId(),
+			Slug: workspace.GetSlug(),
+			Name: name,
+			Type: strings.ToLower(gen.DyWorkspaceType_name[int32(workspace.GetType())]),
+		})
+	}
+	return out, nil
+}
+
+// ListWorkspaces returns the account's workspaces with their display names.
+// The id list and the batch read are two registry calls, not one per
+// workspace, so a person in twenty workspaces still costs two dials.
+func (s *Service) ListWorkspaces(ctx context.Context, accountID string) ([]WorkspaceView, error) {
+	catalog, ok := s.workspaces.(WorkspaceCatalog)
+	if !ok {
+		return nil, fmt.Errorf("workspace listing is unavailable")
+	}
+	ids, err := catalog.UserWorkspaces(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.WorkspaceBatch(ctx, ids)
 }
 
 // NewWorkspaceClient dials the DyWorkspaceService gRPC endpoint hosted by the

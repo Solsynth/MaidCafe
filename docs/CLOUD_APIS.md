@@ -11,6 +11,8 @@ relays webhook invocations to them over polling.
 - **Authentication**:
   - User routes require `Authorization: Bearer <solar-token>` (a Solar
     Network session token validated against the auth service).
+  - The web console sends no bearer header: after the hand-off exchange it
+    carries an `AuthToken` HttpOnly cookie, which the same routes accept.
   - Daemon ingestion routes require `Authorization: Bearer <daemon-secret>`
     (the one-time secret returned at daemon registration).
   - The two credential classes are mutually exclusive: a daemon secret cannot
@@ -255,7 +257,48 @@ curl http://localhost:8080/health
 {"ok": true, "mode": "cloud"}
 ```
 
-`GET /` serves the HTML landing page.
+`GET /` serves the built console when `[web] distPath` resolves to a dist
+directory, and the HTML status page otherwise.
+
+### Console session (hand-off)
+
+The web console does not ship a password form. It redirects to the identity
+console's sign-in page, which returns a single-use `code`; the cloud exchanges
+that code server-to-server and sets its own `AuthToken` and `RefreshToken`
+HttpOnly cookies. Those cookies authenticate every `/api` user route, so the
+console never holds a token in JavaScript.
+
+#### `GET /api/auth/config`
+
+Anonymous. Publishes the configured issuer's sign-in page.
+
+```json
+{"configured": true, "sign_in_url": "https://id.solian.app/sign-in"}
+```
+
+`configured` is false when `[handoff] baseUrl` or `clientId` is unset.
+
+#### `POST /api/auth/session`
+
+Exchange a hand-off code for this cloud's session cookies. The body is
+`{"code":"..."}`; the token is verified against the auth service before the
+cookies are set, so a bad code never leaves a session behind. `200` returns
+the account view and `expires_in`.
+
+#### `GET /api/auth/session`
+
+Authenticated. Returns the account behind the session cookie, which is how the
+console boots without another call to the issuer.
+
+#### `POST /api/auth/refresh`
+
+Trades the `RefreshToken` cookie for a fresh access token and rotates both
+cookies. A missing or refused refresh clears the cookies and answers `401`
+`{"error":"invalid_grant"}`.
+
+#### `POST /api/auth/logout`
+
+Clears this cloud's cookies. The issuer's own session is not ended.
 
 ### Daemons (user routes)
 
@@ -436,6 +479,18 @@ curl -X POST http://localhost:8080/api/daemons/d0f2f0c2-.../push-notification \
 | `metadata` | object | optional, `<= 16 KiB` serialized |
 
 ### Workspaces (user routes)
+
+#### `GET /api/workspaces`
+
+List the workspaces the authenticated account belongs to, with their display
+names. The console uses this to choose the workspace whose daemons it lists;
+`GET /api/daemons` still requires an explicit `workspace_id`.
+
+```json
+[
+  {"id": "5f1c...", "slug": "solar", "name": "Solar Network", "type": "organization"}
+]
+```
 
 #### `GET /api/workspaces/:id/quota`
 

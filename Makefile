@@ -1,6 +1,15 @@
-.PHONY: build build-cloud build-daemon build-priv run-cloud run-daemon test tidy
+.PHONY: build build-cloud build-daemon build-priv run-cloud run-daemon test tidy web web-dev
 
 build: build-cloud build-daemon build-priv
+
+# The console is built separately: it needs Bun, while the Go targets do not.
+# The cloud serves internal/cloud/web/dist at the same path the built image
+# uses, so `make web && make run-cloud` shows the console locally.
+web:
+	cd internal/cloud/web && bun install --frozen-lockfile && bun run build
+
+web-dev:
+	cd internal/cloud/web && bun run dev
 
 build-cloud:
 	go build -o bin/maidcafe-cloud ./cmd/cloud
