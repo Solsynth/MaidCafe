@@ -1573,6 +1573,9 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.LogsUploadEnabled && c.Daemon.LogsUploadInterval <= 0 {
 		return fmt.Errorf("daemon.logsUploadInterval must be positive when logsUploadEnabled is true")
 	}
+	if c.Daemon.LogsUploadEnabled && c.Daemon.LogsInterval <= 0 {
+		return fmt.Errorf("daemon.logsInterval must be positive when logsUploadEnabled is true")
+	}
 	if c.Daemon.MaxBodyBytes <= 0 {
 		return fmt.Errorf("daemon.maxBodyBytes must be positive")
 	}

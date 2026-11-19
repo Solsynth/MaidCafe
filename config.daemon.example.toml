@@ -16,7 +16,8 @@ alarmsDir = "/etc/maidcafe/alarms"
 # holds one job's fields (the same shape as a [[daemon.jobs]] entry).
 jobsDir = "/etc/maidcafe/jobs"
 # Captured container logs (JSONL per container, rotated at 512 KiB, pruned by
-# metricsRetentionDays). 0 disables log tracking.
+# metricsRetentionDays). 0 disables log tracking, so logsUploadEnabled needs a
+# positive logsInterval; the uploader cannot send lines that were never read.
 logsDir = "/var/lib/maidcafe/logs"
 logsInterval = "30s"
 # Cadence at which the daemon compares every container's image against its

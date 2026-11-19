@@ -1355,3 +1355,33 @@ func TestDaemonValidatesLogAlerts(t *testing.T) {
 		t.Fatal("invalid log regex accepted")
 	}
 }
+
+func TestLogUploadRequiresCaptureCadence(t *testing.T) {
+	base := DaemonConfig{
+		ID:                   "host-1",
+		Transport:            "stdio",
+		MetricsInterval:      time.Minute,
+		StreamInterval:       time.Second,
+		ContainersInterval:   5 * time.Second,
+		ImagesInterval:       time.Minute,
+		ProcessesInterval:    10 * time.Second,
+		SystemdInterval:      30 * time.Second,
+		Runtimes:             []string{"java", "dotnet", "python"},
+		ProcessesLimit:       50,
+		RequestTimeout:       time.Second,
+		ScriptTimeout:        time.Second,
+		MaxBodyBytes:         1,
+		MaxConcurrentRuns:    1,
+		LogsUploadEnabled:    true,
+		LogsUploadInterval:   30 * time.Second,
+		LogsUploadBatchLines: 100,
+	}
+	cfg := Config{Daemon: base}
+	if err := cfg.ValidateDaemon(); err == nil {
+		t.Fatal("log upload accepted with capture disabled")
+	}
+	cfg.Daemon.LogsInterval = 30 * time.Second
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatalf("log upload with capture rejected: %v", err)
+	}
+}
