@@ -411,12 +411,24 @@ type MetricInput struct {
 	SwapFreeKb         int64     `json:"swap_free_kb"`
 	DiskTotalKb        int64     `json:"disk_total_kb"`
 	DiskAvailableKb    int64     `json:"disk_available_kb"`
-	NetRxBytes         uint64    `json:"net_rx_bytes"`
-	NetTxBytes         uint64    `json:"net_tx_bytes"`
-	WebhookExecutions  uint64    `json:"webhook_executions"`
-	WebhookFailures    uint64    `json:"webhook_failures"`
-	HealthScore        int       `json:"health_score"`
-	HealthStatus       string    `json:"health_status"`
+	// Disks is the daemon's per-mount breakdown. The cloud only stores the
+	// aggregate totals above, but must accept the field: unknown JSON fields
+	// are rejected, which made every metric from a current daemon a 400.
+	Disks             []DiskUsageInput `json:"disks,omitempty"`
+	NetRxBytes        uint64           `json:"net_rx_bytes"`
+	NetTxBytes        uint64           `json:"net_tx_bytes"`
+	WebhookExecutions uint64           `json:"webhook_executions"`
+	WebhookFailures   uint64           `json:"webhook_failures"`
+	HealthScore       int              `json:"health_score"`
+	HealthStatus      string           `json:"health_status"`
+}
+
+// DiskUsageInput is one mounted filesystem reported by the daemon.
+type DiskUsageInput struct {
+	Mount       string `json:"mount"`
+	Filesystem  string `json:"filesystem,omitempty"`
+	TotalKb     int64  `json:"total_kb"`
+	AvailableKb int64  `json:"available_kb"`
 }
 
 // LogInput is one container log line uploaded by a daemon. The daemon
@@ -496,12 +508,16 @@ type MetricView struct {
 	SwapFreeKb         int64     `json:"swap_free_kb"`
 	DiskTotalKb        int64     `json:"disk_total_kb"`
 	DiskAvailableKb    int64     `json:"disk_available_kb"`
-	NetRxBytes         uint64    `json:"net_rx_bytes"`
-	NetTxBytes         uint64    `json:"net_tx_bytes"`
-	WebhookExecutions  uint64    `json:"webhook_executions"`
-	WebhookFailures    uint64    `json:"webhook_failures"`
-	HealthScore        int       `json:"health_score"`
-	HealthStatus       string    `json:"health_status"`
+	// Disks is the daemon's per-mount breakdown. The cloud only stores the
+	// aggregate totals above, but must accept the field: unknown JSON fields
+	// are rejected, which made every metric from a current daemon a 400.
+	Disks             []DiskUsageInput `json:"disks,omitempty"`
+	NetRxBytes        uint64           `json:"net_rx_bytes"`
+	NetTxBytes        uint64           `json:"net_tx_bytes"`
+	WebhookExecutions uint64           `json:"webhook_executions"`
+	WebhookFailures   uint64           `json:"webhook_failures"`
+	HealthScore       int              `json:"health_score"`
+	HealthStatus      string           `json:"health_status"`
 }
 type NotificationInput struct {
 	Kind     string          `json:"kind"`
