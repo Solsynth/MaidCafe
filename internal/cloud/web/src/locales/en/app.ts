@@ -149,7 +149,8 @@ export default {
     trend: 'Recent CPU and memory',
     samples: '{count} samples',
     containersTitle: 'Containers',
-    containersEmpty: 'This host has not uploaded a container status yet.',
+    containersEmpty:
+      'This host has not uploaded a container status. Set daemon.statusUploadEnabled = true on the host and wait for one metrics tick.',
     containerName: 'Container',
     image: 'Image',
     state: 'State',
@@ -160,7 +161,8 @@ export default {
     container: 'Container',
     allContainers: 'All containers',
     lines: 'Lines',
-    noLogs: 'No log lines have been uploaded for this host.',
+    noLogs:
+      'No log lines have been uploaded. Set daemon.logsUploadEnabled = true; capture also needs daemon.logsInterval > 0.',
     logsHint: 'Only containers opted into upload appear here; line text is stored verbatim.',
     actionsTitle: 'Actions',
     actionsEmpty: 'The daemon has not reported any action.',

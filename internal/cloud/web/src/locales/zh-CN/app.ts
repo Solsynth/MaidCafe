@@ -146,7 +146,8 @@ export default {
     trend: '近期 CPU 与内存',
     samples: '{count} 个样本',
     containersTitle: '容器',
-    containersEmpty: '此主机尚未上传容器状态。',
+    containersEmpty:
+      '此主机尚未上传容器状态。请在主机上设置 daemon.statusUploadEnabled = true，并等待一个指标周期。',
     containerName: '容器',
     image: '镜像',
     state: '状态',
@@ -157,7 +158,8 @@ export default {
     container: '容器',
     allContainers: '全部容器',
     lines: '行数',
-    noLogs: '此主机尚未上传日志。',
+    noLogs:
+      '尚未上传日志。请在主机上设置 daemon.logsUploadEnabled = true；采集还需要 daemon.logsInterval > 0。',
     logsHint: '这里只显示已开启上传的容器；日志文本按原样保存。',
     actionsTitle: '操作',
     actionsEmpty: '守护进程尚未上报任何操作。',

@@ -52,6 +52,7 @@ func RegisterRoutes(r *gin.Engine, svc *cloud.Service, userAuth gin.HandlerFunc,
 	user.PUT("/notification-preferences/:topic", setGlobalNotificationPreference(svc))
 	user.DELETE("/notification-preferences/:topic", deleteGlobalNotificationPreference(svc))
 	user.GET("/notification-topics", listNotificationTopics(svc))
+	user.GET("/daemons/:id/notification-preferences", listNotificationPreferences(svc))
 	user.PUT("/daemons/:id/notification-preferences", setAllDaemonNotificationPreferences(svc))
 	user.DELETE("/daemons/:id/notification-preferences", deleteAllDaemonNotificationPreferences(svc))
 	user.PUT("/daemons/:id/notification-preferences/:topic", setDaemonNotificationPreference(svc))
@@ -93,6 +94,18 @@ func requireUser() gin.HandlerFunc {
 func accountID(c *gin.Context) string {
 	result, _, _ := dyauth.GetAuth(c)
 	return result.Account.GetId()
+}
+
+// requireWorkspaceQuery reads the workspace every notification surface needs.
+// A missing value is a client error, not a server fault: it used to reach the
+// service and surface as 500, which made a console bug look like an outage.
+func requireWorkspaceQuery(c *gin.Context) (string, bool) {
+	id := strings.TrimSpace(c.Query("workspace_id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+		return "", false
+	}
+	return id, true
 }
 
 func userHandle(c *gin.Context) string {
@@ -286,12 +299,17 @@ func daemonHealth(s *cloud.Service) gin.HandlerFunc {
 
 func listNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		out, err := s.ListNotificationPreferences(
-			c,
-			accountID(c),
-			c.Query("workspace_id"),
-			c.Query("daemon_id"),
-		)
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		// The flat route filters by ?daemon_id; the daemon-scoped route names
+		// the daemon in its path, so the same handler serves both.
+		daemonID := c.Param("id")
+		if daemonID == "" {
+			daemonID = c.Query("daemon_id")
+		}
+		out, err := s.ListNotificationPreferences(c, accountID(c), workspaceID, daemonID)
 		if err != nil {
 			serviceStatus(c, err)
 			return
@@ -302,7 +320,11 @@ func listNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 
 func listNotificationTopics(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		out, err := s.ListNotificationTopics(c, accountID(c), c.Query("workspace_id"))
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		out, err := s.ListNotificationTopics(c, accountID(c), workspaceID)
 		if err != nil {
 			serviceStatus(c, err)
 			return
@@ -317,9 +339,13 @@ func setGlobalNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 		if !parseJSON(c, &input) {
 			return
 		}
-		workspaceID := c.Query("workspace_id")
+		workspaceID := strings.TrimSpace(c.Query("workspace_id"))
 		if workspaceID == "" {
-			workspaceID = c.GetString("workspace_id")
+			workspaceID = strings.TrimSpace(c.GetString("workspace_id"))
+		}
+		if workspaceID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+			return
 		}
 		if err := s.SetNotificationPreference(c, accountID(c), workspaceID, "", c.Param("topic"), input.Preference); err != nil {
 			serviceStatus(c, err)
@@ -331,7 +357,11 @@ func setGlobalNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 
 func deleteGlobalNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if err := s.DeleteNotificationPreference(c, accountID(c), c.Query("workspace_id"), "", c.Param("topic")); err != nil {
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		if err := s.DeleteNotificationPreference(c, accountID(c), workspaceID, "", c.Param("topic")); err != nil {
 			serviceStatus(c, err)
 			return
 		}
@@ -348,7 +378,12 @@ func setDaemonNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 		if !parseJSON(c, &input) {
 			return
 		}
-		if err := s.SetNotificationPreference(c, accountID(c), input.WorkspaceID, c.Param("id"), c.Param("topic"), input.Preference); err != nil {
+		workspaceID := strings.TrimSpace(input.WorkspaceID)
+		if workspaceID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+			return
+		}
+		if err := s.SetNotificationPreference(c, accountID(c), workspaceID, c.Param("id"), c.Param("topic"), input.Preference); err != nil {
 			serviceStatus(c, err)
 			return
 		}
@@ -365,7 +400,12 @@ func setAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 		if !parseJSON(c, &input) {
 			return
 		}
-		if err := s.SetAllDaemonNotificationPreferences(c, accountID(c), input.WorkspaceID, c.Param("id"), input.Preference); err != nil {
+		workspaceID := strings.TrimSpace(input.WorkspaceID)
+		if workspaceID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+			return
+		}
+		if err := s.SetAllDaemonNotificationPreferences(c, accountID(c), workspaceID, c.Param("id"), input.Preference); err != nil {
 			serviceStatus(c, err)
 			return
 		}
@@ -375,7 +415,11 @@ func setAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 
 func deleteAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if err := s.DeleteAllDaemonNotificationPreferences(c, accountID(c), c.Query("workspace_id"), c.Param("id")); err != nil {
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		if err := s.DeleteAllDaemonNotificationPreferences(c, accountID(c), workspaceID, c.Param("id")); err != nil {
 			serviceStatus(c, err)
 			return
 		}
@@ -385,7 +429,11 @@ func deleteAllDaemonNotificationPreferences(s *cloud.Service) gin.HandlerFunc {
 
 func deleteDaemonNotificationPreference(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if err := s.DeleteNotificationPreference(c, accountID(c), c.Query("workspace_id"), c.Param("id"), c.Param("topic")); err != nil {
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		if err := s.DeleteNotificationPreference(c, accountID(c), workspaceID, c.Param("id"), c.Param("topic")); err != nil {
 			serviceStatus(c, err)
 			return
 		}
@@ -743,7 +791,11 @@ func markRead(s *cloud.Service) gin.HandlerFunc {
 }
 func markAllRead(s *cloud.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if err := s.MarkAllNotificationsRead(c, accountID(c), c.Query("workspace_id")); err != nil {
+		workspaceID, ok := requireWorkspaceQuery(c)
+		if !ok {
+			return
+		}
+		if err := s.MarkAllNotificationsRead(c, accountID(c), workspaceID); err != nil {
 			serviceStatus(c, err)
 			return
 		}

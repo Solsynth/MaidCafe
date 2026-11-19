@@ -39,10 +39,12 @@ async function load() {
   error.value = ''
   try {
     const [topicList, current] = await Promise.all([
-      notificationApi.topics(),
+      notificationApi.topics(props.workspaceId),
       isDaemon.value
         ? notificationApi.daemonPreferences(props.daemonId ?? '', props.workspaceId)
-        : notificationApi.preferences(props.workspaceId),
+        : notificationApi
+            .preferences(props.workspaceId)
+            .then((rows) => rows.filter((row) => !row.daemon_id)),
     ])
     topics.value = topicList
     preferences.value = current

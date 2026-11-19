@@ -571,6 +571,11 @@ topic default; a daemon-specific row overrides that default.
 Set an account-wide topic preference. The JSON body is
 `{"preference": 0|1|2}`. `DELETE` on the same route resets it to normal.
 
+#### `GET /api/daemons/:id/notification-preferences?workspace_id=`
+
+List the caller's overrides for one daemon. The console uses it to show which
+topics have a daemon-specific policy instead of the workspace default.
+
 #### `PUT /api/daemons/:id/notification-preferences`
 
 Set one delivery policy for every known notification topic for a daemon. The

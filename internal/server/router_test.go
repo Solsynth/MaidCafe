@@ -302,3 +302,57 @@ func TestDaemonHealthUserRoute(t *testing.T) {
 		t.Fatalf("health view mismatch: %+v", view)
 	}
 }
+
+func TestDaemonNotificationPreferencesRoute(t *testing.T) {
+	db, err := database.NewSQLite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	svc := cloud.NewService(db, routePublisher{}, routeWorkspaces{})
+	router := NewRouter(nil, svc, routeAuthenticator{})
+
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetNotificationPreference(ctx, "account-a", "ws-a", daemon.ID, "webhook.success", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer solar-token")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// The daemon-scoped route names the daemon in the path; the console relies
+	// on it for the overrides panel.
+	rec := get("/api/daemons/" + daemon.ID + "/notification-preferences?workspace_id=ws-a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("daemon preference route %d %s", rec.Code, rec.Body)
+	}
+	var rows []cloud.NotificationPreferenceView
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].DaemonID != daemon.ID || rows[0].Preference != 1 {
+		t.Fatalf("daemon preference rows %#v", rows)
+	}
+
+	// A missing workspace is a client error the console surfaces, not a
+	// server fault.
+	if bad := get("/api/notification-topics"); bad.Code != http.StatusBadRequest {
+		t.Fatalf("topics without workspace = %d", bad.Code)
+	}
+	topics := get("/api/notification-topics?workspace_id=ws-a")
+	if topics.Code != http.StatusOK {
+		t.Fatalf("topics route %d %s", topics.Code, topics.Body)
+	}
+}

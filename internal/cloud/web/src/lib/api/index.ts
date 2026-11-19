@@ -82,7 +82,8 @@ export const notificationApi = {
     request<void>(`/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' }),
   markAllRead: (workspaceID: string) =>
     request<void>('/notifications/all/read', { method: 'POST', query: { workspace_id: workspaceID } }),
-  topics: () => request<NotificationTopic[]>('/notification-topics'),
+  topics: (workspaceID: string) =>
+    request<NotificationTopic[]>('/notification-topics', { query: { workspace_id: workspaceID } }),
   preferences: (workspaceID: string, daemonID = '') =>
     request<NotificationPreference[]>('/notification-preferences', {
       query: { workspace_id: workspaceID, daemon_id: daemonID },
