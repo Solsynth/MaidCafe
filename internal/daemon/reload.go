@@ -154,7 +154,7 @@ func (a *App) applyReload(cfg config.DaemonConfig) {
 	// one up when cloud configuration appeared on a host that had none.
 	rt := newReloadableConfig(cfg)
 	if pub := a.publish(); pub != nil {
-		pub.Reload(cfg.CloudURL, cfg.CloudSecret)
+		pub.Reload(cfg.CloudURL, cfg.CloudSecret, cfg.ID)
 	} else if strings.TrimSpace(cfg.CloudURL) != "" && strings.TrimSpace(cfg.CloudSecret) != "" {
 		if created, err := NewCloudPublisher(cfg, a.logger); err == nil && created != nil {
 			a.publisher.Store(created)

@@ -74,8 +74,8 @@ func NewCloudPublisher(cfg config.DaemonConfig, logger *slog.Logger) (*CloudPubl
 	}
 	return &CloudPublisher{
 		baseURL:  parsed.String(),
-		daemonID: cfg.ID,
-		secret:   cfg.CloudSecret,
+		daemonID: strings.TrimSpace(cfg.ID),
+		secret:   strings.TrimSpace(cfg.CloudSecret),
 		timeout:  cfg.RequestTimeout,
 		logger:   logger,
 		client: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -87,7 +87,7 @@ func NewCloudPublisher(cfg config.DaemonConfig, logger *slog.Logger) (*CloudPubl
 // Reload swaps the cloud URL and secret (hot reload). The pacing state is
 // kept: a re-pointed daemon keeps its quota discipline. An empty URL or
 // secret disables publishing (requests then fail fast with a clear error).
-func (p *CloudPublisher) Reload(cloudURL, cloudSecret string) {
+func (p *CloudPublisher) Reload(cloudURL, cloudSecret, daemonID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(cloudURL), "/"))
@@ -98,6 +98,9 @@ func (p *CloudPublisher) Reload(cloudURL, cloudSecret string) {
 	}
 	p.baseURL = parsed.String()
 	p.secret = strings.TrimSpace(cloudSecret)
+	if id := strings.TrimSpace(daemonID); id != "" {
+		p.daemonID = id
+	}
 }
 
 func (p *CloudPublisher) request(ctx context.Context, method, suffix string, payload any, dst any) error {
@@ -150,6 +153,7 @@ func (p *CloudPublisher) requestWithTimeout(ctx context.Context, timeout time.Du
 	p.mu.RLock()
 	baseURL := p.baseURL
 	secret := p.secret
+	daemonID := p.daemonID
 	if timeout <= 0 {
 		timeout = p.timeout
 	}
@@ -164,7 +168,7 @@ func (p *CloudPublisher) requestWithTimeout(ctx context.Context, timeout time.Du
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, baseURL+"/api/daemons/"+p.daemonID+suffix, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+"/api/daemons/"+daemonID+suffix, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -178,6 +182,9 @@ func (p *CloudPublisher) requestWithTimeout(ctx context.Context, timeout time.Du
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("cloud %s %s: status %d (daemon id/secret rejected: check daemon.id and daemon.cloudSecret match this cloud, and the daemon is enabled and its secret not rotated)", method, suffix, resp.StatusCode)
+		}
 		return fmt.Errorf("cloud %s %s: status %d", method, suffix, resp.StatusCode)
 	}
 	if dst != nil {
