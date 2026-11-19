@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -51,6 +52,7 @@ func RegisterAuthRoutes(r *gin.Engine, cfg *config.Config, authenticator dyauth.
 		}
 	}
 	r.GET("/api/auth/config", routes.config)
+	r.GET("/api/accounts/:name/picture", routes.accountPicture)
 	r.POST("/api/auth/session", routes.redeem)
 	r.POST("/api/auth/refresh", routes.refresh)
 	r.POST("/api/auth/logout", routes.logout)
@@ -58,6 +60,23 @@ func RegisterAuthRoutes(r *gin.Engine, cfg *config.Config, authenticator dyauth.
 
 func (h *handoffRoutes) enabled() bool {
 	return h != nil && h.cfg != nil && h.cfg.HandoffEnabled() && h.client != nil
+}
+
+// accountPicture redirects an <img> to the identity console's canonical
+// account-picture endpoint. The account view carries the picture URL when the
+// identity service knew one, but a profile reference may carry only a file id;
+// that endpoint resolves both forms, so the console always has one URL to try.
+func (h *handoffRoutes) accountPicture(c *gin.Context) {
+	name := strings.TrimSpace(c.Param("name"))
+	base := ""
+	if h != nil && h.cfg != nil {
+		base = strings.TrimRight(strings.TrimSpace(h.cfg.Handoff.BaseURL), "/")
+	}
+	if name == "" || base == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Redirect(http.StatusFound, base+"/api/accounts/"+url.PathEscape(name)+"/picture")
 }
 
 // config publishes the issuer's sign-in page. The browser needs the host

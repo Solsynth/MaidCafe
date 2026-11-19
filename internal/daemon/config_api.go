@@ -48,6 +48,22 @@ var patchDurationRule = patchRule{
 	},
 }
 
+var patchLogUploadLevelRule = patchRule{
+	validate: func(value any) error {
+		text, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("must be a log level string")
+		}
+		if _, ok := config.NormalizeLogUploadLevel(text); !ok {
+			return fmt.Errorf("must be trace, debug, info, warn, error, or fatal")
+		}
+		return nil
+	},
+	toml: func(value any) (string, error) {
+		return tomlString(value.(string)), nil
+	},
+}
+
 func patchIntRule(min, max int64) patchRule {
 	return patchRule{
 		validate: func(value any) error {
@@ -145,6 +161,7 @@ var patchableDaemonKeys = map[string]patchRule{
 	"maxBodyBytes":            patchIntRule(1, 1<<30),
 	"maxConcurrentRuns":       patchIntRule(1, 256),
 	"logsUploadBatchLines":    patchIntRule(1, 500),
+	"logsUploadMinLevel":      patchLogUploadLevelRule,
 	"logsUploadEnabled":       patchBoolRule,
 	"statusUploadEnabled":     patchBoolRule,
 	"managedContainers":       patchStringListRule,
@@ -199,6 +216,7 @@ type redactedConfigView struct {
 	LogsUploadEnabled    bool     `json:"logs_upload_enabled"`
 	LogsUploadInterval   string   `json:"logs_upload_interval"`
 	LogsUploadBatchLines int      `json:"logs_upload_batch_lines"`
+	LogsUploadMinLevel   string   `json:"logs_upload_min_level"`
 	StatusUploadEnabled  bool     `json:"status_upload_enabled"`
 	ManagedContainers    []string `json:"managed_containers"`
 	ManagedComposes      []string `json:"managed_composes"`
@@ -234,6 +252,7 @@ func newRedactedConfigView(cfg config.DaemonConfig) redactedConfigView {
 		LogsUploadEnabled:    cfg.LogsUploadEnabled,
 		LogsUploadInterval:   cfg.LogsUploadInterval.String(),
 		LogsUploadBatchLines: cfg.LogsUploadBatchLines,
+		LogsUploadMinLevel:   cfg.LogsUploadMinLevel,
 		StatusUploadEnabled:  cfg.StatusUploadEnabled,
 		ManagedContainers:    cfg.ManagedContainers,
 		ManagedComposes:      cfg.ManagedComposes,

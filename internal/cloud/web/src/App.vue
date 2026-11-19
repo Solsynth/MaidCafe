@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   Cloud16,
@@ -31,6 +31,25 @@ const nav = [
 ]
 
 const year = new Date().getFullYear()
+
+// A profile picture reference may carry only a Drive id, so the identity
+// console's canonical endpoint is the fallback: it resolves the reference to
+// bytes, while a stored URL can go stale. A failed load latches so a missing
+// picture falls back to the generic glyph instead of a broken image.
+const avatarFailed = ref(false)
+const avatarUrl = computed(() => {
+  const account = session.account
+  if (!account) return ''
+  if (account.picture) return account.picture
+  const probe = account.name || account.id
+  return probe ? `/api/accounts/${encodeURIComponent(probe)}/picture` : ''
+})
+watch(
+  () => [session.account?.picture, session.account?.name],
+  () => {
+    avatarFailed.value = false
+  },
+)
 
 onMounted(() => {
   void session.boot().then(() => workspace.load())
@@ -103,10 +122,11 @@ function changeWorkspace(event: Event) {
           <div v-else class="dropdown dropdown-end">
             <div tabindex="0" role="button" class="flex items-center gap-2" :title="session.displayName">
               <img
-                v-if="session.account?.picture"
-                :src="session.account.picture"
+                v-if="avatarUrl && !avatarFailed"
+                :src="avatarUrl"
                 alt=""
                 class="h-6 w-6 rounded-full object-cover"
+                @error="avatarFailed = true"
               />
               <span v-else class="flex h-6 w-6 items-center justify-center rounded-full bg-base-300/60 text-faint">
                 <UserAvatar16 aria-hidden="true" />

@@ -1079,20 +1079,43 @@ func (s *Service) IngestLogs(ctx context.Context, id, secret string, input LogBa
 			return fmt.Errorf("container_id exceeds bounds or is empty")
 		}
 		if entry.Timestamp.IsZero() {
-			return fmt.Errorf("timestamp is required")
+			entry.Timestamp = now
 		}
 		if retentionDays > 0 && entry.Timestamp.Before(now.AddDate(0, 0, -retentionDays)) {
-			return fmt.Errorf("log outside retention window")
+			// A host with a stale cursor must not wedge the whole stream on
+			// rows the retention window will not keep anyway.
+			continue
 		}
-		if len(entry.Line) == 0 || len(entry.Line) > 4096 || !utf8.ValidString(entry.Line) {
-			return fmt.Errorf("line exceeds bounds or is empty")
+		line := normalizeStoredLogLine(entry.Line)
+		if line == "" {
+			continue
 		}
 		rows = append(rows, database.DaemonLog{
 			ID: uuid.NewString(), DaemonID: d.ID, ContainerID: entry.ContainerID,
-			Timestamp: entry.Timestamp.UTC(), ReceivedAt: now, Line: entry.Line,
+			Timestamp: entry.Timestamp.UTC(), ReceivedAt: now, Line: line,
 		})
 	}
+	if len(rows) == 0 {
+		return nil
+	}
 	return s.db.WithContext(ctx).Create(&rows).Error
+}
+
+// normalizeStoredLogLine bounds one line to the storage contract. Empty lines
+// are skipped by the caller; a line that is too long is truncated rather than
+// rejecting the other 99 lines in the batch.
+func normalizeStoredLogLine(line string) string {
+	line = strings.ReplaceAll(line, "\r\n", "\n")
+	line = strings.ToValidUTF8(strings.TrimRight(line, "\r"), "\uFFFD")
+	const max = 4096
+	if len(line) <= max {
+		return line
+	}
+	cut := max - len("…")
+	for cut > 0 && !utf8.ValidString(line[:cut]) {
+		cut--
+	}
+	return line[:cut] + "…"
 }
 
 // ListLogs returns recent uploaded log lines to workspace members.

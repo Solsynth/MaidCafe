@@ -1384,4 +1384,15 @@ func TestLogUploadRequiresCaptureCadence(t *testing.T) {
 	if err := cfg.ValidateDaemon(); err != nil {
 		t.Fatalf("log upload with capture rejected: %v", err)
 	}
+	cfg.Daemon.LogsUploadMinLevel = "warning"
+	if err := cfg.ValidateDaemon(); err != nil {
+		t.Fatalf("warning alias rejected: %v", err)
+	}
+	if cfg.Daemon.LogsUploadMinLevel != "warn" {
+		t.Fatalf("warning alias = %q, want warn", cfg.Daemon.LogsUploadMinLevel)
+	}
+	cfg.Daemon.LogsUploadMinLevel = "loud"
+	if err := cfg.ValidateDaemon(); err == nil {
+		t.Fatal("unknown log level accepted")
+	}
 }

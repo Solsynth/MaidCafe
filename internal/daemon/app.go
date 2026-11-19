@@ -1102,7 +1102,7 @@ func (a *App) runLogsCollector(ctx context.Context) {
 						}
 					}
 				}
-				a.logUpload.Flush(ctx, a.publish(), rt.logsUploadEnabled, rt.logsUploadInterval, rt.logsUploadBatchLines)
+				a.logUpload.Flush(ctx, a.publish(), rt.logsUploadEnabled, rt.logsUploadInterval, rt.logsUploadBatchLines, rt.logsUploadMinLevel)
 			}
 		}
 	}()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -182,10 +183,14 @@ func (p *CloudPublisher) requestWithTimeout(ctx context.Context, timeout time.Du
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp.StatusCode == http.StatusUnauthorized {
-			return fmt.Errorf("cloud %s %s: status %d (daemon id/secret rejected: check daemon.id and daemon.cloudSecret match this cloud, and the daemon is enabled and its secret not rotated)", method, suffix, resp.StatusCode)
+		detail := ""
+		if raw, err := io.ReadAll(io.LimitReader(resp.Body, 1024)); err == nil {
+			detail = strings.TrimSpace(string(raw))
 		}
-		return fmt.Errorf("cloud %s %s: status %d", method, suffix, resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("cloud %s %s: status %d (daemon id/secret rejected: check daemon.id and daemon.cloudSecret match this cloud, and the daemon is enabled and its secret not rotated): %s", method, suffix, resp.StatusCode, detail)
+		}
+		return fmt.Errorf("cloud %s %s: status %d: %s", method, suffix, resp.StatusCode, detail)
 	}
 	if dst != nil {
 		return json.NewDecoder(resp.Body).Decode(dst)

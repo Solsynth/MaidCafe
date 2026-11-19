@@ -240,6 +240,12 @@ type DaemonConfig struct {
 	LogsUploadEnabled    bool          `mapstructure:"logsUploadEnabled"`
 	LogsUploadInterval   time.Duration `mapstructure:"logsUploadInterval"`
 	LogsUploadBatchLines int           `mapstructure:"logsUploadBatchLines"`
+	// LogsUploadMinLevel filters outbound log lines by severity. Accepted
+	// values are trace, debug, info, warn, error, and fatal (warning/err and
+	// critical/panic aliases are normalized); empty uploads every line. A
+	// line whose level cannot be parsed is uploaded regardless, so an unknown
+	// format is never silently dropped.
+	LogsUploadMinLevel string `mapstructure:"logsUploadMinLevel"`
 	// ManagedContainers and ManagedComposes scope cloud uploads (logs and
 	// container status) to a curated set. An empty managed list uploads every
 	// container (the default, matching the pre-scoping behavior). Matching is
@@ -944,6 +950,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("daemon.logsUploadEnabled", false)
 	viper.SetDefault("daemon.logsUploadInterval", 30*time.Second)
 	viper.SetDefault("daemon.logsUploadBatchLines", 100)
+	viper.SetDefault("daemon.logsUploadMinLevel", "")
 
 	viper.SetDefault("eventbus.subjectPrefix", "")
 	viper.SetDefault("ring.target", "")
@@ -1339,6 +1346,7 @@ func applyEnvAliases() {
 		"DAEMON_LOGS_UPLOAD_ENABLED":     "daemon.logsUploadEnabled",
 		"DAEMON_LOGS_UPLOAD_INTERVAL":    "daemon.logsUploadInterval",
 		"DAEMON_LOGS_UPLOAD_BATCH_LINES": "daemon.logsUploadBatchLines",
+		"DAEMON_LOGS_UPLOAD_MIN_LEVEL":   "daemon.logsUploadMinLevel",
 		"DAEMON_CLOUD_URL":               "daemon.cloudUrl", "DAEMON_CLOUD_SECRET": "daemon.cloudSecret",
 		"DAEMON_METRICS_INTERVAL": "daemon.metricsInterval", "DAEMON_STREAM_INTERVAL": "daemon.streamInterval",
 		"DAEMON_CONTAINERS_INTERVAL": "daemon.containersInterval", "DAEMON_IMAGES_INTERVAL": "daemon.imagesInterval", "DAEMON_PROCESSES_INTERVAL": "daemon.processesInterval",
@@ -1423,6 +1431,29 @@ func anchorWebDistPath(cfg *Config, configPath string) {
 		if absolute, err := filepath.Abs(candidate); err == nil {
 			cfg.Web.DistPath = absolute
 		}
+	}
+}
+
+// NormalizeLogUploadLevel maps the accepted log-level spellings to the six
+// canonical names. An empty string means no filter and is valid.
+func NormalizeLogUploadLevel(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", true
+	case "trace":
+		return "trace", true
+	case "debug":
+		return "debug", true
+	case "info", "notice":
+		return "info", true
+	case "warn", "warning":
+		return "warn", true
+	case "error", "err":
+		return "error", true
+	case "fatal", "critical", "crit", "panic":
+		return "fatal", true
+	default:
+		return "", false
 	}
 }
 
@@ -1570,6 +1601,11 @@ func (c *Config) ValidateDaemon() error {
 	if c.Daemon.LogsUploadBatchLines > 500 {
 		return fmt.Errorf("daemon.logsUploadBatchLines must be between 1 and 500")
 	}
+	level, ok := NormalizeLogUploadLevel(c.Daemon.LogsUploadMinLevel)
+	if !ok {
+		return fmt.Errorf("daemon.logsUploadMinLevel must be trace, debug, info, warn, error, or fatal")
+	}
+	c.Daemon.LogsUploadMinLevel = level
 	if c.Daemon.LogsUploadEnabled && c.Daemon.LogsUploadInterval <= 0 {
 		return fmt.Errorf("daemon.logsUploadInterval must be positive when logsUploadEnabled is true")
 	}

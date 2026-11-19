@@ -32,6 +32,11 @@ updateCheckInterval = "6h"
 logsUploadEnabled = false
 logsUploadInterval = "30s"
 logsUploadBatchLines = 100
+# Upload only lines at or above this severity: trace, debug, info, warn,
+# error, or fatal. JSON fields level/severity/lvl (and nested log/fields) and
+# plain-text keywords are recognized; a line with no recognizable level is
+# uploaded, never dropped. Empty uploads every line.
+# logsUploadMinLevel = "warn"
 # Managed allowlist for cloud uploads (logs + container status). Empty = upload
 # every container (default). Match by exact container name or ID prefix, or by
 # compose project label (com.docker.compose.project / io.podman.compose.project).

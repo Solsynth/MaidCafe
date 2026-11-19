@@ -997,8 +997,9 @@ func TestIngestAndListLogs(t *testing.T) {
 	if err := svc.IngestLogs(ctx, created.ID, "wrong", LogBatchInput{Entries: []LogInput{{ContainerID: "web", Timestamp: now, Line: "x"}}}); err != ErrUnauthorized {
 		t.Fatalf("wrong secret accepted: %v", err)
 	}
-	if err := svc.IngestLogs(ctx, created.ID, created.Secret, LogBatchInput{Entries: []LogInput{{ContainerID: "web", Timestamp: now, Line: ""}}}); err == nil {
-		t.Fatal("empty log line accepted")
+	// A blank line is skipped, not a reason to reject the rest of the batch.
+	if err := svc.IngestLogs(ctx, created.ID, created.Secret, LogBatchInput{Entries: []LogInput{{ContainerID: "web", Timestamp: now, Line: ""}}}); err != nil {
+		t.Fatalf("empty log line rejected: %v", err)
 	}
 }
 func TestIngestAndListContainerStatus(t *testing.T) {
@@ -1247,5 +1248,38 @@ func TestListWorkspacesUsesCatalog(t *testing.T) {
 	svc = &Service{workspaces: &fakeWorkspaces{}}
 	if _, err := svc.ListWorkspaces(context.Background(), "account-a"); err == nil {
 		t.Fatal("catalog-less workspace service accepted a listing")
+	}
+}
+
+func TestIngestLogsToleratesEmptyAndLongLines(t *testing.T) {
+	svc, db, _, workspaces := testService(t)
+	workspaces.quotas = map[string]map[string]int64{
+		"ws-a": {"max_daemons": 10, "metrics_retention_days": 30},
+	}
+	defer db.Close()
+	ctx := context.Background()
+	daemon, err := svc.CreateDaemon(ctx, "account-a", "ws-a", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	long := strings.Repeat("x", 5000)
+	err = svc.IngestLogs(ctx, daemon.ID, daemon.Secret, LogBatchInput{Entries: []LogInput{
+		{ContainerID: "abc", Timestamp: now, Line: ""},
+		{ContainerID: "abc", Timestamp: now, Line: long},
+		{ContainerID: "abc", Timestamp: now.AddDate(0, 0, -400), Line: "expired"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := svc.ListLogs(ctx, "account-a", daemon.ID, "", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("stored logs = %d %#v", len(logs), logs)
+	}
+	if len(logs[0].Line) > 4096 || !strings.HasSuffix(logs[0].Line, "…") {
+		t.Fatalf("stored line bounds = %d suffix=%q", len(logs[0].Line), logs[0].Line[len(logs[0].Line)-3:])
 	}
 }

@@ -166,3 +166,28 @@ func cookieNamed(cookies []*http.Cookie, name string) *http.Cookie {
 	}
 	return nil
 }
+
+func TestAccountPictureRedirectsToIssuer(t *testing.T) {
+	issuer := handoffIssuer(t)
+	defer issuer.Close()
+	cfg := &config.Config{Handoff: config.HandoffConfig{
+		BaseURL:  issuer.URL,
+		ClientID: "maidkit-test",
+	}}
+	router := NewRouter(cfg, nil, handoffAuthenticator{})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/accounts/maid/picture", nil))
+	if response.Code != http.StatusFound {
+		t.Fatalf("account picture = %d %s", response.Code, response.Body)
+	}
+	if got := response.Header().Get("Location"); got != issuer.URL+"/api/accounts/maid/picture" {
+		t.Fatalf("account picture location = %q", got)
+	}
+
+	plain := httptest.NewRecorder()
+	NewRouter(&config.Config{}, nil, nil).ServeHTTP(plain, httptest.NewRequest(http.MethodGet, "/api/accounts/maid/picture", nil))
+	if plain.Code != http.StatusNotFound {
+		t.Fatalf("picture without issuer = %d", plain.Code)
+	}
+}

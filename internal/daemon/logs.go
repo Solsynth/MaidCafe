@@ -136,19 +136,32 @@ func (b *logUploadBuffer) Add(container string, lines []containerLogLine) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, line := range lines {
-		b.pending = append(b.pending, LogUploadEntry{ContainerID: container, Timestamp: line.TS, Line: line.Line})
+		text := sanitizeUploadLogLine(line.Line)
+		if text == "" {
+			continue
+		}
+		b.pending = append(b.pending, LogUploadEntry{ContainerID: container, Timestamp: line.TS, Line: text})
 	}
 	if len(b.pending) > 5000 {
 		b.pending = b.pending[len(b.pending)-5000:]
 	}
 }
 
-func (b *logUploadBuffer) Flush(ctx context.Context, publisher *CloudPublisher, enabled bool, interval time.Duration, maxLines int) {
+func (b *logUploadBuffer) Flush(ctx context.Context, publisher *CloudPublisher, enabled bool, interval time.Duration, maxLines int, minLevel string) {
 	if !enabled || publisher == nil || maxLines <= 0 {
 		return
 	}
 	b.mu.Lock()
 	now := time.Now()
+	// Filtering happens at upload time, so changing logsUploadMinLevel applies
+	// to lines already buffered instead of only to future captures.
+	kept := make([]LogUploadEntry, 0, len(b.pending))
+	for _, entry := range b.pending {
+		if shouldUploadLog(entry.Line, minLevel) {
+			kept = append(kept, entry)
+		}
+	}
+	b.pending = kept
 	if len(b.pending) == 0 || (!b.lastTry.IsZero() && now.Sub(b.lastTry) < interval) {
 		b.mu.Unlock()
 		return
